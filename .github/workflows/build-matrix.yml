@@ -31,14 +31,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev
 
-      - name: Cache prepared kernel tree
+      - name: Cache built kernel tree
         id: cache-kernel
         uses: actions/cache@v4
         with:
           path: linux-${{ matrix.kernel_version }}
-          key: kernel-tree-v1-${{ matrix.kernel_version }}
+          key: kernel-tree-v2-${{ matrix.kernel_version }}
 
-      - name: Download and prepare kernel source
+      - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
@@ -48,11 +48,21 @@ jobs:
           tar -xf linux.tar.xz
           rm linux.tar.xz
           cd "linux-${{ matrix.kernel_version }}"
-          make defconfig
-          # modules_prepare builds just enough (Module.symvers, autoconf.h,
-          # generated headers) to compile out-of-tree modules against this
-          # tree - much faster than a full kernel build.
-          make modules_prepare -j"$(nproc)"
+          # modules_prepare alone does NOT produce a real Module.symvers -
+          # that file is only populated by actually compiling the kernel
+          # source that contains EXPORT_SYMBOL() calls. A full defconfig
+          # build works but takes 30-60+ minutes; tinyconfig + just the
+          # subsystems our modules touch gets a real, complete symbol
+          # table in a few minutes instead.
+          make tinyconfig
+          ./scripts/config --enable CONFIG_MODULES
+          ./scripts/config --enable CONFIG_KPROBES
+          ./scripts/config --enable CONFIG_CRYPTO
+          ./scripts/config --enable CONFIG_CRYPTO_HASH
+          ./scripts/config --enable CONFIG_CRYPTO_SHA256
+          ./scripts/config --enable CONFIG_PROC_FS
+          make olddefconfig
+          make -j"$(nproc)"
 
       - name: Build av/ against this kernel tree
         run: |
