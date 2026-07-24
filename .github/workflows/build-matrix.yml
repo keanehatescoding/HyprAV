@@ -1,0 +1,83 @@
+name: Build matrix (compile compatibility)
+
+# Tier 1 CI: verifies every module still COMPILES against multiple kernel
+# versions. This does not insmod/boot anything - GitHub-hosted runners
+# can't switch their host kernel, and free-tier runners have unreliable
+# /dev/kvm access, so this is compile-only compatibility testing.
+# Runtime testing (insmod + trigger detection) belongs in a separate
+# QEMU-based job - see README.md "CI" section for why that's kept apart.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Update these as kernel.org publishes new point releases.
+        # Format must match the tarball name exactly, e.g. 6.12.96.
+        kernel_version:
+          - "6.12.96"  # LTS
+          - "6.18.21"  # LTS
+          - "7.1.4"    # current stable
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev
+
+      - name: Cache prepared kernel tree
+        id: cache-kernel
+        uses: actions/cache@v4
+        with:
+          path: linux-${{ matrix.kernel_version }}
+          key: kernel-tree-v1-${{ matrix.kernel_version }}
+
+      - name: Download and prepare kernel source
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
+          curl -fL -o linux.tar.xz \
+            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
+          tar -xf linux.tar.xz
+          rm linux.tar.xz
+          cd "linux-${{ matrix.kernel_version }}"
+          make defconfig
+          # modules_prepare builds just enough (Module.symvers, autoconf.h,
+          # generated headers) to compile out-of-tree modules against this
+          # tree - much faster than a full kernel build.
+          make modules_prepare -j"$(nproc)"
+
+      - name: Build av/ against this kernel tree
+        run: |
+          set -euxo pipefail
+          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}"
+          make -C av KDIR="$KDIR" clean
+          make -C av KDIR="$KDIR"
+
+      - name: Build experiments/ against this kernel tree
+        run: |
+          set -euxo pipefail
+          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}"
+          for d in experiments/hello experiments/procfs_demo experiments/kprobe_log; do
+            echo "::group::Building $d"
+            make -C "$d" KDIR="$KDIR" clean
+            make -C "$d" KDIR="$KDIR"
+            echo "::endgroup::"
+          done
+
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: modules-${{ matrix.kernel_version }}
+          path: |
+            av/*.ko
+            experiments/*/*.ko
+          if-no-files-found: warn
