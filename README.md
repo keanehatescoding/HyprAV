@@ -33,6 +33,9 @@ experiments/          - throwaway learning modules, not tagged/released
   hello/              - minimal LKM: module_init/module_exit, dmesg logging
   procfs_demo/        - /proc entry you can read/write from userspace
   kprobe_log/         - kprobe on execve that just logs filenames (no blocking)
+tests/
+  test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
+  test_detection.sh    - full build/load/detect/unload integration test
 ```
 
 ## Architecture: what lives in the kernel vs. userspace
@@ -109,6 +112,34 @@ sudo cat /proc/kallsyms | grep sys_execve
 ```
 
 and adjust `HOOKED_SYSCALL_NAME` in the source accordingly.
+
+## Automated tests
+
+`tests/` has two scripts — both run *inside your VM*, not in CI (see
+the CI section below for why):
+
+- **`test_sigtable.sh`** — exercises the `avctl`/`/proc` protocol: add,
+  list, del, and rejection of malformed input. Run against an
+  already-loaded module:
+  ```bash
+  sudo insmod av/av.ko    # if not already loaded
+  cd userspace/avctl && make && cd ../..
+  tests/test_sigtable.sh
+  ```
+
+- **`test_detection.sh`** — full integration test: builds the module,
+  loads it, runs a known-clean command and verifies it's logged clean
+  (and not killed), creates and runs the EICAR test file and verifies
+  it's detected and killed, then unloads. Needs root (insmod/rmmod):
+  ```bash
+  sudo tests/test_detection.sh
+  ```
+
+Run `test_detection.sh` from a fresh snapshot when testing anything that
+touches `handler_pre`/`av_work_fn` — same caution as manual testing.
+Both scripts print a pass/fail count and exit non-zero on any failure,
+so they're suitable for a pre-commit or pre-tag check even without CI
+runtime support.
 
 ## Testing signature detection safely
 
