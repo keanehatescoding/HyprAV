@@ -31,18 +31,34 @@ experiments/          - throwaway learning modules, not tagged/released
   kprobe_log/         - kprobe on execve that just logs filenames (no blocking)
 ```
 
+## Architecture: what lives in the kernel vs. userspace
+
+Most of the roadmap below is deliberately **not** kernel code. The kernel
+module's job is narrow: intercept execve/file events cheaply, do fast
+checks (hash lookup, simple counters), and enforce (kill/deny). Anything
+slow, complex, or using large libraries — YARA matching, ELF parsing,
+entropy math, fuzzy hashing — belongs in a userspace daemon that the
+kernel module talks to (via `/proc`, `debugfs`, or netlink), for the same
+reason the workqueue fix mattered: you don't want blocking, heavyweight,
+or crash-prone logic running in kernel context on every process launch.
+
 ## Releases
 
 Milestones are marked with annotated git tags on `av/`, not separate
-directories. Suggested progression:
+directories.
 
-| Tag      | What it adds                                              |
-|----------|------------------------------------------------------------|
-| `v0.1.0` | kprobe execve hook + in-kernel SHA-256 + hardcoded signature list, kill on match |
-| `v0.2.0` | signature DB moved to a kernel hashtable, populated from userspace via `/proc` or `debugfs` |
-| `v0.3.0` | behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) |
-| `v0.4.0` | fuzzy hashing via a userspace daemon |
-| `v1.0.0` | quarantine policy, structured logging, performance benchmarks |
+| Tag | Feature | Where it lives |
+|-----|---------|-----------------|
+| `v0.1.0` ✅ | Hash-based detection (SHA-256), kprobe execve hook, kill on match | kernel |
+| `v0.2.0` | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, populated from userspace via `/proc`/`debugfs` | kernel |
+| `v0.3.0` | YARA rule scanning | userspace daemon (libyara), kernel forwards flagged paths, daemon returns a verdict |
+| `v0.4.0` | String & API heuristics (suspicious imported symbols — `ptrace`, `memfd_create`, ELF symbol table scanning) | userspace |
+| `v0.5.0` | ELF header & section analysis (suspicious section names, RWX-permission sections, anomalous entry points) | userspace |
+| `v0.6.0` | Entropy analysis (Shannon entropy per section — packed/encrypted binary detection) | userspace |
+| `v0.7.0` | Fuzzy hashing (ssdeep/TLSH) against a known-sample corpus | userspace |
+| `v0.8.0` | Behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) | kernel (workqueue-deferred, same pattern as v0.1.0) |
+| `v0.9.0` | Evasion resistance — adversarial testing against your own engine (packing, obfuscation, timing-based sandbox detection) and documenting what does/doesn't get caught | test suite + report, not shipped code |
+| `v1.0.0` | Quarantine policy, structured logging, performance benchmarks | kernel + userspace |
 
 Tagging a milestone once it's working and tested:
 
