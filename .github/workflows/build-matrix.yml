@@ -162,6 +162,14 @@ jobs:
           # a genuinely clean binary should NOT match
           ! yara rules/heuristics.yar /bin/ls | grep -q Imports_Ptrace
 
+      - name: Smoke-test elf_analysis.yar against a real UPX-packed binary
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y upx-ucl
+          upx --best -o /tmp/upx_packed /tmp/ptrace_test
+          yara rules/elf_analysis.yar /tmp/upx_packed | grep -q No_Section_Headers
+          ! yara rules/elf_analysis.yar /bin/ls | grep -q No_Section_Headers
+
       - uses: actions/upload-artifact@v4
         with:
           name: avd

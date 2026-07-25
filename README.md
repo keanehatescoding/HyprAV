@@ -41,6 +41,11 @@ rules/
                         module (ptrace, memfd_create, mprotect, dlopen,
                         plus a compound rule) - see the confidence notes
                         in the file, these are individually weak signals
+  elf_analysis.yar      - v0.5.0: ELF structural analysis (no section
+                        headers, executable stack, RWX segments, entry
+                        point outside .text) - higher confidence than
+                        heuristics.yar, verified against a real UPX-packed
+                        binary
 userspace/
   avctl/              - CLI for managing the signature DB via /proc
     avctl.c
@@ -83,7 +88,7 @@ directories.
 | `v0.3.0-prep` ✅ | Kernel↔daemon Generic Netlink channel (`netlink_chan.c`, `avd` skeleton) — plumbing, verified against real kernel/libnl headers | kernel + `avd` |
 | `v0.3.0` ✅ | Real YARA rule scanning — `avd` loads `rules/*.yar` and scans on a signature miss; verified against a real EICAR match at runtime | userspace daemon (libyara) |
 | `v0.4.0` ✅ | String & API heuristics via YARA's `elf` module (imported dynamic symbols: `ptrace`, `memfd_create`, `mprotect`, `dlopen`, plus a compound rule) — verified against real ptrace-importing binaries | userspace (`rules/heuristics.yar`) |
-| `v0.5.0` | ELF header & section analysis (suspicious section names, RWX-permission sections, anomalous entry points) | userspace |
+| `v0.5.0` ✅ | ELF header & section analysis — no section headers (packer indicator), executable stack, RWX segments, entry point outside `.text` — verified against a real UPX-packed binary | userspace (`rules/elf_analysis.yar`) |
 | `v0.6.0` | Entropy analysis (Shannon entropy per section — packed/encrypted binary detection) | userspace |
 | `v0.7.0` | Fuzzy hashing (ssdeep/TLSH) against a known-sample corpus | userspace |
 | `v0.8.0` | Behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) | kernel (workqueue-deferred, same pattern as v0.1.0) |
@@ -348,6 +353,45 @@ your report — run `strace` itself through `insmod`'d module and show
 it gets flagged, then discuss why single-heuristic detection isn't
 production-ready without the later milestones (entropy, fuzzy hashing,
 behavioral correlation) to corroborate.
+
+## Testing the ELF structural analysis (v0.5.0)
+
+Unlike `heuristics.yar`'s import checks, these were verified against a
+**genuinely packed binary**, not just a synthetic test case:
+
+```bash
+sudo apt-get install -y upx-ucl   # or: sudo pacman -S upx
+
+gcc -o /tmp/ptrace_test /tmp/ptrace_test.c  # from the v0.4.0 section above
+upx --best -o /tmp/upx_packed /tmp/ptrace_test
+
+yara rules/elf_analysis.yar /tmp/upx_packed
+# expect: No_Section_Headers AND Entry_Point_Outside_Text
+# (UPX strips section headers entirely, which is why both fire for the
+#  same underlying reason - no .text section exists to check against)
+
+yara rules/elf_analysis.yar /bin/ls
+# expect: no output (clean binaries shouldn't match)
+```
+
+For the executable-stack rule specifically:
+
+```bash
+gcc -z execstack -o /tmp/execstack_test /tmp/ptrace_test.c
+yara rules/elf_analysis.yar /tmp/execstack_test
+# expect: Executable_Stack
+```
+
+`Has_RWX_Segment` is logically sound (checks `PT_LOAD` segments for both
+`PF_W` and `PF_X`) but wasn't verified against a real sample — producing
+a genuine RWX `PT_LOAD` segment needs a deliberately crafted binary or
+linker script, which is a reasonable thing to build as a follow-up test
+case for your report (framed as "how would I verify a detector I can't
+easily produce a positive sample for").
+
+Full round trip: same as before — `avd` loads all `*.yar` files in
+`rules/` automatically, so restart `avd` after adding this file and the
+new rules are active immediately.
 
 ## Toolchain support (GCC / Clang)
 
