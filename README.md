@@ -22,9 +22,13 @@ rmmod av
 
 ```
 av/                  - the actual antivirus module (single, evolving)
-  av.c
-  signatures.h
+  main.c              - kprobe hook, workqueue, multi-algorithm hashing
+  sigtable.c/.h       - kernel hashtable signature store + /proc interface
   Makefile
+userspace/
+  avctl/              - CLI for managing the signature DB via /proc
+    avctl.c
+    Makefile
 experiments/          - throwaway learning modules, not tagged/released
   hello/              - minimal LKM: module_init/module_exit, dmesg logging
   procfs_demo/        - /proc entry you can read/write from userspace
@@ -50,7 +54,7 @@ directories.
 | Tag | Feature | Where it lives |
 |-----|---------|-----------------|
 | `v0.1.0` ✅ | Hash-based detection (SHA-256), kprobe execve hook, kill on match | kernel |
-| `v0.2.0` | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, populated from userspace via `/proc`/`debugfs` | kernel |
+| `v0.2.0` ✅ | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, managed at runtime via `/proc/kernel_av_signatures` (or the `avctl` CLI) | kernel + `avctl` CLI |
 | `v0.3.0` | YARA rule scanning | userspace daemon (libyara), kernel forwards flagged paths, daemon returns a verdict |
 | `v0.4.0` | String & API heuristics (suspicious imported symbols — `ptrace`, `memfd_create`, ELF symbol table scanning) | userspace |
 | `v0.5.0` | ELF header & section analysis (suspicious section names, RWX-permission sections, anomalous entry points) | userspace |
@@ -116,11 +120,31 @@ a hash you can add to your signature list.
 # create it
 printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
 chmod +x /tmp/eicar.com
-sha256sum /tmp/eicar.com   # add this hash to signatures.h
+sha256sum /tmp/eicar.com
 ```
 
-Then try to execute it (`/tmp/eicar.com`) and confirm your module logs a
-detection and kills it before it runs.
+As of v0.2.0, the module seeds the EICAR SHA-256 signature automatically
+at load time — no manual step needed. Check it's there:
+
+```bash
+cd userspace/avctl && make
+./avctl list
+```
+
+Then trigger it:
+
+```bash
+/tmp/eicar.com
+dmesg | tail -5     # DETECTED ... - killing
+```
+
+To manage signatures manually:
+
+```bash
+./avctl add sha256 <hex> "some-name"
+./avctl del sha256 <hex>
+./avctl list
+```
 
 ## Toolchain support (GCC / Clang)
 
