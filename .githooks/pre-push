@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# .githooks/pre-push - runs the full build+load+detect+unload test suite
+# before anything leaves your machine, but ONLY when the push actually
+# touches av/ or userspace/avctl/ - a docs-only push shouldn't insmod a
+# kernel module.
+#
+# This needs sudo (insmod/rmmod) and should only run inside your VM.
+#
+# Enable with: scripts/setup-hooks.sh   (or: git config core.hooksPath .githooks)
+# Bypass once with: git push --no-verify (not recommended, especially
+# right before tagging a release)
+
+set -uo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 1
+
+ZERO_SHA="0000000000000000000000000000000000000000"
+CHANGED_FILES=""
+
+# git feeds pre-push one line per ref being pushed, on stdin:
+#   <local ref> <local sha1> <remote ref> <remote sha1>
+while read -r local_ref local_sha remote_ref remote_sha; do
+    if [ "$local_sha" = "$ZERO_SHA" ]; then
+        continue  # deleting a remote ref - nothing to test
+    fi
+    if [ "$remote_sha" = "$ZERO_SHA" ]; then
+        # new branch/tag on the remote - diff isn't meaningful, just
+        # list every file in the pushed tree
+        files="$(git diff-tree --no-commit-id --name-only -r "$local_sha")"
+    else
+        files="$(git diff --name-only "$remote_sha" "$local_sha")"
+    fi
+    CHANGED_FILES="$CHANGED_FILES
+$files"
+done
+
+if ! printf '%s' "$CHANGED_FILES" | grep -qE '^(av/|userspace/avctl/)'; then
+    echo "pre-push: no changes under av/ or userspace/avctl/ - skipping test suite"
+    exit 0
+fi
+
+echo "==> pre-push: changes detected in av/ or userspace/avctl/"
+echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
+
+if ! sudo -v; then
+    echo
+    echo "pre-push: could not get sudo - aborting push. Run manually, then push again:"
+    echo "  sudo tests/run_all.sh"
+    exit 1
+fi
+
+if sudo tests/run_all.sh; then
+    echo "pre-push: all tests passed"
+    exit 0
+else
+    echo
+    echo "pre-push: tests FAILED - push aborted."
+    echo "Fix the issue, or bypass with:"
+    echo "  git push --no-verify   (not recommended, especially before a tag)"
+    exit 1
+fi

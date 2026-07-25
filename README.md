@@ -21,6 +21,11 @@ rmmod av
 ## Repo layout
 
 ```
+.githooks/
+  pre-commit          - lint on commit (fast, no build)
+  pre-push            - full test suite on push (only if av/ or avctl changed)
+scripts/
+  setup-hooks.sh       - one-time: git config core.hooksPath .githooks
 av/                  - the actual antivirus module (single, evolving)
   main.c              - kprobe hook, workqueue, multi-algorithm hashing
   sigtable.c/.h       - kernel hashtable signature store + /proc interface
@@ -36,6 +41,7 @@ experiments/          - throwaway learning modules, not tagged/released
 tests/
   test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
   test_detection.sh    - full build/load/detect/unload integration test
+  run_all.sh           - runs both of the above (used by the pre-push hook)
 ```
 
 ## Architecture: what lives in the kernel vs. userspace
@@ -112,6 +118,29 @@ sudo cat /proc/kallsyms | grep sys_execve
 ```
 
 and adjust `HOOKED_SYSCALL_NAME` in the source accordingly.
+
+## Git hooks (lint on commit, full tests on push)
+
+One-time setup after cloning:
+
+```bash
+scripts/setup-hooks.sh
+```
+
+This points git at the tracked hooks in `.githooks/` instead of the
+default untracked `.git/hooks/`:
+
+- **pre-commit** — fast lint only (cppcheck on `av/` and
+  `userspace/avctl/`, `gcc -fsyntax-only` on the CLI, shellcheck on test
+  scripts). No build, no insmod — stays quick so it doesn't discourage
+  committing.
+- **pre-push** — runs `tests/run_all.sh` (build, insmod, EICAR
+  detection, unload) via sudo, but **only** when the push actually
+  touches `av/` or `userspace/avctl/` — a docs-only push won't load a
+  kernel module.
+
+Both are bypassable with `--no-verify` if you genuinely need to, but
+avoid that right before tagging a release.
 
 ## Automated tests
 

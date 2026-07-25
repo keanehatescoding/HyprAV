@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+#
+# .githooks/pre-commit - fast lint checks on staged files.
+# Kept deliberately quick (no build, no insmod) so it doesn't discourage
+# committing. The full test suite runs at push time instead - see
+# .githooks/pre-push.
+#
+# Enable with: scripts/setup-hooks.sh   (or: git config core.hooksPath .githooks)
+# Bypass once with: git commit --no-verify (not recommended)
+
+set -uo pipefail
+
+FAIL=0
+STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
+
+if [ -z "$STAGED" ]; then
+    exit 0
+fi
+
+echo "==> pre-commit: linting staged files"
+
+for f in $STAGED; do
+    [ -f "$f" ] || continue
+
+    case "$f" in
+        av/*.c|av/*.h)
+            if command -v cppcheck >/dev/null 2>&1; then
+                echo "  - cppcheck: $f"
+                cppcheck --quiet --enable=warning,style,performance \
+                    --suppress=missingIncludeSystem --error-exitcode=1 "$f" || FAIL=1
+            else
+                echo "  ! cppcheck not installed - skipping static analysis for $f"
+                echo "    (sudo pacman -S cppcheck  /  apt install cppcheck)"
+            fi
+            # Optional stricter kernel style check, only if you point
+            # CHECKPATCH at a full kernel source tree's scripts/checkpatch.pl
+            # (not included in headers-only packages, so this is opt-in).
+            if [ -n "${CHECKPATCH:-}" ] && [ -x "${CHECKPATCH:-}" ]; then
+                echo "  - checkpatch.pl: $f"
+                "$CHECKPATCH" --no-tree --terse -f "$f" || FAIL=1
+            fi
+            ;;
+        userspace/avctl/*.c)
+            echo "  - gcc -fsyntax-only: $f"
+            gcc -fsyntax-only -Wall -Wextra "$f" || FAIL=1
+            if command -v cppcheck >/dev/null 2>&1; then
+                echo "  - cppcheck: $f"
+                cppcheck --quiet --enable=warning,style --error-exitcode=1 "$f" || FAIL=1
+            fi
+            ;;
+        tests/*.sh|.githooks/*)
+            if command -v shellcheck >/dev/null 2>&1; then
+                echo "  - shellcheck: $f"
+                shellcheck "$f" || FAIL=1
+            else
+                echo "  - bash -n (shellcheck not installed): $f"
+                bash -n "$f" || FAIL=1
+            fi
+            ;;
+        *.yml|*.yaml)
+            if command -v yamllint >/dev/null 2>&1; then
+                echo "  - yamllint: $f"
+                yamllint "$f" || FAIL=1
+            fi
+            ;;
+    esac
+done
+
+if [ "$FAIL" -ne 0 ]; then
+    echo
+    echo "pre-commit: lint failed - fix the issues above, or bypass with"
+    echo "  git commit --no-verify   (not recommended)"
+    exit 1
+fi
+
+echo "pre-commit: lint passed"
+exit 0
