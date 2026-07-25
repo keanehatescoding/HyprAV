@@ -23,62 +23,86 @@ jobs:
           - "6.12.96"  # LTS
           - "6.18.21"  # LTS
           - "7.1.4"    # current stable
+        # A module generally must be built with the same compiler family
+        # as the target kernel, especially under LTO/CFI configs - e.g.
+        # CachyOS ships a Clang-built kernel variant. Rather than branch
+        # the repo per toolchain, we build BOTH the kernel and the module
+        # with the same compiler on each leg of this matrix.
+        toolchain: [gcc, clang]
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install build dependencies
+      - name: Install build dependencies (gcc)
+        if: matrix.toolchain == 'gcc'
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev libelf-dev
+
+      - name: Install build dependencies (clang)
+        if: matrix.toolchain == 'clang'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm bc bison flex libssl-dev libelf-dev
 
       - name: Cache built kernel tree
         id: cache-kernel
         uses: actions/cache@v4
         with:
-          path: linux-${{ matrix.kernel_version }}
-          key: kernel-tree-v2-${{ matrix.kernel_version }}
+          path: linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          key: kernel-tree-v3-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
+          SRCDIR="linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}"
           curl -fL -o linux.tar.xz \
             "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
-          tar -xf linux.tar.xz
+          mkdir -p "$SRCDIR"
+          tar -xf linux.tar.xz -C "$SRCDIR" --strip-components=1
           rm linux.tar.xz
-          cd "linux-${{ matrix.kernel_version }}"
+          cd "$SRCDIR"
+          LLVM_ARG=""
+          if [ "${{ matrix.toolchain }}" = "clang" ]; then LLVM_ARG="LLVM=1"; fi
           # modules_prepare alone does NOT produce a real Module.symvers -
           # that file is only populated by actually compiling the kernel
           # source that contains EXPORT_SYMBOL() calls. A full defconfig
           # build works but takes 30-60+ minutes; tinyconfig + just the
           # subsystems our modules touch gets a real, complete symbol
           # table in a few minutes instead.
-          make tinyconfig
+          make $LLVM_ARG tinyconfig
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_CRYPTO
           ./scripts/config --enable CONFIG_CRYPTO_HASH
           ./scripts/config --enable CONFIG_CRYPTO_SHA256
           ./scripts/config --enable CONFIG_PROC_FS
-          make olddefconfig
-          make -j"$(nproc)"
+          make $LLVM_ARG olddefconfig
+          make $LLVM_ARG -j"$(nproc)"
 
       - name: Build av/ against this kernel tree
         run: |
           set -euxo pipefail
-          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}"
-          make -C av KDIR="$KDIR" clean
-          make -C av KDIR="$KDIR"
+          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}"
+          if [ "${{ matrix.toolchain }}" = "clang" ]; then
+            make -C av KDIR="$KDIR" CC=clang LLVM=1 clean
+            make -C av KDIR="$KDIR" CC=clang LLVM=1
+          else
+            make -C av KDIR="$KDIR" clean
+            make -C av KDIR="$KDIR"
+          fi
 
       - name: Build experiments/ against this kernel tree
         run: |
           set -euxo pipefail
-          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}"
+          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}"
+          EXTRA_ARGS=""
+          if [ "${{ matrix.toolchain }}" = "clang" ]; then EXTRA_ARGS="CC=clang LLVM=1"; fi
           for d in experiments/hello experiments/procfs_demo experiments/kprobe_log; do
             echo "::group::Building $d"
-            make -C "$d" KDIR="$KDIR" clean
-            make -C "$d" KDIR="$KDIR"
+            make -C "$d" KDIR="$KDIR" $EXTRA_ARGS clean
+            make -C "$d" KDIR="$KDIR" $EXTRA_ARGS
             echo "::endgroup::"
           done
 
@@ -86,7 +110,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: modules-${{ matrix.kernel_version }}
+          name: modules-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
           path: |
             av/*.ko
             experiments/*/*.ko

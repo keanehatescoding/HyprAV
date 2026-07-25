@@ -25,7 +25,7 @@ struct av_signature {
 static const struct av_signature known_signatures[] = {
     {
         .name = "EICAR-Test-File",
-        .sha256_hex = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0",
+        .sha256_hex = "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
     },
     /* Add more entries here as you build out your test corpus. */
 };

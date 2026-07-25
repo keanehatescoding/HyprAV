@@ -106,6 +106,24 @@ sha256sum /tmp/eicar.com   # add this hash to signatures.h
 Then try to execute it (`/tmp/eicar.com`) and confirm your module logs a
 detection and kills it before it runs.
 
+## Toolchain support (GCC / Clang)
+
+A kernel module generally must be built with the same compiler family as
+the target kernel — this matters if you're testing against a Clang-built
+kernel (e.g. CachyOS's `-clang` variant), especially under LTO/CFI
+configs. Rather than maintaining separate branches (which would mean
+manually porting every fix to both), the Makefiles take `CC`/`LLVM`
+overrides that get passed straight through to the kernel build system:
+
+```bash
+make                    # default: GCC
+make CC=clang LLVM=1    # build against a Clang-built kernel
+```
+
+CI builds and tests both toolchains against all three kernel versions (6
+matrix legs total) — see the `toolchain` matrix dimension in
+`build-matrix.yml`.
+
 ## CI
 
 `.github/workflows/build-matrix.yml` compile-tests `av/` (and the
