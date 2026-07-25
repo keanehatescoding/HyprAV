@@ -149,6 +149,19 @@ jobs:
           printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
           yara rules/test.yar /tmp/eicar.com | grep -q EICAR_Test_String
 
+      - name: Smoke-test heuristics.yar against a real ptrace-importing binary
+        run: |
+          set -euxo pipefail
+          cat > /tmp/ptrace_test.c << 'EOF'
+          #include <sys/ptrace.h>
+          #include <stddef.h>
+          int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
+          EOF
+          gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
+          yara rules/heuristics.yar /tmp/ptrace_test | grep -q Imports_Ptrace
+          # a genuinely clean binary should NOT match
+          ! yara rules/heuristics.yar /bin/ls | grep -q Imports_Ptrace
+
       - uses: actions/upload-artifact@v4
         with:
           name: avd

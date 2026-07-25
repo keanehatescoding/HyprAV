@@ -36,8 +36,11 @@ av/                  - the actual antivirus module (single, evolving)
   Makefile
 rules/
   test.yar             - sample YARA rules used for testing avd (EICAR string
-                        match, a toy reverse-shell pattern) - add real rule
-                        sets here once testing against actual samples
+                        match, a toy reverse-shell pattern)
+  heuristics.yar        - v0.4.0: API import heuristics using YARA's elf
+                        module (ptrace, memfd_create, mprotect, dlopen,
+                        plus a compound rule) - see the confidence notes
+                        in the file, these are individually weak signals
 userspace/
   avctl/              - CLI for managing the signature DB via /proc
     avctl.c
@@ -79,7 +82,7 @@ directories.
 | `v0.2.0` ✅ | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, managed at runtime via `/proc/kernel_av_signatures` (or the `avctl` CLI) | kernel + `avctl` CLI |
 | `v0.3.0-prep` ✅ | Kernel↔daemon Generic Netlink channel (`netlink_chan.c`, `avd` skeleton) — plumbing, verified against real kernel/libnl headers | kernel + `avd` |
 | `v0.3.0` ✅ | Real YARA rule scanning — `avd` loads `rules/*.yar` and scans on a signature miss; verified against a real EICAR match at runtime | userspace daemon (libyara) |
-| `v0.4.0` | String & API heuristics (suspicious imported symbols — `ptrace`, `memfd_create`, ELF symbol table scanning) | userspace |
+| `v0.4.0` ✅ | String & API heuristics via YARA's `elf` module (imported dynamic symbols: `ptrace`, `memfd_create`, `mprotect`, `dlopen`, plus a compound rule) — verified against real ptrace-importing binaries | userspace (`rules/heuristics.yar`) |
 | `v0.5.0` | ELF header & section analysis (suspicious section names, RWX-permission sections, anomalous entry points) | userspace |
 | `v0.6.0` | Entropy analysis (Shannon entropy per section — packed/encrypted binary detection) | userspace |
 | `v0.7.0` | Fuzzy hashing (ssdeep/TLSH) against a known-sample corpus | userspace |
@@ -304,7 +307,51 @@ test, not a formality — watch `dmesg` closely, and have a snapshot
 ready per the usual caution with new kprobe/workqueue-adjacent code
 paths.
 
+## Testing the API heuristics (v0.4.0)
+
+These rules use YARA's `elf` module to check the dynamic symbol table
+directly rather than doing raw string matching — more precise (only
+fires on genuine imports, not the name appearing anywhere in the
+file), but every individual rule is still a weak, high-false-positive
+signal. Read the confidence notes in `rules/heuristics.yar` before
+trusting any single match.
+
+Quick standalone check (no kernel module needed — this exercises the
+YARA rule logic in isolation):
+
+```bash
+cat > /tmp/ptrace_test.c << 'EOF'
+#include <sys/ptrace.h>
+#include <stddef.h>
+int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
+EOF
+gcc -o /tmp/ptrace_test /tmp/ptrace_test.c
+
+yara rules/heuristics.yar /tmp/ptrace_test
+# expect: Imports_Ptrace /tmp/ptrace_test
+
+yara rules/heuristics.yar /bin/ls
+# expect: no output (clean binaries shouldn't match)
+```
+
+Full round trip through the kernel + daemon works the same way as the
+YARA testing section above — `avd` loads every `*.yar` file in `rules/`
+automatically, so `heuristics.yar` is active as soon as you restart
+`avd`, no separate wiring needed. Running the compiled `/tmp/ptrace_test`
+binary should produce a `MATCH` line in `avd`'s output listing
+`Imports_Ptrace`, and a `DETECTED ... via daemon` kill in `dmesg`.
+
+**Expect false positives.** Legitimate tools that use `ptrace` (like
+`strace` or a debugger) or `memfd_create` (some package managers,
+`systemd`) will also match. This is worth demonstrating deliberately in
+your report — run `strace` itself through `insmod`'d module and show
+it gets flagged, then discuss why single-heuristic detection isn't
+production-ready without the later milestones (entropy, fuzzy hashing,
+behavioral correlation) to corroborate.
+
 ## Toolchain support (GCC / Clang)
+
+
 
 A kernel module generally must be built with the same compiler family as
 the target kernel — this matters if you're testing against a Clang-built

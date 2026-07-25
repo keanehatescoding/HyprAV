@@ -184,7 +184,8 @@ static int load_rules(const char *dir)
 
 struct yara_match_ctx {
     int matched;
-    char rule_name[AV_RULE_NAME_MAXLEN + 1];
+    int match_count;
+    char rule_name[AV_RULE_NAME_MAXLEN + 1]; /* comma-joined, truncated to fit */
 };
 
 static int yara_callback(YR_SCAN_CONTEXT *context, int message,
@@ -196,11 +197,22 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
 
     if (message == CALLBACK_MSG_RULE_MATCHING) {
         YR_RULE *rule = (YR_RULE *)message_data;
+        size_t used = strlen(ctx->rule_name);
+        size_t remaining = sizeof(ctx->rule_name) - used;
 
         ctx->matched = 1;
-        snprintf(ctx->rule_name, sizeof(ctx->rule_name), "%s",
-                 rule->identifier);
-        return CALLBACK_ABORT; /* first match is enough for our purposes */
+        ctx->match_count++;
+
+        /* Collect every matching rule rather than stopping at the
+         * first - with related rules (e.g. Imports_Ptrace and the
+         * compound Multiple_Suspicious_Imports both matching the same
+         * file), aborting early could hide the more meaningful
+         * compound match behind a low-confidence single-API one. */
+        if (remaining > 1) {
+            snprintf(ctx->rule_name + used, remaining, "%s%s",
+                     used > 0 ? "," : "", rule->identifier);
+        }
+        return CALLBACK_CONTINUE;
     }
 
     return CALLBACK_CONTINUE;
@@ -209,7 +221,7 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
 static void handle_scan_request(uint64_t reqid, uint32_t pid,
                                  const char *path, const char *sha256_hex)
 {
-    struct yara_match_ctx ctx = { .matched = 0, .rule_name = "" };
+    struct yara_match_ctx ctx = { .matched = 0, .match_count = 0, .rule_name = "" };
     int ret;
 
     printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
@@ -233,7 +245,8 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
     }
 
     if (ctx.matched) {
-        printf("avd: MATCH \"%s\" -> rule \"%s\"\n", path, ctx.rule_name);
+        printf("avd: MATCH \"%s\" -> %d rule(s): \"%s\"\n",
+               path, ctx.match_count, ctx.rule_name);
         send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
     } else {
         send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
