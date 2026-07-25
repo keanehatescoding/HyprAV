@@ -46,6 +46,10 @@ rules/
                         point outside .text) - higher confidence than
                         heuristics.yar, verified against a real UPX-packed
                         binary
+  entropy.yar           - v0.6.0: whole-file and per-section Shannon
+                        entropy - threshold (7.0/8.0) calibrated against
+                        real samples, catches packers that strip AND
+                        packers that keep section headers
 userspace/
   avctl/              - CLI for managing the signature DB via /proc
     avctl.c
@@ -89,7 +93,7 @@ directories.
 | `v0.3.0` ✅ | Real YARA rule scanning — `avd` loads `rules/*.yar` and scans on a signature miss; verified against a real EICAR match at runtime | userspace daemon (libyara) |
 | `v0.4.0` ✅ | String & API heuristics via YARA's `elf` module (imported dynamic symbols: `ptrace`, `memfd_create`, `mprotect`, `dlopen`, plus a compound rule) — verified against real ptrace-importing binaries | userspace (`rules/heuristics.yar`) |
 | `v0.5.0` ✅ | ELF header & section analysis — no section headers (packer indicator), executable stack, RWX segments, entry point outside `.text` — verified against a real UPX-packed binary | userspace (`rules/elf_analysis.yar`) |
-| `v0.6.0` | Entropy analysis (Shannon entropy per section — packed/encrypted binary detection) | userspace |
+| `v0.6.0` ✅ | Entropy analysis — whole-file and per-section Shannon entropy, threshold calibrated against real samples (normal binary, packed binary, random data) | userspace (`rules/entropy.yar`) |
 | `v0.7.0` | Fuzzy hashing (ssdeep/TLSH) against a known-sample corpus | userspace |
 | `v0.8.0` | Behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) | kernel (workqueue-deferred, same pattern as v0.1.0) |
 | `v0.9.0` | Evasion resistance — adversarial testing against your own engine (packing, obfuscation, timing-based sandbox detection) and documenting what does/doesn't get caught | test suite + report, not shipped code |
@@ -392,6 +396,58 @@ easily produce a positive sample for").
 Full round trip: same as before — `avd` loads all `*.yar` files in
 `rules/` automatically, so restart `avd` after adding this file and the
 new rules are active immediately.
+
+## Testing the entropy analysis (v0.6.0)
+
+The 7.0 threshold was picked by actually measuring entropy across real
+samples, not guessed:
+
+```bash
+python3 -c "
+import math, collections
+def entropy(path):
+    data = open(path,'rb').read()
+    counts = collections.Counter(data)
+    n = len(data)
+    return -sum((c/n)*math.log2(c/n) for c in counts.values())
+print('ls:', entropy('/bin/ls'))               # ~5.9
+"
+```
+
+Whole-file check, using the same UPX-packed binary from v0.5.0:
+
+```bash
+head -c 100000 /dev/urandom > /tmp/random_sample.bin
+
+yara rules/entropy.yar /tmp/upx_packed
+# expect: High_Overall_Entropy
+
+yara rules/entropy.yar /tmp/random_sample.bin
+# expect: High_Overall_Entropy
+
+yara rules/entropy.yar /bin/ls
+# expect: no output (normal compiled code isn't high-entropy)
+```
+
+Per-section check — since UPX in default mode strips section headers
+entirely (so there's nothing for this rule to check), a real positive
+sample needs a binary that *keeps* sections but hides high-entropy
+content in one. `objcopy` can simulate this cleanly:
+
+```bash
+cp /tmp/ptrace_test /tmp/section_entropy_test
+objcopy --add-section .packed_data=/tmp/random_sample.bin \
+        --set-section-flags .packed_data=alloc,contents \
+        /tmp/section_entropy_test
+
+yara rules/entropy.yar /tmp/section_entropy_test
+# expect: High_Entropy_Section
+```
+
+Worth including in your report: these two rules are deliberately
+complementary rather than redundant — `High_Overall_Entropy` catches
+packers that strip sections (like UPX), `High_Entropy_Section` would
+catch ones that don't. Neither alone covers both cases.
 
 ## Toolchain support (GCC / Clang)
 

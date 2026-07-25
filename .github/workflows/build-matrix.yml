@@ -170,6 +170,20 @@ jobs:
           yara rules/elf_analysis.yar /tmp/upx_packed | grep -q No_Section_Headers
           ! yara rules/elf_analysis.yar /bin/ls | grep -q No_Section_Headers
 
+      - name: Smoke-test entropy.yar against real calibration samples
+        run: |
+          set -euxo pipefail
+          head -c 100000 /dev/urandom > /tmp/random_sample.bin
+          yara rules/entropy.yar /tmp/upx_packed | grep -q High_Overall_Entropy
+          yara rules/entropy.yar /tmp/random_sample.bin | grep -q High_Overall_Entropy
+          ! yara rules/entropy.yar /bin/ls | grep -q High_Overall_Entropy
+          # per-section check: inject a real high-entropy section and confirm it fires
+          cp /tmp/ptrace_test /tmp/section_entropy_test
+          objcopy --add-section .packed_data=/tmp/random_sample.bin \
+                  --set-section-flags .packed_data=alloc,contents \
+                  /tmp/section_entropy_test
+          yara rules/entropy.yar /tmp/section_entropy_test | grep -q High_Entropy_Section
+
       - uses: actions/upload-artifact@v4
         with:
           name: avd
