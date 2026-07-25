@@ -48,6 +48,16 @@ for f in $STAGED; do
                 cppcheck --quiet --enable=warning,style --error-exitcode=1 "$f" || FAIL=1
             fi
             ;;
+        userspace/avd/*.c)
+            NL_CFLAGS="$(pkg-config --cflags libnl-genl-3.0 2>/dev/null)"
+            if [ -z "$NL_CFLAGS" ]; then
+                echo "  ! libnl-genl-3.0 not found via pkg-config - skipping syntax check for $f"
+                echo "    (sudo pacman -S libnl  /  apt install libnl-genl-3-dev)"
+            else
+                echo "  - gcc -fsyntax-only: $f"
+                gcc -fsyntax-only -Wall -Wextra $NL_CFLAGS "$f" || FAIL=1
+            fi
+            ;;
         tests/*.sh|.githooks/*)
             if command -v shellcheck >/dev/null 2>&1; then
                 echo "  - shellcheck: $f"

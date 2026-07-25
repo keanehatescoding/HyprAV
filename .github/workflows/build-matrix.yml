@@ -49,7 +49,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
-          key: kernel-tree-v4-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          key: kernel-tree-v5-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -80,6 +80,7 @@ jobs:
           ./scripts/config --enable CONFIG_CRYPTO_SHA1
           ./scripts/config --enable CONFIG_CRYPTO_SHA256
           ./scripts/config --enable CONFIG_PROC_FS
+          ./scripts/config --enable CONFIG_NET
           make $LLVM_ARG olddefconfig
           make $LLVM_ARG -j"$(nproc)"
 
@@ -128,4 +129,20 @@ jobs:
         with:
           name: avctl
           path: userspace/avctl/avctl
+          if-no-files-found: error
+
+  build-avd:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libnl-genl
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libnl-genl-3-dev pkg-config
+      - name: Build avd
+        run: make -C userspace/avd
+      - uses: actions/upload-artifact@v4
+        with:
+          name: avd
+          path: userspace/avd/avd
           if-no-files-found: error

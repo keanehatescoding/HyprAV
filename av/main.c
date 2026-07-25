@@ -19,6 +19,14 @@
  *   - hashes are computed for MD5, SHA-1, and SHA-256 in a single file
  *     read pass; a match on any one algorithm triggers a kill
  *
+ * v0.3.0-prep changes:
+ *   - added a Generic Netlink channel (netlink_chan.c) to a userspace
+ *     daemon (avd). On a signature miss, the daemon gets a second look
+ *     (stubbed as always-clean until the real YARA/heuristic logic
+ *     lands in avd - see docs/netlink-protocol.md and
+ *     userspace/avd/avd.c). Fail-open if no daemon is connected or it
+ *     doesn't respond within DAEMON_TIMEOUT_MS.
+ *
  * Build:   make
  * Load:    sudo insmod av.ko
  * Seed:    a default EICAR SHA-256 signature is added at module load
@@ -43,9 +51,15 @@
 #include <linux/pid.h>
 
 #include "sigtable.h"
+#include "netlink_proto.h"
+#include "netlink_chan.h"
 
 #define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
 #define READ_CHUNK_SIZE     4096
+#define DAEMON_TIMEOUT_MS   2000 /* fail-open if the daemon doesn't answer
+                                   * in time - see docs/netlink-protocol.md
+                                   * for the fail-open vs fail-closed
+                                   * discussion */
 
 static struct kprobe kp = {
     .symbol_name = HOOKED_SYSCALL_NAME,
@@ -180,9 +194,46 @@ static void av_work_fn(struct work_struct *w)
             send_sig(SIGKILL, task, 0);
         }
         rcu_read_unlock();
-    } else {
-        pr_info("kernel-av: execve(\"%s\") md5=%s sha1=%s sha256=%s clean\n",
-                aw->path, digest.md5, digest.sha1, digest.sha256);
+        goto out;
+    }
+
+    /* No signature match - ask the userspace daemon (avd) for a second
+     * opinion (YARA/heuristics, once those land in v0.3.0+). Fail-open:
+     * if there's no daemon connected or it doesn't answer in time, we
+     * fall through and log clean rather than blocking exec indefinitely
+     * or killing on inconclusive information. See docs/netlink-protocol.md. */
+    {
+        int verdict = AV_VERDICT_CLEAN;
+        char rule_name[AV_RULE_NAME_MAXLEN + 1] = "";
+        int nl_ret;
+
+        nl_ret = av_netlink_scan_request(aw->path, digest.sha256,
+                                          pid_nr(aw->target_pid),
+                                          &verdict, rule_name,
+                                          sizeof(rule_name),
+                                          DAEMON_TIMEOUT_MS);
+        if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
+            rcu_read_lock();
+            task = pid_task(aw->target_pid, PIDTYPE_PID);
+            if (task) {
+                pr_alert("kernel-av: DETECTED \"%s\" via daemon, rule "
+                         "\"%s\" (pid %d) - killing\n",
+                         aw->path, rule_name, pid_nr(aw->target_pid));
+                send_sig(SIGKILL, task, 0);
+            }
+            rcu_read_unlock();
+        } else if (nl_ret == 0) {
+            pr_info("kernel-av: execve(\"%s\") md5=%s sha1=%s sha256=%s "
+                    "clean (daemon)\n",
+                    aw->path, digest.md5, digest.sha1, digest.sha256);
+        } else {
+            /* -ENOTCONN (no daemon), -ETIMEDOUT, or another error -
+             * fail open, but log distinctly so this is visible/greppable
+             * separately from a genuine daemon-confirmed clean verdict. */
+            pr_info("kernel-av: execve(\"%s\") md5=%s sha1=%s sha256=%s "
+                    "clean (no daemon verdict, err=%d)\n",
+                    aw->path, digest.md5, digest.sha1, digest.sha256, nl_ret);
+        }
     }
 
 out:
@@ -248,16 +299,24 @@ static int __init av_init(void)
         goto err_proc;
     }
 
+    ret = av_netlink_init();
+    if (ret) {
+        pr_err("kernel-av: failed to register netlink family: %d\n", ret);
+        goto err_wq;
+    }
+
     kp.pre_handler = handler_pre;
     ret = register_kprobe(&kp);
     if (ret < 0) {
         pr_err("kernel-av: register_kprobe failed: %d\n", ret);
-        goto err_wq;
+        goto err_netlink;
     }
 
     pr_info("kernel-av: loaded, %zu signature(s) active\n", av_sigtable_count());
     return 0;
 
+err_netlink:
+    av_netlink_exit();
 err_wq:
     destroy_workqueue(av_wq);
 err_proc:
@@ -273,6 +332,7 @@ static void __exit av_exit(void)
     /* destroy_workqueue() flushes all pending work first, so no work
      * item can run against unloaded module .text after this returns. */
     destroy_workqueue(av_wq);
+    av_netlink_exit();
     av_sigtable_proc_exit();
     av_sigtable_exit();
     pr_info("kernel-av: unloaded\n");
@@ -284,4 +344,4 @@ module_exit(av_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Keane");
 MODULE_DESCRIPTION("Signature-based execve detection with runtime-managed signature DB");
-MODULE_VERSION("0.2");
+MODULE_VERSION("0.3-pre");

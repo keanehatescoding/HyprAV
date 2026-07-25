@@ -26,13 +26,22 @@ rmmod av
   pre-push            - full test suite on push (only if av/ or avctl changed)
 scripts/
   setup-hooks.sh       - one-time: git config core.hooksPath .githooks
+docs/
+  netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
 av/                  - the actual antivirus module (single, evolving)
   main.c              - kprobe hook, workqueue, multi-algorithm hashing
   sigtable.c/.h       - kernel hashtable signature store + /proc interface
+  netlink_chan.c/.h   - Generic Netlink channel to avd (see docs/netlink-protocol.md)
+  netlink_proto.h     - protocol definitions shared with userspace/avd
   Makefile
 userspace/
   avctl/              - CLI for managing the signature DB via /proc
     avctl.c
+    Makefile
+  avd/                - daemon: receives scan requests over netlink, replies
+                        with a verdict. Currently a stub (always "clean") -
+                        real YARA/heuristic logic is the actual v0.3.0 feature.
+    avd.c
     Makefile
 experiments/          - throwaway learning modules, not tagged/released
   hello/              - minimal LKM: module_init/module_exit, dmesg logging
@@ -64,7 +73,8 @@ directories.
 |-----|---------|-----------------|
 | `v0.1.0` ✅ | Hash-based detection (SHA-256), kprobe execve hook, kill on match | kernel |
 | `v0.2.0` ✅ | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, managed at runtime via `/proc/kernel_av_signatures` (or the `avctl` CLI) | kernel + `avctl` CLI |
-| `v0.3.0` | YARA rule scanning | userspace daemon (libyara), kernel forwards flagged paths, daemon returns a verdict |
+| `v0.3.0-prep` 🚧 | Kernel↔daemon Generic Netlink channel (`netlink_chan.c`, `avd` skeleton) — plumbing only, `avd` currently always replies "clean" | kernel + `avd` (stub) |
+| `v0.3.0` | YARA rule scanning (the actual detection logic, replacing avd's stub) | userspace daemon (libyara) |
 | `v0.4.0` | String & API heuristics (suspicious imported symbols — `ptrace`, `memfd_create`, ELF symbol table scanning) | userspace |
 | `v0.5.0` | ELF header & section analysis (suspicious section names, RWX-permission sections, anomalous entry points) | userspace |
 | `v0.6.0` | Entropy analysis (Shannon entropy per section — packed/encrypted binary detection) | userspace |
@@ -72,6 +82,10 @@ directories.
 | `v0.8.0` | Behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) | kernel (workqueue-deferred, same pattern as v0.1.0) |
 | `v0.9.0` | Evasion resistance — adversarial testing against your own engine (packing, obfuscation, timing-based sandbox detection) and documenting what does/doesn't get caught | test suite + report, not shipped code |
 | `v1.0.0` | Quarantine policy, structured logging, performance benchmarks | kernel + userspace |
+
+`v0.3.0-prep` is worth tagging on its own once verified — see
+`docs/netlink-protocol.md` for the full protocol design, including a
+documented fail-open-on-timeout decision worth discussing in your report.
 
 Tagging a milestone once it's working and tested:
 
@@ -205,6 +219,59 @@ To manage signatures manually:
 ./avctl del sha256 <hex>
 ./avctl list
 ```
+
+## Testing the kernel↔daemon netlink plumbing (v0.3.0-prep)
+
+`avd` currently always replies "clean" — this only proves the round trip
+works end to end, not any real detection. Real YARA logic replaces the
+stub in `handle_scan_request()` (`userspace/avd/avd.c`) as the actual
+v0.3.0 feature.
+
+```bash
+# build everything
+cd av && make && cd ..
+cd userspace/avd && make && cd ../..
+
+# load the module first
+sudo insmod av/av.ko
+dmesg | tail -3   # "loaded, N signature(s) active"
+
+# start the daemon (separate terminal, or backgrounded)
+sudo userspace/avd/avd
+```
+
+You should see `avd: registered with kernel module (family id N), listening...`
+Now, in another terminal, run something that ISN'T a known signature
+(so it falls through to the daemon path):
+
+```bash
+ls
+```
+
+Expect to see in `avd`'s output:
+```
+avd: scan request reqid=1 pid=<pid> path="/usr/bin/ls" sha256=<hash>
+```
+
+And in `dmesg`:
+```
+kernel-av: execve("/usr/bin/ls") md5=... sha1=... sha256=... clean (daemon)
+```
+
+If `avd` isn't running, the same `ls` should still log clean, but via
+the fail-open path — check for the distinct `(no daemon verdict, err=-103)`
+suffix (`-103` is `-ECONNREFUSED`-adjacent territory; the exact errno
+depends on what failed — `-ENOTCONN` if `avd` never registered, or
+`-ETIMEDOUT` if it registered but didn't reply in time).
+
+**This whole path is unverified against a real running kernel at time of
+writing** — the kernel module build was compile/link-checked against
+real (if version-adjacent) kernel headers and the daemon was
+compile-checked against real libnl headers, but neither has actually
+been loaded and exercised together yet. Treat your first VM test run as
+a real test, not a formality — watch `dmesg` closely, and have a
+snapshot ready per the usual caution with new kprobe/workqueue-adjacent
+code paths.
 
 ## Toolchain support (GCC / Clang)
 

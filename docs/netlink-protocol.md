@@ -1,0 +1,100 @@
+# Kernel ↔ Daemon Protocol (Generic Netlink)
+
+Prerequisite plumbing for v0.3.0+ (YARA, string/API heuristics, ELF
+analysis, entropy, fuzzy hashing) — all of which are too heavy/complex to
+run in kernel context. This document + `av/netlink_chan.{c,h}` +
+`userspace/avd/` establish the request/response channel; the actual YARA
+matching logic still needs to be added inside `avd` as its own feature
+commit.
+
+## Why Generic Netlink
+
+Plain `/proc` works for occasional writes (adding signatures — see
+`sigtable.c`) but has no natural way for the **kernel to initiate** a
+message and get a **correlated reply** back per-event. Generic Netlink
+(genl) is the standard mechanism for this in Linux (systemd, udev,
+nl80211 all use it) and doesn't require reserving a new protocol number
+in the kernel headers the way a raw `NETLINK_*` family would.
+
+## Message flow
+
+```
+ kernel module                          avd (userspace daemon)
+ --------------                          ----------------------
+ module load
+   |
+   |<--------- AV_C_REGISTER ------------|   daemon starts, registers
+   |           (captures daemon's                its netlink port ID
+   |            portid for unicast)
+   |
+ [execve on an unknown file - no
+  signature match in sigtable]
+   |
+   |---------- AV_C_SCAN_REQUEST ------->|   unicast to daemon's portid
+   |           REQID, PID, PATH,             (kernel generates a unique
+   |           SHA256                        REQID per request)
+   |
+   |                                     [ daemon opens the file, runs
+   |                                       YARA / heuristics - not yet
+   |                                       implemented, stubbed as
+   |                                       "always clean" for now ]
+   |
+   |<--------- AV_C_VERDICT -------------|   REQID (echoed back),
+   |           VERDICT (0=clean/                VERDICT, RULE_NAME
+   |           1=malicious), RULE_NAME
+   |
+ [workqueue thread was blocked in
+  av_netlink_scan_request(), wakes
+  up via completion, matched by
+  REQID; kills the process if
+  VERDICT=malicious]
+```
+
+The workqueue thread (`av_work_fn` in `main.c`) blocks waiting for the
+verdict with a timeout (default 2000ms) — this is safe because it's
+process context, not the atomic kprobe path. If the daemon isn't
+running, isn't registered, or takes too long, the request fails
+gracefully and the file is treated as clean-by-default (fail-open) for
+now. **Fail-open vs fail-closed is a real design decision worth
+discussing in your report** — a security tool that fails open on
+timeout has a different threat model than one that fails closed
+(blocks execution until it gets an answer). Fail-open was chosen here
+to avoid the daemon crashing becoming a denial-of-service against the
+whole system; document this tradeoff explicitly.
+
+## Commands
+
+| Command | Direction | Purpose |
+|---|---|---|
+| `AV_C_REGISTER` | daemon → kernel | Daemon announces itself; kernel stores its netlink port ID for future unicasts. **Only one daemon connection is supported right now** — a second `REGISTER` overwrites the stored portid. |
+| `AV_C_SCAN_REQUEST` | kernel → daemon | Kernel asks the daemon to analyze a file. |
+| `AV_C_VERDICT` | daemon → kernel | Daemon's answer, correlated by `REQID`. |
+
+## Attributes
+
+| Attribute | Type | Used in | Notes |
+|---|---|---|---|
+| `AV_A_REQID` | u64 | SCAN_REQUEST, VERDICT | Kernel-generated, monotonically increasing. Daemon must echo it back unchanged — this is how concurrent requests (multiple execve calls in flight at once) get matched to the right waiter. |
+| `AV_A_PID` | u32 | SCAN_REQUEST | PID of the process that's executing the file (informational for the daemon; the kernel does its own `pid_task()` lookup for the actual kill). |
+| `AV_A_PATH` | nul-string | SCAN_REQUEST | Absolute path to the file. |
+| `AV_A_SHA256` | nul-string | SCAN_REQUEST | Precomputed SHA-256 (kernel already computed it for the signature check, may as well forward it — saves the daemon a redundant hash for logging/caching). |
+| `AV_A_VERDICT` | u8 | VERDICT | `0` = clean, `1` = malicious. |
+| `AV_A_RULE_NAME` | nul-string | VERDICT | Which rule/heuristic matched, for logging. Optional/empty on a clean verdict. |
+
+## Known limitations (document these in your report)
+
+- **Single daemon only.** No multi-client support, no auth on who can
+  `REGISTER` or send a `VERDICT` — any process that can open a netlink
+  socket can currently impersonate the daemon. Fine for a VM-only
+  student project; would need real access control for anything beyond
+  that.
+- **Fail-open on timeout/no-daemon**, as above — a deliberate but
+  debatable choice.
+- **Kernel netlink API surface is version-sensitive**, same caveat as
+  the syscall-wrapper kprobe hooking — `genl_family` struct layout has
+  changed across kernel versions (notably where `.policy` lives). This
+  code targets the layout used in kernels 5.10+, which covers all
+  three CI targets (6.12/6.18/7.1.4), but is worth re-checking if you
+  ever build against something older.
+- **Not yet wired into a real detector.** `avd` currently always
+  replies `clean` — this is plumbing, not v0.3.0's actual YARA feature.
