@@ -1,19 +1,21 @@
 /*
  * avd.c - userspace daemon: registers with the av kernel module over
- * Generic Netlink, receives scan requests, and replies with a verdict.
+ * Generic Netlink, receives scan requests, and replies with a verdict
+ * based on YARA rule matching against the file at the given path.
  *
- * STUB WARNING: this currently always replies "clean" - it's the
- * plumbing for v0.3.0 (YARA), not the feature itself. Real detection
- * logic (libyara integration) goes in handle_scan_request() below.
+ * v0.3.0: real detection logic - loads all *.yar files from a rules
+ * directory (default: ./rules, override with argv[1] or AVD_RULES_DIR)
+ * at startup, then scans each requested file against them.
  *
- * Compile-verified against real libnl-genl-3.0 headers (clean build,
- * -Wall -Wextra, no warnings). NOT yet runtime-tested against the
- * actual kernel module - the netlink_chan.c kernel side is unverified
- * against real kernel headers (see its own UNTESTED note), so the
- * first real test of this whole path happens together in your VM.
+ * Compile-verified against real libnl-genl-3.0 and libyara headers
+ * (clean build, -Wall -Wextra, no warnings) and the rules in rules/
+ * were verified to match with the real `yara` CLI. NOT yet
+ * runtime-tested end-to-end against the actual kernel module together
+ * with this - see docs/netlink-protocol.md and the top-level README's
+ * netlink testing section.
  *
- * Dependencies (Arch/CachyOS):  sudo pacman -S libnl
- * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev
+ * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara
+ * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev libyara-dev
  *
  * See docs/netlink-protocol.md for the full protocol design.
  */
@@ -22,16 +24,26 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
+#include <stdbool.h>
 
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
 #include <netlink/genl/ctrl.h>
 
+#include <yara.h>
+
 #include "../../av/netlink_proto.h"
+
+#define DEFAULT_RULES_DIR "rules"
+#define SCAN_TIMEOUT_SECS 10
 
 static struct nl_sock *sock;
 static int family_id;
 static volatile sig_atomic_t running = 1;
+static YR_RULES *compiled_rules;
 
 static void handle_sigint(int signum)
 {
@@ -83,20 +95,149 @@ nla_put_failure:
 }
 
 /*
- * STUB: this is where v0.3.0's actual detection logic goes (libyara
- * against the file at `path`, using `sha256_hex` for caching/logging).
- * For now: always clean, so the plumbing is testable end to end before
- * real detection logic is added.
+ * Loads every *.yar or *.yara file in `dir`, compiles them together, and
+ * stores the result in compiled_rules. Continues past individual file
+ * compile errors (reporting them) rather than failing the whole daemon
+ * over one bad rule file - a malformed rule shouldn't take detection
+ * offline entirely.
  */
+static int load_rules(const char *dir)
+{
+    YR_COMPILER *compiler = NULL;
+    DIR *d;
+    struct dirent *entry;
+    int loaded = 0;
+    int total_errors = 0;
+
+    if (yr_initialize() != ERROR_SUCCESS) {
+        fprintf(stderr, "avd: yr_initialize failed\n");
+        return -1;
+    }
+
+    if (yr_compiler_create(&compiler) != ERROR_SUCCESS) {
+        fprintf(stderr, "avd: yr_compiler_create failed\n");
+        yr_finalize();
+        return -1;
+    }
+
+    d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "avd: could not open rules directory \"%s\": %s\n",
+                dir, strerror(errno));
+        yr_compiler_destroy(compiler);
+        yr_finalize();
+        return -1;
+    }
+
+    while ((entry = readdir(d)) != NULL) {
+        char filepath[PATH_MAX];
+        size_t len = strlen(entry->d_name);
+        FILE *fp;
+        int errors;
+        bool is_yar = len >= 4 && !strcmp(entry->d_name + len - 4, ".yar");
+        bool is_yara = len >= 5 && !strcmp(entry->d_name + len - 5, ".yara");
+
+        if (!is_yar && !is_yara)
+            continue;
+
+        snprintf(filepath, sizeof(filepath), "%s/%s", dir, entry->d_name);
+
+        fp = fopen(filepath, "r");
+        if (!fp) {
+            fprintf(stderr, "avd: could not open rule file %s: %s\n",
+                    filepath, strerror(errno));
+            continue;
+        }
+
+        errors = yr_compiler_add_file(compiler, fp, NULL, filepath);
+        fclose(fp);
+
+        if (errors > 0) {
+            fprintf(stderr, "avd: %d error(s) compiling %s - skipping\n",
+                    errors, filepath);
+            total_errors += errors;
+        } else {
+            printf("avd: loaded rules from %s\n", filepath);
+            loaded++;
+        }
+    }
+    closedir(d);
+
+    if (loaded == 0)
+        fprintf(stderr, "avd: no valid rule files loaded from \"%s\" - "
+                        "all scans will report clean\n", dir);
+    if (total_errors > 0)
+        fprintf(stderr, "avd: %d total compile error(s) across all rule "
+                        "files - continuing with whatever DID compile\n",
+                total_errors);
+
+    if (yr_compiler_get_rules(compiler, &compiled_rules) != ERROR_SUCCESS) {
+        fprintf(stderr, "avd: yr_compiler_get_rules failed\n");
+        yr_compiler_destroy(compiler);
+        yr_finalize();
+        return -1;
+    }
+
+    yr_compiler_destroy(compiler); /* rules are now owned by compiled_rules */
+    return 0;
+}
+
+struct yara_match_ctx {
+    int matched;
+    char rule_name[AV_RULE_NAME_MAXLEN + 1];
+};
+
+static int yara_callback(YR_SCAN_CONTEXT *context, int message,
+                          void *message_data, void *user_data)
+{
+    struct yara_match_ctx *ctx = (struct yara_match_ctx *)user_data;
+
+    (void)context;
+
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        YR_RULE *rule = (YR_RULE *)message_data;
+
+        ctx->matched = 1;
+        snprintf(ctx->rule_name, sizeof(ctx->rule_name), "%s",
+                 rule->identifier);
+        return CALLBACK_ABORT; /* first match is enough for our purposes */
+    }
+
+    return CALLBACK_CONTINUE;
+}
+
 static void handle_scan_request(uint64_t reqid, uint32_t pid,
                                  const char *path, const char *sha256_hex)
 {
+    struct yara_match_ctx ctx = { .matched = 0, .rule_name = "" };
+    int ret;
+
     printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
            (unsigned long long)reqid, pid, path, sha256_hex);
 
-    /* TODO (v0.3.0): run YARA rules against `path`, and reply
-     * AV_VERDICT_MALICIOUS with the matched rule name if something hits. */
-    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    if (!compiled_rules) {
+        send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+        return;
+    }
+
+    ret = yr_rules_scan_file(compiled_rules, path, 0, yara_callback, &ctx,
+                              SCAN_TIMEOUT_SECS);
+    if (ret != ERROR_SUCCESS) {
+        /* File vanished, permission denied, scan timeout, etc. - fail
+         * open here too, matching the kernel side's own fail-open
+         * stance on inconclusive information (see docs/netlink-protocol.md). */
+        fprintf(stderr, "avd: yr_rules_scan_file(\"%s\") failed: error %d\n",
+                path, ret);
+        send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+        return;
+    }
+
+    if (ctx.matched) {
+        printf("avd: MATCH \"%s\" -> rule \"%s\"\n", path, ctx.rule_name);
+        send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
+    } else {
+        send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    }
 }
 
 static struct nla_policy av_policy[AV_A_MAX + 1] = {
@@ -153,10 +294,22 @@ static int register_with_kernel(void)
     return ret < 0 ? -1 : 0;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    const char *rules_dir = DEFAULT_RULES_DIR;
+
+    if (argc > 1)
+        rules_dir = argv[1];
+    else if (getenv("AVD_RULES_DIR"))
+        rules_dir = getenv("AVD_RULES_DIR");
+
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
+
+    if (load_rules(rules_dir) != 0) {
+        fprintf(stderr, "avd: failed to initialize YARA - aborting\n");
+        return 1;
+    }
 
     sock = nl_socket_alloc();
     if (!sock) {
@@ -205,5 +358,8 @@ int main(void)
 
     printf("avd: shutting down\n");
     nl_socket_free(sock);
+    if (compiled_rules)
+        yr_rules_destroy(compiled_rules);
+    yr_finalize();
     return 0;
 }

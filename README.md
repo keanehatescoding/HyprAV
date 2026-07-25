@@ -34,13 +34,17 @@ av/                  - the actual antivirus module (single, evolving)
   netlink_chan.c/.h   - Generic Netlink channel to avd (see docs/netlink-protocol.md)
   netlink_proto.h     - protocol definitions shared with userspace/avd
   Makefile
+rules/
+  test.yar             - sample YARA rules used for testing avd (EICAR string
+                        match, a toy reverse-shell pattern) - add real rule
+                        sets here once testing against actual samples
 userspace/
   avctl/              - CLI for managing the signature DB via /proc
     avctl.c
     Makefile
-  avd/                - daemon: receives scan requests over netlink, replies
-                        with a verdict. Currently a stub (always "clean") -
-                        real YARA/heuristic logic is the actual v0.3.0 feature.
+  avd/                - daemon: receives scan requests over netlink, loads
+                        rules/*.yar at startup, replies with a verdict based
+                        on YARA matching
     avd.c
     Makefile
 experiments/          - throwaway learning modules, not tagged/released
@@ -73,8 +77,8 @@ directories.
 |-----|---------|-----------------|
 | `v0.1.0` ✅ | Hash-based detection (SHA-256), kprobe execve hook, kill on match | kernel |
 | `v0.2.0` ✅ | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, managed at runtime via `/proc/kernel_av_signatures` (or the `avctl` CLI) | kernel + `avctl` CLI |
-| `v0.3.0-prep` 🚧 | Kernel↔daemon Generic Netlink channel (`netlink_chan.c`, `avd` skeleton) — plumbing only, `avd` currently always replies "clean" | kernel + `avd` (stub) |
-| `v0.3.0` | YARA rule scanning (the actual detection logic, replacing avd's stub) | userspace daemon (libyara) |
+| `v0.3.0-prep` ✅ | Kernel↔daemon Generic Netlink channel (`netlink_chan.c`, `avd` skeleton) — plumbing, verified against real kernel/libnl headers | kernel + `avd` |
+| `v0.3.0` ✅ | Real YARA rule scanning — `avd` loads `rules/*.yar` and scans on a signature miss; verified against a real EICAR match at runtime | userspace daemon (libyara) |
 | `v0.4.0` | String & API heuristics (suspicious imported symbols — `ptrace`, `memfd_create`, ELF symbol table scanning) | userspace |
 | `v0.5.0` | ELF header & section analysis (suspicious section names, RWX-permission sections, anomalous entry points) | userspace |
 | `v0.6.0` | Entropy analysis (Shannon entropy per section — packed/encrypted binary detection) | userspace |
@@ -220,12 +224,13 @@ To manage signatures manually:
 ./avctl list
 ```
 
-## Testing the kernel↔daemon netlink plumbing (v0.3.0-prep)
+## Testing the kernel↔daemon YARA path (v0.3.0)
 
-`avd` currently always replies "clean" — this only proves the round trip
-works end to end, not any real detection. Real YARA logic replaces the
-stub in `handle_scan_request()` (`userspace/avd/avd.c`) as the actual
-v0.3.0 feature.
+`avd` loads every `*.yar`/`*.yara` file from `rules/` at startup and
+scans each file that doesn't already match a kernel-side signature.
+`rules/test.yar` includes a rule for the EICAR string, deliberately
+separate from the SHA-256 signature already in `av/main.c` — this lets
+you test the YARA path independently.
 
 ```bash
 # build everything
@@ -236,42 +241,68 @@ cd userspace/avd && make && cd ../..
 sudo insmod av/av.ko
 dmesg | tail -3   # "loaded, N signature(s) active"
 
-# start the daemon (separate terminal, or backgrounded)
-sudo userspace/avd/avd
+# start the daemon (separate terminal, or backgrounded) - run from the
+# repo root so it finds ./rules by default, or pass a path explicitly:
+sudo userspace/avd/avd rules
 ```
 
-You should see `avd: registered with kernel module (family id N), listening...`
-Now, in another terminal, run something that ISN'T a known signature
-(so it falls through to the daemon path):
+You should see:
+```
+avd: loaded rules from rules/test.yar
+avd: registered with kernel module (family id N), listening...
+```
+
+**Clean-file check** — run something that isn't a known signature and
+doesn't match either YARA rule:
 
 ```bash
 ls
 ```
 
-Expect to see in `avd`'s output:
+Expect in `avd`'s output: `avd: scan request reqid=1 ...`, no `MATCH`
+line. In `dmesg`: `... clean (daemon)`.
+
+**YARA detection check** — since the EICAR file's SHA-256 is already a
+kernel-side signature, temporarily remove it so the request actually
+reaches the daemon and exercises the YARA path (rather than being
+caught earlier by the hash check):
+
+```bash
+cd userspace/avctl && make && cd ../..
+./userspace/avctl/avctl del sha256 275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f
+
+printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
+chmod +x /tmp/eicar.com
+/tmp/eicar.com
 ```
-avd: scan request reqid=1 pid=<pid> path="/usr/bin/ls" sha256=<hash>
+
+Expect in `avd`'s output:
+```
+avd: MATCH "/tmp/eicar.com" -> rule "EICAR_Test_String"
 ```
 
 And in `dmesg`:
 ```
-kernel-av: execve("/usr/bin/ls") md5=... sha1=... sha256=... clean (daemon)
+kernel-av: DETECTED "/tmp/eicar.com" via daemon, rule "EICAR_Test_String" (pid ...) - killing
 ```
 
-If `avd` isn't running, the same `ls` should still log clean, but via
-the fail-open path — check for the distinct `(no daemon verdict, err=-103)`
-suffix (`-103` is `-ECONNREFUSED`-adjacent territory; the exact errno
-depends on what failed — `-ENOTCONN` if `avd` never registered, or
-`-ETIMEDOUT` if it registered but didn't reply in time).
+If `avd` isn't running, the same file should still log clean via the
+fail-open path — check for the `(no daemon verdict, err=...)` suffix
+(`-ENOTCONN` if `avd` never registered, `-ETIMEDOUT` if it registered
+but didn't reply in time).
 
-**This whole path is unverified against a real running kernel at time of
-writing** — the kernel module build was compile/link-checked against
-real (if version-adjacent) kernel headers and the daemon was
-compile-checked against real libnl headers, but neither has actually
-been loaded and exercised together yet. Treat your first VM test run as
-a real test, not a formality — watch `dmesg` closely, and have a
-snapshot ready per the usual caution with new kprobe/workqueue-adjacent
-code paths.
+**What's actually been verified vs. what hasn't**: the kernel module
+(including `netlink_chan.c`) was compile/link-checked against real (if
+version-adjacent) kernel headers; `avd` was compile-checked against
+real libnl and libyara headers; `rules/test.yar` was verified to
+compile and correctly match the EICAR file using both the real `yara`
+CLI and an isolated test harness running the exact scan/callback
+pattern `avd.c` uses. **What has NOT been verified**: the kernel
+module and `avd` have not yet been loaded and exercised together
+against a real running kernel. Treat your first VM test run as a real
+test, not a formality — watch `dmesg` closely, and have a snapshot
+ready per the usual caution with new kprobe/workqueue-adjacent code
+paths.
 
 ## Toolchain support (GCC / Clang)
 

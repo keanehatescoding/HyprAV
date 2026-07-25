@@ -135,12 +135,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install libnl-genl
+      - name: Install libnl-genl and libyara
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnl-genl-3-dev pkg-config
+          sudo apt-get install -y libnl-genl-3-dev libyara-dev pkg-config
       - name: Build avd
         run: make -C userspace/avd
+
+      - name: Smoke-test YARA rules against EICAR
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y yara
+          printf 'X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > /tmp/eicar.com
+          yara rules/test.yar /tmp/eicar.com | grep -q EICAR_Test_String
+
       - uses: actions/upload-artifact@v4
         with:
           name: avd

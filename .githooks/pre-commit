@@ -50,12 +50,25 @@ for f in $STAGED; do
             ;;
         userspace/avd/*.c)
             NL_CFLAGS="$(pkg-config --cflags libnl-genl-3.0 2>/dev/null)"
-            if [ -z "$NL_CFLAGS" ]; then
-                echo "  ! libnl-genl-3.0 not found via pkg-config - skipping syntax check for $f"
-                echo "    (sudo pacman -S libnl  /  apt install libnl-genl-3-dev)"
+            YARA_CFLAGS="$(pkg-config --cflags yara 2>/dev/null)"
+            if [ -z "$NL_CFLAGS" ] || [ -z "$(pkg-config --libs yara 2>/dev/null)" ]; then
+                echo "  ! libnl-genl-3.0 and/or yara not found via pkg-config - skipping syntax check for $f"
+                echo "    (sudo pacman -S libnl yara  /  apt install libnl-genl-3-dev libyara-dev)"
             else
                 echo "  - gcc -fsyntax-only: $f"
-                gcc -fsyntax-only -Wall -Wextra $NL_CFLAGS "$f" || FAIL=1
+                gcc -fsyntax-only -Wall -Wextra $NL_CFLAGS $YARA_CFLAGS "$f" || FAIL=1
+            fi
+            ;;
+        rules/*.yar|rules/*.yara)
+            if command -v yara >/dev/null 2>&1; then
+                echo "  - yara --compiled-rules check: $f"
+                # `yara <rules> <target>` requires a scan target even to
+                # just validate compilation - /bin/true is a harmless
+                # always-present stand-in file.
+                yara "$f" /bin/true >/dev/null || FAIL=1
+            else
+                echo "  ! yara CLI not installed - skipping rule syntax check for $f"
+                echo "    (sudo pacman -S yara  /  apt install yara)"
             fi
             ;;
         tests/*.sh|.githooks/*)
