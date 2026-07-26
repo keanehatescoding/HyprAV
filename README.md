@@ -77,7 +77,16 @@ tests/
   test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
   test_detection.sh    - full build/load/detect/unload integration test
   run_all.sh           - runs both of the above (used by the pre-push hook)
+  evasion/              - v0.9.0: adversarial tests against the engine itself
+    test_dynamic_symbol_evasion.sh    - standalone, no kernel module needed
+    test_fuzzy_evasion.sh              - standalone
+    test_entropy_dilution_evasion.sh   - standalone
+    test_slow_drip_evasion.sh          - needs the live kernel module (VM only)
 ```
+
+See `docs/evasion-findings.md` for the full writeup of what each test
+found — this is the actual report deliverable for v0.9.0, not just the
+scripts.
 
 ## Architecture: what lives in the kernel vs. userspace
 
@@ -106,7 +115,7 @@ directories.
 | `v0.6.0` ✅ | Entropy analysis — whole-file and per-section Shannon entropy, threshold calibrated against real samples (normal binary, packed binary, random data) | userspace (`rules/entropy.yar`) |
 | `v0.7.0` ✅ | Fuzzy hashing (ssdeep/libfuzzy) against a corpus of known-bad hashes — catches near-identical variants that evade exact hash matching entirely; verified: a modified variant scores 100 similarity, an unrelated file scores 0 | `avd` + `corpus/fuzzy_hashes.txt` |
 | `v0.8.0` ✅ | Behavioral heuristics — rapid write-intent opens (ransomware-like), sensitive path writes/deletes, self-deleting binaries; hooks `openat`/`unlink`/`unlinkat` instead of `write()` to avoid risky cross-process fd→path resolution | kernel (workqueue-deferred, same pattern as v0.1.0) |
-| `v0.9.0` | Evasion resistance — adversarial testing against your own engine (packing, obfuscation, timing-based sandbox detection) and documenting what does/doesn't get caught | test suite + report, not shipped code |
+| `v0.9.0` ✅ | Evasion resistance — 4 techniques tested against the real engine (dynamic symbol resolution, fuzzy-hash dilution, entropy dilution, slow-drip behavioral pacing); 3 of 4 evaded their target layer, but one (entropy dilution) was still caught by structural analysis running alongside it — the core validation of the layered-detection design | `tests/evasion/` + `docs/evasion-findings.md` |
 | `v1.0.0` | Quarantine policy, structured logging, performance benchmarks | kernel + userspace |
 
 `v0.3.0-prep` is worth tagging on its own once verified — see
@@ -640,6 +649,32 @@ doesn't depend on knowing which case it was. Treat "we got lucky" and
   versions and could evade this specific hook. Modern glibc routes
   through `openat` internally on Linux, so this covers the common
   case, but a determined evasion attempt might not.
+
+## Testing evasion resistance (v0.9.0)
+
+Full findings are in `docs/evasion-findings.md` — this section is just
+how to reproduce them.
+
+```bash
+# three of these run standalone, no kernel module needed:
+tests/evasion/test_dynamic_symbol_evasion.sh
+tests/evasion/test_fuzzy_evasion.sh
+tests/evasion/test_entropy_dilution_evasion.sh
+
+# this one needs the live module and root, and is the one most worth
+# re-running fresh (the writeup's conclusion is derived from the code
+# path, not yet re-confirmed against a live dmesg capture):
+sudo insmod av/av.ko
+sudo tests/evasion/test_slow_drip_evasion.sh
+```
+
+The headline result worth understanding before anything else: **3 of
+4 techniques evaded their specific target layer, but the layering
+itself held** — evading `entropy.yar` on a padded, packed binary did
+not evade `elf_analysis.yar` running against the same file. That's the
+central validation of treating detection as several independent
+checks rather than one big score, and the strongest single piece of
+evidence for that design choice in the whole project.
 
 ## Toolchain support (GCC / Clang)
 
