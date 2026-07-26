@@ -629,15 +629,53 @@ init — but this was never verified with certainty, and the fix
 doesn't depend on knowing which case it was. Treat "we got lucky" and
 "we fixed it" as two different, non-substitutable things.
 
+### Incident: browser storage engine killed as "rapid file modification"
+
+[#incident-browser-storage-engine-killed-as-rapid-file-modification](#incident-browser-storage-engine-killed-as-rapid-file-modification)
+
+A second real false positive, same heuristic, different root cause —
+worth documenting on its own rather than folding into the PID 1 fix
+above, since the fix is a different mechanism entirely.
+
+```
+kernel-av: DETECTED behavioral: rapid file modification (possible
+ransomware pattern) "/home/keane/.zen/<profile>/storage/default/
+moz-extension+++<uuid>/.metadata-v2" (pid 87527) - killing
+```
+
+**Root cause**: Zen (a Firefox fork)'s storage engine rewrites a
+handful of its own small IndexedDB/metadata files repeatedly as part
+of completely normal browsing activity, easily exceeding 50 write
+opens in a 2-second window. Unlike the PID 1 case, this isn't a path
+that should be excluded wholesale — `~/.zen/.../storage/` is user
+data, and a heuristic that special-cased every browser's profile
+directory would be pure whack-a-mole (the next legitimate multi-file
+writer — a database engine, an IDE's autosave, `git`, a package
+manager — would just trip it from a different path next time).
+
+**The actual fix**: the counter now tracks *distinct paths* written
+in the window, not raw `openat()` call count. A dedup ring buffer
+(sized to `WRITE_OPEN_THRESHOLD`, so it can never overflow before the
+threshold itself would fire) tracks path hashes seen so far in the
+current window; repeat opens of an already-seen path no longer
+increment the counter. A process rewriting the same few files
+hundreds of times a second no longer trips this heuristic, while a
+process touching 50+ *distinct* files in the same window — the actual
+ransomware pattern — still does. This is a strictly better
+approximation of "mass file modification" than raw open count ever
+was, independent of the false positive that surfaced it.
+
 **Other caveats worth discussing in your report:**
-- The `WRITE_OPEN_THRESHOLD` (now 50 opens/2s, raised from 20 after
-  the above) is still a tunable guess, not derived from real
-  ransomware sample behavior — legitimate tools (compilers, package
-  managers, `git clean`) can plausibly still trigger false positives.
-  Worth actually testing (e.g. does `make -j` on a multi-file project
-  trip it?) and tuning further based on what you find. The `/sys`,
-  `/proc`, `/dev` exclusion removes the worst offender but doesn't
-  make this heuristic false-positive-free.
+- `WRITE_OPEN_THRESHOLD` (50 *distinct paths*/2s, after the fix above)
+  is still a tunable guess, not derived from real ransomware sample
+  behavior — legitimate tools that touch many distinct files fast
+  (extracting an archive, `git clean` across many files, a fresh
+  `npm install`) can plausibly still trigger false positives, since
+  distinct-path counting doesn't help when the files genuinely are
+  distinct. Worth actually testing and tuning further based on what
+  you find. The `/sys`, `/proc`, `/dev` exclusion and the distinct-path
+  dedup remove the two false positives found in testing so far, but
+  neither claims to make this heuristic false-positive-free.
 - Per-PID behavioral state is **never cleaned up** on process exit —
   there's no exit hook, so entries accumulate for the lifetime of the
   module. Fine for a demo/testing session, a real concern for long

@@ -12,20 +12,34 @@
 #include <linux/sched/signal.h>
 #include <linux/string.h>
 #include <linux/fcntl.h>
+#include <linux/stringhash.h>
 
 #include "behavior.h"
 
 #define BEHAVIOR_BITS 10 /* 1024 buckets */
 #define WRITE_OPEN_WINDOW_MS  2000 /* sliding window size */
-#define WRITE_OPEN_THRESHOLD  50   /* write-intent opens within the window
-                                    * that trip the "rapid modification"
-                                    * heuristic - tunable, not derived
-                                    * from any real ransomware sample;
-                                    * raised from an initial 20 after real
-                                    * VM testing showed systemd's routine
-                                    * cgroup writes tripping it well
-                                    * within normal boot activity - see
-                                    * README for the incident writeup */
+#define WRITE_OPEN_THRESHOLD  50   /* DISTINCT write-intent opens within
+                                    * the window that trip the "rapid
+                                    * modification" heuristic - tunable,
+                                    * not derived from any real
+                                    * ransomware sample; raised from an
+                                    * initial 20 after real VM testing
+                                    * showed systemd's routine cgroup
+                                    * writes tripping it well within
+                                    * normal boot activity - see README
+                                    * for the incident writeup */
+#define MAX_TRACKED_PATHS WRITE_OPEN_THRESHOLD
+                                   /* Sized to exactly cover the
+                                    * threshold: a real mass-distinct-
+                                    * file writer will trip `rapid`
+                                    * from the dedup set alone by the
+                                    * time it's full, so there's no
+                                    * window where the ring buffer
+                                    * overflowing could hide a genuine
+                                    * positive. See the note on
+                                    * recent_path_hashes below for why
+                                    * distinct-path counting exists at
+                                    * all. */
 
 /* Paths under these prefixes are excluded from BOTH the rapid-write
  * counter and the sensitive-path check entirely - not just given a
@@ -75,6 +89,24 @@ struct av_behavior_entry {
     char exec_path[PATH_MAX];    /* recorded at execve time, empty if unknown */
     unsigned int write_open_count;
     unsigned long window_start_jiffies;
+
+    /* Dedup ring buffer for the rapid-write-open heuristic - counts
+     * DISTINCT paths written in the window, not raw open() calls.
+     * Without this, a process rewriting a handful of its own files
+     * repeatedly (browser IndexedDB/storage metadata, sqlite WAL
+     * files, log rotation) trips the same counter as one touching 50
+     * separate user documents - a real false positive seen in testing
+     * (Firefox/Zen's storage engine rewriting its own
+     * ".metadata-v2" file). Real mass-encryption ransomware still
+     * trips this because it touches many DISTINCT files; an app
+     * hammering its own small file set no longer does. Hashes only
+     * (not full paths) to keep this cheap and fixed-size - a 32-bit
+     * hash collision could theoretically under-count two different
+     * paths as one, which only makes the heuristic slightly less
+     * sensitive, never more trigger-happy. */
+    u32 recent_path_hashes[MAX_TRACKED_PATHS];
+    unsigned int recent_path_next;   /* ring buffer write cursor */
+    unsigned int recent_path_filled; /* valid entries, caps at MAX_TRACKED_PATHS */
 };
 
 static DEFINE_HASHTABLE(behavior_table, BEHAVIOR_BITS);
@@ -191,12 +223,38 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
     if (e) {
         unsigned long window_ms = jiffies_to_msecs(
             jiffies - e->window_start_jiffies);
+        bool new_window = (e->window_start_jiffies == 0 ||
+                            window_ms > WRITE_OPEN_WINDOW_MS);
+        u32 path_hash = full_name_hash(NULL, path, strlen(path));
+        bool seen_before = false;
+        unsigned int i;
 
-        if (e->window_start_jiffies == 0 || window_ms > WRITE_OPEN_WINDOW_MS) {
-            /* Start (or restart) the window. */
+        if (new_window) {
+            /* Start (or restart) the window - also resets the dedup
+             * set, since "distinct paths written" only means anything
+             * within a single window. */
             e->window_start_jiffies = jiffies;
-            e->write_open_count = 1;
-        } else {
+            e->write_open_count = 0;
+            e->recent_path_next = 0;
+            e->recent_path_filled = 0;
+        }
+
+        for (i = 0; i < e->recent_path_filled; i++) {
+            if (e->recent_path_hashes[i] == path_hash) {
+                seen_before = true;
+                break;
+            }
+        }
+
+        /* Only count (and only check the threshold on) a path we
+         * haven't already seen in this window - repeatedly rewriting
+         * the same file no longer inflates the counter. */
+        if (!seen_before) {
+            e->recent_path_hashes[e->recent_path_next] = path_hash;
+            e->recent_path_next = (e->recent_path_next + 1) % MAX_TRACKED_PATHS;
+            if (e->recent_path_filled < MAX_TRACKED_PATHS)
+                e->recent_path_filled++;
+
             e->write_open_count++;
             if (e->write_open_count > WRITE_OPEN_THRESHOLD)
                 rapid = true;
