@@ -94,6 +94,11 @@ static struct workqueue_struct *av_wq;
 struct av_work {
     struct work_struct work;
     struct pid *target_pid;
+    pid_t tgid; /* thread-group (process) ID - see the tgid-vs-pid note
+                 * on av_openat_work below; captured here so
+                 * av_behavior_record_exec() keys behavior state by
+                 * process rather than by the individual thread that
+                 * happened to call execve(). */
     char path[PATH_MAX];
 };
 
@@ -237,7 +242,7 @@ static void av_work_fn(struct work_struct *w)
      * immediately it'll never reach the unlink hook anyway, and this
      * keeps the recording logic in one place rather than duplicated
      * across the signature-match/daemon-match/clean branches. */
-    av_behavior_record_exec(pid_nr(aw->target_pid), aw->path);
+    av_behavior_record_exec(aw->tgid, aw->path);
 
     if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
         snprintf(reason, sizeof(reason), "matches signature \"%s\"", sig_name);
@@ -301,12 +306,25 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     if (!aw)
         return 0;
 
-    if (strncpy_from_user(aw->path, user_filename, PATH_MAX) <= 0) {
-        kfree(aw);
-        return 0;
+    /* strncpy_from_user() returns the copied length (excluding NUL) on
+     * success, a negative errno on fault - but if the source string is
+     * >= PATH_MAX bytes, it returns exactly PATH_MAX with NO guarantee
+     * the destination is NUL-terminated. Checking only "<= 0" lets that
+     * truncation case through as "success", leaving aw->path as a
+     * non-NUL-terminated buffer that filp_open()/strcmp()/strstr()
+     * further down would read past. Reject anything that fills the
+     * whole buffer, not just outright failures. */
+    {
+        ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
+
+        if (path_len <= 0 || path_len >= PATH_MAX) {
+            kfree(aw);
+            return 0;
+        }
     }
 
     aw->target_pid = get_task_pid(current, PIDTYPE_PID);
+    aw->tgid = task_tgid_nr(current);
     INIT_WORK(&aw->work, av_work_fn);
     queue_work(av_wq, &aw->work);
 
@@ -319,7 +337,14 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 struct av_openat_work {
     struct work_struct work;
     struct pid *target_pid;
-    pid_t pid;
+    pid_t pid; /* actually the tgid (thread-group/process ID), not the
+                * calling thread's individual pid - see task_tgid_nr()
+                * below. behavior.c's tracking table is keyed by this
+                * value, and current->pid is the kernel's per-THREAD
+                * id: keying by it let a multi-threaded process evade
+                * the rapid-write-open threshold by simply spreading
+                * writes across threads, since each thread got its own
+                * independent counter. */
     int flags;
     char path[PATH_MAX];
 };
@@ -366,13 +391,17 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs)
     if (!ow)
         return 0;
 
-    if (strncpy_from_user(ow->path, user_filename, PATH_MAX) <= 0) {
-        kfree(ow);
-        return 0;
+    {
+        ssize_t path_len = strncpy_from_user(ow->path, user_filename, PATH_MAX);
+
+        if (path_len <= 0 || path_len >= PATH_MAX) {
+            kfree(ow);
+            return 0;
+        }
     }
 
     ow->flags = flags;
-    ow->pid = current->pid;
+    ow->pid = task_tgid_nr(current);
     ow->target_pid = get_task_pid(current, PIDTYPE_PID);
     INIT_WORK(&ow->work, av_openat_work_fn);
     queue_work(av_wq, &ow->work);
@@ -385,7 +414,10 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs)
 struct av_unlink_work {
     struct work_struct work;
     struct pid *target_pid;
-    pid_t pid;
+    pid_t pid; /* tgid, not thread pid - see the note on av_openat_work
+                * above; self-delete correlation against exec_path
+                * needs to match the same key av_behavior_record_exec()
+                * used. */
     char path[PATH_MAX];
 };
 
@@ -410,12 +442,16 @@ static int schedule_unlink_work(const char __user *user_path)
     if (!uw)
         return 0;
 
-    if (strncpy_from_user(uw->path, user_path, PATH_MAX) <= 0) {
-        kfree(uw);
-        return 0;
+    {
+        ssize_t path_len = strncpy_from_user(uw->path, user_path, PATH_MAX);
+
+        if (path_len <= 0 || path_len >= PATH_MAX) {
+            kfree(uw);
+            return 0;
+        }
     }
 
-    uw->pid = current->pid;
+    uw->pid = task_tgid_nr(current);
     uw->target_pid = get_task_pid(current, PIDTYPE_PID);
     INIT_WORK(&uw->work, av_unlink_work_fn);
     queue_work(av_wq, &uw->work);

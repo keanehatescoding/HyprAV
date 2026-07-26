@@ -20,6 +20,7 @@
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
 #include <linux/string.h>
+#include <linux/ctype.h>
 
 #include "sigtable.h"
 
@@ -41,6 +42,21 @@ static const char * const algo_names[AV_ALGO_COUNT] = { "md5", "sha1", "sha256" 
 static u32 hex_key(const char *hex)
 {
     return full_name_hash(NULL, hex, strlen(hex));
+}
+
+/* hex_key() hashes the raw bytes of the string, but av_sigtable_match()/
+ * av_sigtable_del() compare with strncasecmp() (case-insensitive). Those
+ * two have to agree on a canonical case, or a signature added with
+ * different casing than a query digest lands in a different hash
+ * bucket and is never found - even though strncasecmp() would call it
+ * a match if it were ever compared directly. bin_to_hex() in main.c
+ * always emits lowercase, so lowercase is the canonical form; this
+ * normalizes any input (from avctl/echo) to match before it's ever
+ * hashed or stored. */
+static void hex_tolower(char *hex)
+{
+    for (; *hex; hex++)
+        *hex = tolower(*hex);
 }
 
 static const char *digest_for_algo(const struct av_digest *d, enum av_algo algo)
@@ -77,10 +93,11 @@ int av_sigtable_add(enum av_algo algo, const char *hex, const char *name)
 
     e->algo = algo;
     strscpy(e->hex, hex, sizeof(e->hex));
+    hex_tolower(e->hex); /* canonicalize before hashing - see hex_key() */
     strscpy(e->name, name, sizeof(e->name));
 
     mutex_lock(&sig_lock);
-    hash_add(sig_table, &e->node, hex_key(hex));
+    hash_add(sig_table, &e->node, hex_key(e->hex));
     sig_count++;
     mutex_unlock(&sig_lock);
 
@@ -89,11 +106,19 @@ int av_sigtable_add(enum av_algo algo, const char *hex, const char *name)
 
 int av_sigtable_del(enum av_algo algo, const char *hex)
 {
-    struct av_sig_entry *e;
+    /* e is initialized to NULL only to satisfy static analyzers that
+     * can't expand hash_for_each_possible() without full kernel
+     * headers - see get_or_create_entry() in behavior.c for the same
+     * workaround and full explanation. */
+    struct av_sig_entry *e = NULL;
+    char lower_hex[AV_HASH_HEX_MAXLEN + 1];
     int ret = -ENOENT;
 
+    strscpy(lower_hex, hex, sizeof(lower_hex));
+    hex_tolower(lower_hex);
+
     mutex_lock(&sig_lock);
-    hash_for_each_possible(sig_table, e, node, hex_key(hex)) {
+    hash_for_each_possible(sig_table, e, node, hex_key(lower_hex)) {
         if (e->algo == algo && !strncasecmp(e->hex, hex, algo_hexlen[algo])) {
             hash_del(&e->node);
             kfree(e);
@@ -108,7 +133,8 @@ int av_sigtable_del(enum av_algo algo, const char *hex)
 
 int av_sigtable_match(const struct av_digest *d, char *name_out, size_t name_out_len)
 {
-    struct av_sig_entry *e;
+    /* Same false-positive workaround as av_sigtable_del() above. */
+    struct av_sig_entry *e = NULL;
     int algo;
     int found = 0;
 
@@ -143,8 +169,9 @@ static int sig_proc_show(struct seq_file *m, void *v)
     int bkt;
 
     mutex_lock(&sig_lock);
-    hash_for_each(sig_table, bkt, e, node)
+    hash_for_each(sig_table, bkt, e, node) {
         seq_printf(m, "%s %s %s\n", algo_names[e->algo], e->hex, e->name);
+    }
     mutex_unlock(&sig_lock);
     return 0;
 }

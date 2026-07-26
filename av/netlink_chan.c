@@ -59,6 +59,11 @@ static const struct nla_policy av_genl_policy[AV_A_MAX + 1] = {
 
 static int av_nl_register_doit(struct sk_buff *skb, struct genl_info *info)
 {
+    /* GENL_ADMIN_PERM on this op (see av_genl_ops below) already
+     * requires CAP_NET_ADMIN, so any caller that reaches this point is
+     * privileged - but log the portid either way so a legitimate
+     * daemon restart (or an attempted hijack from a privileged
+     * process) is visible in dmesg. */
     spin_lock(&daemon_lock);
     daemon_portid = info->snd_portid;
     daemon_registered = true;
@@ -73,13 +78,34 @@ static int av_nl_register_doit(struct sk_buff *skb, struct genl_info *info)
 
 static int av_nl_verdict_doit(struct sk_buff *skb, struct genl_info *info)
 {
-    struct av_pending_scan *p, *found = NULL;
+    /* p is initialized to NULL only to satisfy static analyzers that
+     * can't expand list_for_each_entry() (a nested kernel macro
+     * requiring full kernel headers to resolve) - the macro itself
+     * always assigns p via list_entry()/container_of() before the loop
+     * body runs, so this has no effect on actual behavior. Same
+     * false-positive class as get_or_create_entry() in behavior.c. */
+    struct av_pending_scan *p = NULL, *found = NULL;
     u64 reqid;
     u8 verdict;
     const char *rule_name = "";
 
     if (!info->attrs[AV_A_REQID] || !info->attrs[AV_A_VERDICT])
         return -EINVAL;
+
+    /* Only the currently-registered daemon's portid may answer a scan
+     * request. GENL_ADMIN_PERM (see av_genl_ops) already restricts who
+     * can reach this handler at all, but that alone isn't enough: any
+     * two CAP_NET_ADMIN processes could otherwise race to answer each
+     * other's requests. Binding to the specific registered portid closes
+     * that gap without needing anything fancier. */
+    spin_lock(&daemon_lock);
+    if (!daemon_registered || info->snd_portid != daemon_portid) {
+        spin_unlock(&daemon_lock);
+        pr_warn("kernel-av: AV_C_VERDICT from portid %u ignored (not the "
+                "registered daemon)\n", info->snd_portid);
+        return -EPERM;
+    }
+    spin_unlock(&daemon_lock);
 
     reqid = nla_get_u64(info->attrs[AV_A_REQID]);
     verdict = nla_get_u8(info->attrs[AV_A_VERDICT]);
@@ -115,12 +141,14 @@ static const struct genl_ops av_genl_ops[] = {
     {
         .cmd = AV_C_REGISTER,
         .doit = av_nl_register_doit,
-        .flags = 0,
+        .flags = GENL_ADMIN_PERM, /* CAP_NET_ADMIN only - see the
+                                    * netlink-auth note in
+                                    * docs/netlink-protocol.md */
     },
     {
         .cmd = AV_C_VERDICT,
         .doit = av_nl_verdict_doit,
-        .flags = 0,
+        .flags = GENL_ADMIN_PERM,
     },
 };
 

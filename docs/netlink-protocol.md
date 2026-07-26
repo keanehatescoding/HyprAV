@@ -83,11 +83,16 @@ whole system; document this tradeoff explicitly.
 
 ## Known limitations (document these in your report)
 
-- **Single daemon only.** No multi-client support, no auth on who can
-  `REGISTER` or send a `VERDICT` — any process that can open a netlink
-  socket can currently impersonate the daemon. Fine for a VM-only
-  student project; would need real access control for anything beyond
-  that.
+- **Single daemon only.** No multi-client support - only one daemon can
+  be registered at a time, and a second `REGISTER` silently replaces
+  the first. **Fixed:** `REGISTER` and `VERDICT` now require
+  `GENL_ADMIN_PERM` (CAP_NET_ADMIN), and `VERDICT` is additionally
+  checked against the currently-registered daemon's portid, so an
+  unprivileged local process can no longer impersonate the daemon or
+  answer someone else's scan request. `avd` already runs under `sudo`
+  in every documented workflow, so this doesn't change how you run it -
+  it just closes a gap where anything unprivileged previously could
+  have disabled detection entirely by registering first.
 - **Fail-open on timeout/no-daemon**, as above — a deliberate but
   debatable choice.
 - **Kernel netlink API surface is version-sensitive**, same caveat as

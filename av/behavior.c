@@ -71,7 +71,7 @@ static const char * const sensitive_path_substrings[] = {
 
 struct av_behavior_entry {
     struct hlist_node node;
-    pid_t pid;
+    pid_t pid; /* tgid (process ID), not a thread id - see behavior.h */
     char exec_path[PATH_MAX];    /* recorded at execve time, empty if unknown */
     unsigned int write_open_count;
     unsigned long window_start_jiffies;
