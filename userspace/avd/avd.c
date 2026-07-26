@@ -51,6 +51,17 @@
 #define DEFAULT_RULES_DIR   "rules"
 #define DEFAULT_CORPUS_FILE "corpus/fuzzy_hashes.txt"
 #define SCAN_TIMEOUT_SECS   10
+#define MALICIOUS_SCORE_THRESHOLD 100
+    /* Sum of every matching rule's `weight` meta (see the .yar files under rules/) has
+     * to clear this before avd convicts. Added after real testing
+     * killed /usr/bin/zsh, /bin/sh, and /usr/bin/uwsm - all legitimate
+     * binaries that each matched exactly one low/medium-confidence
+     * rule. Any single weak import heuristic (weight 5-15) or even a
+     * "verified" structural rule alone (weight 30-55) now stays below
+     * threshold; conviction requires corroboration across rules, which
+     * is what the documented real UPX-packed test sample actually
+     * produces (No_Section_Headers + Entry_Point_Outside_Text +
+     * High_Overall_Entropy firing together comfortably clears this). */
 #define FUZZY_MATCH_THRESHOLD 60 /* 0-100; see corpus/fuzzy_hashes.txt
                                    * and the README's v0.7.0 testing
                                    * section for how this was picked -
@@ -331,6 +342,8 @@ static int check_fuzzy_corpus(const char *path, char *name_out,
 struct yara_match_ctx {
     int matched;
     int match_count;
+    int score; /* sum of every matched rule's `weight` meta - see
+                * MALICIOUS_SCORE_THRESHOLD above */
     char rule_name[AV_RULE_NAME_MAXLEN + 1]; /* comma-joined, truncated to fit */
 };
 
@@ -343,11 +356,24 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
 
     if (message == CALLBACK_MSG_RULE_MATCHING) {
         YR_RULE *rule = (YR_RULE *)message_data;
+        YR_META *meta;
         size_t used = strlen(ctx->rule_name);
         size_t remaining = sizeof(ctx->rule_name) - used;
 
         ctx->matched = 1;
         ctx->match_count++;
+
+        /* Every rule in the .yar files under rules/ carries a `weight` meta; a rule
+         * missing one contributes 0 rather than crashing or silently
+         * auto-convicting - fail toward "needs corroboration", not
+         * toward "convict on anything". */
+        yr_rule_metas_foreach(rule, meta) {
+            if (meta->type == META_TYPE_INTEGER &&
+                strcmp(meta->identifier, "weight") == 0) {
+                ctx->score += (int)meta->integer;
+                break;
+            }
+        }
 
         /* Collect every matching rule rather than stopping at the
          * first - with related rules (e.g. Imports_Ptrace and the
@@ -367,7 +393,7 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
 static void handle_scan_request(uint64_t reqid, uint32_t pid,
                                  const char *path, const char *sha256_hex)
 {
-    struct yara_match_ctx ctx = { .matched = 0, .match_count = 0, .rule_name = "" };
+    struct yara_match_ctx ctx = { .matched = 0, .match_count = 0, .score = 0, .rule_name = "" };
     int ret;
 
     printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
@@ -391,10 +417,28 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
     }
 
     if (ctx.matched) {
-        printf("avd: MATCH \"%s\" -> %d rule(s): \"%s\"\n",
-               path, ctx.match_count, ctx.rule_name);
-        send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
-        return;
+        /* Sum of matched rules' weights has to clear
+         * MALICIOUS_SCORE_THRESHOLD before this convicts - a single
+         * low-confidence import heuristic (or even one "verified"
+         * structural rule alone) is logged for visibility but no
+         * longer enough by itself. See the threshold's own comment
+         * for why: real testing killed zsh/sh/uwsm on exactly this
+         * single-weak-match pattern before this existed. */
+        if (ctx.score >= MALICIOUS_SCORE_THRESHOLD) {
+            printf("avd: MATCH \"%s\" -> %d rule(s), score=%d: \"%s\"\n",
+                   path, ctx.match_count, ctx.score, ctx.rule_name);
+            send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
+            return;
+        }
+
+        printf("avd: %d rule(s) matched \"%s\" but score=%d is below "
+               "threshold (%d) - not convicting: \"%s\"\n",
+               ctx.match_count, path, ctx.score,
+               MALICIOUS_SCORE_THRESHOLD, ctx.rule_name);
+        /* Falls through to the fuzzy-hash check below rather than
+         * returning CLEAN immediately - a below-threshold YARA match
+         * plus a fuzzy-hash hit against the known-bad corpus is still
+         * worth convicting on, even though neither alone was enough. */
     }
 
     /* No YARA rule fired - try fuzzy-hash similarity against the

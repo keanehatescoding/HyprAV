@@ -1,5 +1,6 @@
 /*
  * heuristics.yar - v0.4.0: string & API heuristics.
+ * v0.9.1: added numeric `weight` meta (see below).
  *
  * Uses YARA's built-in `elf` module to inspect the DYNAMIC SYMBOL TABLE
  * (imported functions) directly, rather than doing raw string matching -
@@ -19,6 +20,15 @@
  * first attempt at that combination - discuss its false-positive rate
  * honestly in your report rather than presenting single-API matches as
  * strong detections.
+ *
+ * WEIGHT META: avd.c no longer convicts on any single rule match - it
+ * sums the `weight` meta of every matching rule and only sends
+ * AV_VERDICT_MALICIOUS once the total crosses MALICIOUS_SCORE_THRESHOLD
+ * (100, see avd.c). This was added after real testing killed /usr/bin/zsh,
+ * /bin/sh, and /usr/bin/uwsm - all legitimate system binaries that
+ * happened to import one flagged API each. The weights below are a
+ * direct numeric translation of the `confidence` strings already in
+ * each rule; keep the two in sync if you tune one.
  */
 
 import "elf"
@@ -28,6 +38,7 @@ rule Imports_Ptrace
     meta:
         description = "Imports ptrace() - used legitimately by debuggers, but also for anti-debugging tricks and process injection"
         confidence = "low"
+        weight = 15
     condition:
         for any sym in elf.dynsym : (sym.name == "ptrace")
 }
@@ -37,6 +48,7 @@ rule Imports_Memfd_Create
     meta:
         description = "Imports memfd_create() - creates an anonymous, RAM-only file; used legitimately (e.g. systemd, some package managers) but also for fileless execution (loading and exec'ing a payload that never touches disk)"
         confidence = "low"
+        weight = 15
     condition:
         for any sym in elf.dynsym : (sym.name == "memfd_create")
 }
@@ -46,6 +58,7 @@ rule Imports_Dlopen
     meta:
         description = "Imports dlopen() - standard dynamic loading, extremely common in legitimate software; included here mainly as a building block for compound rules below, not meaningful alone"
         confidence = "very low - do not alert on this alone, dlopen is ubiquitous"
+        weight = 5
     condition:
         for any sym in elf.dynsym : (sym.name == "dlopen")
 }
@@ -55,6 +68,7 @@ rule Imports_Mprotect
     meta:
         description = "Imports mprotect() - used to change memory page permissions; legitimate for JIT compilers and language runtimes, but also the standard way to mark a memory region executable after writing shellcode into it"
         confidence = "very low alone - JIT-based software (browsers, many language runtimes) does this routinely"
+        weight = 10
     condition:
         for any sym in elf.dynsym : (sym.name == "mprotect")
 }
@@ -64,6 +78,7 @@ rule Multiple_Suspicious_Imports
     meta:
         description = "Imports ptrace AND memfd_create together - a narrower, still crude, attempt at combining weak signals. Individually common; together, a somewhat less common combination worth a second look rather than an automatic verdict"
         confidence = "medium - still expect false positives from legitimate system tooling"
+        weight = 40
     condition:
         Imports_Ptrace and Imports_Memfd_Create
 }

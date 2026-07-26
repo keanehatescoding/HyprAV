@@ -1,5 +1,12 @@
 /*
  * entropy.yar - v0.6.0: entropy analysis (packed/encrypted file detection).
+ * v0.9.1: added numeric `weight` meta - see heuristics.yar for the
+ * scoring model. Note that on the UPX-packed test binary these rules
+ * were calibrated against, High_Overall_Entropy fires ALONGSIDE
+ * elf_analysis.yar's No_Section_Headers and Entry_Point_Outside_Text
+ * (same underlying packing, different angles) - the combined weight of
+ * that corroboration is what clears MALICIOUS_SCORE_THRESHOLD, not any
+ * single rule here alone.
  *
  * Threshold calibration (measured with a plain Shannon entropy
  * calculation in Python, cross-checked against YARA's math.entropy()):
@@ -33,6 +40,7 @@ rule High_Overall_Entropy
     meta:
         description = "Whole-file Shannon entropy is unusually high - suggests compressed or encrypted content rather than normal compiled code"
         confidence = "medium - verified: fires on a real UPX-packed binary and on random data, stays silent on normal binaries"
+        weight = 55
     condition:
         math.entropy(0, filesize) >= 7.0
 }
@@ -42,6 +50,7 @@ rule High_Entropy_Section
     meta:
         description = "A section's content is unusually high entropy relative to typical compiled code - possible packed/encrypted payload hidden in an otherwise normal-looking section table"
         confidence = "medium - verified with a synthetically injected high-entropy section (objcopy); no naturally-occurring sample on hand that preserves sections while packing"
+        weight = 45
     condition:
         elf.number_of_sections > 0 and
         for any i in (0..elf.number_of_sections - 1) : (
