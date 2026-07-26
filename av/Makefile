@@ -1,5 +1,5 @@
 obj-m += av.o
-av-y := main.o sigtable.o netlink_chan.o
+av-y := main.o sigtable.o netlink_chan.o behavior.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 PWD  := $(shell pwd)

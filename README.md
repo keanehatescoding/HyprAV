@@ -29,10 +29,14 @@ scripts/
 docs/
   netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
 av/                  - the actual antivirus module (single, evolving)
-  main.c              - kprobe hook, workqueue, multi-algorithm hashing
+  main.c              - kprobe hooks (execve, openat, unlink, unlinkat),
+                        workqueue, multi-algorithm hashing
   sigtable.c/.h       - kernel hashtable signature store + /proc interface
   netlink_chan.c/.h   - Generic Netlink channel to avd (see docs/netlink-protocol.md)
   netlink_proto.h     - protocol definitions shared with userspace/avd
+  behavior.c/.h        - v0.8.0: behavioral heuristics (rapid write-intent
+                        opens, sensitive path writes/deletes, self-deleting
+                        binaries) - per-PID state, mutex-protected
   Makefile
 rules/
   test.yar             - sample YARA rules used for testing avd (EICAR string
@@ -101,7 +105,7 @@ directories.
 | `v0.5.0` ✅ | ELF header & section analysis — no section headers (packer indicator), executable stack, RWX segments, entry point outside `.text` — verified against a real UPX-packed binary | userspace (`rules/elf_analysis.yar`) |
 | `v0.6.0` ✅ | Entropy analysis — whole-file and per-section Shannon entropy, threshold calibrated against real samples (normal binary, packed binary, random data) | userspace (`rules/entropy.yar`) |
 | `v0.7.0` ✅ | Fuzzy hashing (ssdeep/libfuzzy) against a corpus of known-bad hashes — catches near-identical variants that evade exact hash matching entirely; verified: a modified variant scores 100 similarity, an unrelated file scores 0 | `avd` + `corpus/fuzzy_hashes.txt` |
-| `v0.8.0` | Behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) | kernel (workqueue-deferred, same pattern as v0.1.0) |
+| `v0.8.0` ✅ | Behavioral heuristics — rapid write-intent opens (ransomware-like), sensitive path writes/deletes, self-deleting binaries; hooks `openat`/`unlink`/`unlinkat` instead of `write()` to avoid risky cross-process fd→path resolution | kernel (workqueue-deferred, same pattern as v0.1.0) |
 | `v0.9.0` | Evasion resistance — adversarial testing against your own engine (packing, obfuscation, timing-based sandbox detection) and documenting what does/doesn't get caught | test suite + report, not shipped code |
 | `v1.0.0` | Quarantine policy, structured logging, performance benchmarks | kernel + userspace |
 
@@ -521,6 +525,121 @@ was picked because it sits well above the "unrelated files" baseline
 but real-world tuning needs an actual malware corpus with known
 variant families, which is out of scope here. Worth discussing this
 gap explicitly in your report rather than presenting 60 as validated.
+
+## Testing behavioral heuristics (v0.8.0)
+
+Three separate things to verify - rebuild and reload first:
+
+```bash
+cd av && make clean && make && cd ..
+sudo rmmod av 2>/dev/null
+sudo insmod av.ko
+dmesg -C
+```
+
+**Self-delete detection** — a process that deletes its own executable:
+
+```bash
+cp /bin/true /tmp/selfdel_test
+/tmp/selfdel_test &   # runs and exits almost immediately, not useful alone
+# better: use a script that deletes itself while "running"
+cat > /tmp/selfdel_test.sh << 'EOF'
+#!/bin/bash
+rm -- "$0"
+sleep 2
+EOF
+chmod +x /tmp/selfdel_test.sh
+/tmp/selfdel_test.sh &
+sleep 1
+dmesg | tail -5
+# expect: DETECTED behavioral: self-deleting binary ... - killing
+```
+
+**Sensitive path write/delete** — writing to a path containing `.ssh`:
+
+```bash
+mkdir -p /tmp/fake_home/.ssh
+echo test > /tmp/fake_home/.ssh/id_rsa_test
+dmesg | tail -5
+# expect: DETECTED behavioral: write-intent open of sensitive path ...
+```
+
+**Rapid file modification** — touching more than `WRITE_OPEN_THRESHOLD`
+(50) files within the 2-second window:
+
+```bash
+mkdir -p /tmp/rapid_test && cd /tmp/rapid_test
+for i in $(seq 1 55); do echo "x" > "file_$i.txt"; done
+cd - && dmesg | tail -10
+# expect: DETECTED behavioral: rapid file modification ... - killing
+# (the killed process is your shell's `for` loop subshell context -
+#  expect the loop to terminate abruptly partway through)
+```
+
+### Incident: this heuristic tried to kill PID 1 on first real-VM test
+
+Worth documenting in full, not glossing over — this is exactly the
+kind of finding a report should include. On first boot with the
+module loaded, real system activity (not a synthetic test) produced:
+
+```
+kernel-av: DETECTED behavioral: rapid file modification (possible
+ransomware pattern) "/sys/fs/cgroup/system.slice/systemd-logind.service/
+pids.max" (pid 1) - killing
+```
+
+**Root cause**: `systemd` (PID 1) routinely writes to many cgroup
+control files (`pids.max`, `memory.max`, etc.) as normal service
+management — nothing malicious about it. The original threshold (20
+opens/2s) had no concept of "this is a kernel control-plane path, not
+user data," so it counted cgroup writes the same as it would count a
+ransomware process encrypting documents in `/home`. A separate false
+positive fired on `/dev/tty1`/`/dev/tty2` for the same underlying
+reason — terminal I/O isn't file modification in any meaningful sense
+either.
+
+**Two fixes, both necessary, not just one:**
+1. **Root cause**: paths under `/sys/`, `/proc/`, and `/dev/` are now
+   excluded entirely from both the rapid-write counter and the
+   sensitive-path check — this is what actually stops the false
+   positives from happening in the first place.
+2. **Hard safety net, independent of the above**: `PID 1` can never be
+   killed by this module, under any circumstance, regardless of which
+   heuristic fires or how confident it is. This isn't a substitute for
+   fix #1 — a heuristic that's *correctly* triggered against a real
+   threat that happened to be running as PID 1 (implausible, but not
+   provably impossible) still shouldn't be allowed to bring down the
+   whole system. Defense in depth: don't rely on any single layer
+   being bug-free when the failure mode is "the kernel panics."
+
+The fact that the test system apparently kept running afterward
+suggests the target may have been a namespaced "PID 1" inside a
+sandboxed systemd service (systemd's `PrivatePIDs`-style isolation
+gives some services their own PID namespace) rather than true host
+init — but this was never verified with certainty, and the fix
+doesn't depend on knowing which case it was. Treat "we got lucky" and
+"we fixed it" as two different, non-substitutable things.
+
+**Other caveats worth discussing in your report:**
+- The `WRITE_OPEN_THRESHOLD` (now 50 opens/2s, raised from 20 after
+  the above) is still a tunable guess, not derived from real
+  ransomware sample behavior — legitimate tools (compilers, package
+  managers, `git clean`) can plausibly still trigger false positives.
+  Worth actually testing (e.g. does `make -j` on a multi-file project
+  trip it?) and tuning further based on what you find. The `/sys`,
+  `/proc`, `/dev` exclusion removes the worst offender but doesn't
+  make this heuristic false-positive-free.
+- Per-PID behavioral state is **never cleaned up** on process exit —
+  there's no exit hook, so entries accumulate for the lifetime of the
+  module. Fine for a demo/testing session, a real concern for long
+  uptimes. A natural `v0.8.1` fix would hook process exit (or add
+  periodic garbage collection of stale entries) — documented here as a
+  known limitation rather than silently left out.
+- `openat` is the only open-family syscall hooked - `open()` (without
+  `at`) and `creat()` are separate syscalls on some architectures/libc
+  versions and could evade this specific hook. Modern glibc routes
+  through `openat` internally on Linux, so this covers the common
+  case, but a determined evasion attempt might not.
 
 ## Toolchain support (GCC / Clang)
 

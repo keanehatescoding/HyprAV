@@ -27,6 +27,19 @@
  *     userspace/avd/avd.c). Fail-open if no daemon is connected or it
  *     doesn't respond within DAEMON_TIMEOUT_MS.
  *
+ * v0.8.0 changes: behavioral heuristics (behavior.c), back on the
+ * kernel side after several userspace-only milestones. Three new
+ * kprobe hooks - openat, unlink, unlinkat - follow the SAME atomic-
+ * context discipline as the execve hook: pre-handlers only copy a
+ * path string (GFP_ATOMIC) and schedule work; all logic (sensitive-
+ * path matching, sliding-window counting, self-delete comparison,
+ * the actual kill) happens in behavior.c, called from workqueue
+ * context. Deliberately hooks openat (path directly available as a
+ * user pointer) rather than write() (only gives an fd - resolving
+ * that to a path from a DIFFERENT process's file table inside a
+ * workqueue is a genuinely risky, version-fragile kernel API area
+ * that this design avoids entirely).
+ *
  * Build:   make
  * Load:    sudo insmod av.ko
  * Seed:    a default EICAR SHA-256 signature is added at module load
@@ -44,6 +57,7 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
+#include <linux/fcntl.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
 #include <linux/sched/signal.h>
@@ -53,6 +67,7 @@
 #include "sigtable.h"
 #include "netlink_proto.h"
 #include "netlink_chan.h"
+#include "behavior.h"
 
 #define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
 #define READ_CHUNK_SIZE     4096
@@ -61,8 +76,17 @@
                                    * for the fail-open vs fail-closed
                                    * discussion */
 
-static struct kprobe kp = {
-    .symbol_name = HOOKED_SYSCALL_NAME,
+static struct kprobe kp_execve = {
+    .symbol_name = "__x64_sys_execve",
+};
+static struct kprobe kp_openat = {
+    .symbol_name = "__x64_sys_openat",
+};
+static struct kprobe kp_unlink = {
+    .symbol_name = "__x64_sys_unlink",
+};
+static struct kprobe kp_unlinkat = {
+    .symbol_name = "__x64_sys_unlinkat",
 };
 
 static struct workqueue_struct *av_wq;
@@ -167,6 +191,31 @@ out:
     return ret;
 }
 
+/* Shared kill-and-log helper, mirroring behavior.c's kill_with_reason -
+ * see its comment for why the PID-1 guard is unconditional and
+ * non-negotiable regardless of what triggered detection. */
+static void av_kill(struct pid *target_pid, const char *path,
+                     const char *reason)
+{
+    struct task_struct *task;
+
+    if (pid_nr(target_pid) == 1) {
+        pr_alert("kernel-av: SUPPRESSED kill of PID 1 (reason: %s, "
+                 "path \"%s\") - refusing to signal init under any "
+                 "circumstance\n", reason, path);
+        return;
+    }
+
+    rcu_read_lock();
+    task = pid_task(target_pid, PIDTYPE_PID);
+    if (task) {
+        pr_alert("kernel-av: DETECTED \"%s\" %s (pid %d) - killing\n",
+                 path, reason, pid_nr(target_pid));
+        send_sig(SIGKILL, task, 0);
+    }
+    rcu_read_unlock();
+}
+
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
  * GFP_KERNEL. This is where all "heavy" work happens. */
 static void av_work_fn(struct work_struct *w)
@@ -174,7 +223,7 @@ static void av_work_fn(struct work_struct *w)
     struct av_work *aw = container_of(w, struct av_work, work);
     struct av_digest digest;
     char sig_name[AV_SIG_NAME_LEN];
-    struct task_struct *task;
+    char reason[AV_SIG_NAME_LEN + 32];
     int ret;
 
     ret = hash_file_multi(aw->path, &digest);
@@ -184,16 +233,15 @@ static void av_work_fn(struct work_struct *w)
         goto out;
     }
 
+    /* Record regardless of verdict below - if this process gets killed
+     * immediately it'll never reach the unlink hook anyway, and this
+     * keeps the recording logic in one place rather than duplicated
+     * across the signature-match/daemon-match/clean branches. */
+    av_behavior_record_exec(pid_nr(aw->target_pid), aw->path);
+
     if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
-        rcu_read_lock();
-        task = pid_task(aw->target_pid, PIDTYPE_PID);
-        if (task) {
-            pr_alert("kernel-av: DETECTED \"%s\" matches signature \"%s\" "
-                     "(pid %d) - killing\n",
-                     aw->path, sig_name, pid_nr(aw->target_pid));
-            send_sig(SIGKILL, task, 0);
-        }
-        rcu_read_unlock();
+        snprintf(reason, sizeof(reason), "matches signature \"%s\"", sig_name);
+        av_kill(aw->target_pid, aw->path, reason);
         goto out;
     }
 
@@ -213,15 +261,8 @@ static void av_work_fn(struct work_struct *w)
                                           sizeof(rule_name),
                                           DAEMON_TIMEOUT_MS);
         if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
-            rcu_read_lock();
-            task = pid_task(aw->target_pid, PIDTYPE_PID);
-            if (task) {
-                pr_alert("kernel-av: DETECTED \"%s\" via daemon, rule "
-                         "\"%s\" (pid %d) - killing\n",
-                         aw->path, rule_name, pid_nr(aw->target_pid));
-                send_sig(SIGKILL, task, 0);
-            }
-            rcu_read_unlock();
+            snprintf(reason, sizeof(reason), "via daemon, rule \"%s\"", rule_name);
+            av_kill(aw->target_pid, aw->path, reason);
         } else if (nl_ret == 0) {
             pr_info("kernel-av: execve(\"%s\") md5=%s sha1=%s sha256=%s "
                     "clean (daemon)\n",
@@ -245,7 +286,7 @@ out:
  * of data with GFP_ATOMIC, reading regs, and scheduling work. */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 {
-    struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
     const char __user *user_filename;
     struct av_work *aw;
 
@@ -272,6 +313,138 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
     return 0;
 }
 
+/* ---- openat: write-intent open tracking (rapid modification +
+ * sensitive-path-write heuristics) ---- */
+
+struct av_openat_work {
+    struct work_struct work;
+    struct pid *target_pid;
+    pid_t pid;
+    int flags;
+    char path[PATH_MAX];
+};
+
+static void av_openat_work_fn(struct work_struct *w)
+{
+    struct av_openat_work *ow = container_of(w, struct av_openat_work, work);
+
+    av_behavior_check_openat(ow->pid, ow->path, ow->flags, ow->target_pid);
+
+    put_pid(ow->target_pid);
+    kfree(ow);
+}
+
+/* openat(int dfd, const char *filename, int flags, umode_t mode) - on
+ * the x86_64 syscall ABI, filename is the SECOND argument (regs->si),
+ * unlike execve where the filename is the first (regs->di). Getting
+ * this register mapping wrong is a silent, hard-to-notice bug (you'd
+ * just never see openat events, no crash) - verify with a kprobe_log-
+ * style dmesg print if this hook seems to never fire. */
+static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+    const char __user *user_filename;
+    int flags;
+    struct av_openat_work *ow;
+
+    if (!real_regs)
+        return 0;
+
+    user_filename = (const char __user *)real_regs->si;
+    if (!user_filename)
+        return 0;
+
+    flags = (int)real_regs->dx;
+    /* Skip the allocation/copy entirely for read-only opens - this is
+     * the overwhelming majority of opens on a normal system, and
+     * filtering here (still atomic-safe - just an integer test) avoids
+     * scheduling work for events behavior.c would discard anyway. */
+    if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
+        return 0;
+
+    ow = kmalloc(sizeof(*ow), GFP_ATOMIC);
+    if (!ow)
+        return 0;
+
+    if (strncpy_from_user(ow->path, user_filename, PATH_MAX) <= 0) {
+        kfree(ow);
+        return 0;
+    }
+
+    ow->flags = flags;
+    ow->pid = current->pid;
+    ow->target_pid = get_task_pid(current, PIDTYPE_PID);
+    INIT_WORK(&ow->work, av_openat_work_fn);
+    queue_work(av_wq, &ow->work);
+
+    return 0;
+}
+
+/* ---- unlink/unlinkat: self-delete + sensitive-path-deletion ---- */
+
+struct av_unlink_work {
+    struct work_struct work;
+    struct pid *target_pid;
+    pid_t pid;
+    char path[PATH_MAX];
+};
+
+static void av_unlink_work_fn(struct work_struct *w)
+{
+    struct av_unlink_work *uw = container_of(w, struct av_unlink_work, work);
+
+    av_behavior_check_unlink(uw->pid, uw->path, uw->target_pid);
+
+    put_pid(uw->target_pid);
+    kfree(uw);
+}
+
+static int schedule_unlink_work(const char __user *user_path)
+{
+    struct av_unlink_work *uw;
+
+    if (!user_path)
+        return 0;
+
+    uw = kmalloc(sizeof(*uw), GFP_ATOMIC);
+    if (!uw)
+        return 0;
+
+    if (strncpy_from_user(uw->path, user_path, PATH_MAX) <= 0) {
+        kfree(uw);
+        return 0;
+    }
+
+    uw->pid = current->pid;
+    uw->target_pid = get_task_pid(current, PIDTYPE_PID);
+    INIT_WORK(&uw->work, av_unlink_work_fn);
+    queue_work(av_wq, &uw->work);
+
+    return 0;
+}
+
+/* unlink(const char *pathname) - pathname is the first (and only)
+ * argument, same register position as execve's filename. */
+static int handler_pre_unlink(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+
+    if (!real_regs)
+        return 0;
+    return schedule_unlink_work((const char __user *)real_regs->di);
+}
+
+/* unlinkat(int dfd, const char *pathname, int flag) - pathname is the
+ * SECOND argument (regs->si), same position as openat's filename. */
+static int handler_pre_unlinkat(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+
+    if (!real_regs)
+        return 0;
+    return schedule_unlink_work((const char __user *)real_regs->si);
+}
+
 static int __init av_init(void)
 {
     int ret;
@@ -292,11 +465,17 @@ static int __init av_init(void)
                      "275a021bbfb6489e54d471899f7db9d1663fc695ec2fe2a2c4538aabf651fd0f",
                      "EICAR-Test-File");
 
+    ret = av_behavior_init();
+    if (ret) {
+        pr_err("kernel-av: failed to init behavior tracking: %d\n", ret);
+        goto err_proc;
+    }
+
     av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, 0);
     if (!av_wq) {
         pr_err("kernel-av: failed to allocate workqueue\n");
         ret = -ENOMEM;
-        goto err_proc;
+        goto err_behavior;
     }
 
     ret = av_netlink_init();
@@ -305,20 +484,49 @@ static int __init av_init(void)
         goto err_wq;
     }
 
-    kp.pre_handler = handler_pre;
-    ret = register_kprobe(&kp);
+    kp_execve.pre_handler = handler_pre;
+    ret = register_kprobe(&kp_execve);
     if (ret < 0) {
-        pr_err("kernel-av: register_kprobe failed: %d\n", ret);
+        pr_err("kernel-av: register_kprobe(execve) failed: %d\n", ret);
         goto err_netlink;
+    }
+
+    kp_openat.pre_handler = handler_pre_openat;
+    ret = register_kprobe(&kp_openat);
+    if (ret < 0) {
+        pr_err("kernel-av: register_kprobe(openat) failed: %d\n", ret);
+        goto err_kp_execve;
+    }
+
+    kp_unlink.pre_handler = handler_pre_unlink;
+    ret = register_kprobe(&kp_unlink);
+    if (ret < 0) {
+        pr_err("kernel-av: register_kprobe(unlink) failed: %d\n", ret);
+        goto err_kp_openat;
+    }
+
+    kp_unlinkat.pre_handler = handler_pre_unlinkat;
+    ret = register_kprobe(&kp_unlinkat);
+    if (ret < 0) {
+        pr_err("kernel-av: register_kprobe(unlinkat) failed: %d\n", ret);
+        goto err_kp_unlink;
     }
 
     pr_info("kernel-av: loaded, %zu signature(s) active\n", av_sigtable_count());
     return 0;
 
+err_kp_unlink:
+    unregister_kprobe(&kp_unlink);
+err_kp_openat:
+    unregister_kprobe(&kp_openat);
+err_kp_execve:
+    unregister_kprobe(&kp_execve);
 err_netlink:
     av_netlink_exit();
 err_wq:
     destroy_workqueue(av_wq);
+err_behavior:
+    av_behavior_exit();
 err_proc:
     av_sigtable_proc_exit();
 err_sigtable:
@@ -328,11 +536,15 @@ err_sigtable:
 
 static void __exit av_exit(void)
 {
-    unregister_kprobe(&kp);
+    unregister_kprobe(&kp_unlinkat);
+    unregister_kprobe(&kp_unlink);
+    unregister_kprobe(&kp_openat);
+    unregister_kprobe(&kp_execve);
     /* destroy_workqueue() flushes all pending work first, so no work
      * item can run against unloaded module .text after this returns. */
     destroy_workqueue(av_wq);
     av_netlink_exit();
+    av_behavior_exit();
     av_sigtable_proc_exit();
     av_sigtable_exit();
     pr_info("kernel-av: unloaded\n");
@@ -343,5 +555,5 @@ module_exit(av_exit);
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Keane");
-MODULE_DESCRIPTION("Signature-based execve detection with runtime-managed signature DB");
-MODULE_VERSION("0.3-pre");
+MODULE_DESCRIPTION("Signature-based execve detection with runtime-managed signature DB and behavioral heuristics");
+MODULE_VERSION("0.8-pre");

@@ -1,0 +1,17 @@
+# .yamllint - relaxes a few default rules that don't fit GitHub Actions
+# workflow conventions:
+#   - line-length: workflow files routinely have long embedded shell
+#     commands; wrapping every one would hurt readability more than it
+#     helps. 150 gives headroom without going unbounded.
+#   - truthy: GitHub Actions' `on:` key is a well-known yamllint false
+#     positive (YAML 1.1 treats bare `on` as boolean true) - every real
+#     GH Actions workflow triggers this, it's not a genuine bug.
+#   - document-start: GH Actions workflows don't need a leading `---`.
+extends: default
+
+rules:
+  line-length:
+    max: 150
+  truthy:
+    check-keys: false
+  document-start: disable
