@@ -50,13 +50,19 @@ rules/
                         entropy - threshold (7.0/8.0) calibrated against
                         real samples, catches packers that strip AND
                         packers that keep section headers
+corpus/
+  fuzzy_hashes.txt      - v0.7.0: corpus of known-bad ssdeep fuzzy hashes
+                        (format: hash,name) - the seed entry is a test
+                        fixture, not real malware; add real sample hashes
+                        here once testing against actual threats
 userspace/
   avctl/              - CLI for managing the signature DB via /proc
     avctl.c
     Makefile
   avd/                - daemon: receives scan requests over netlink, loads
-                        rules/*.yar at startup, replies with a verdict based
-                        on YARA matching
+                        rules/*.yar and corpus/fuzzy_hashes.txt at startup;
+                        replies with a verdict based on YARA matching, then
+                        (on a YARA miss) fuzzy-hash similarity
     avd.c
     Makefile
 experiments/          - throwaway learning modules, not tagged/released
@@ -94,7 +100,7 @@ directories.
 | `v0.4.0` ✅ | String & API heuristics via YARA's `elf` module (imported dynamic symbols: `ptrace`, `memfd_create`, `mprotect`, `dlopen`, plus a compound rule) — verified against real ptrace-importing binaries | userspace (`rules/heuristics.yar`) |
 | `v0.5.0` ✅ | ELF header & section analysis — no section headers (packer indicator), executable stack, RWX segments, entry point outside `.text` — verified against a real UPX-packed binary | userspace (`rules/elf_analysis.yar`) |
 | `v0.6.0` ✅ | Entropy analysis — whole-file and per-section Shannon entropy, threshold calibrated against real samples (normal binary, packed binary, random data) | userspace (`rules/entropy.yar`) |
-| `v0.7.0` | Fuzzy hashing (ssdeep/TLSH) against a known-sample corpus | userspace |
+| `v0.7.0` ✅ | Fuzzy hashing (ssdeep/libfuzzy) against a corpus of known-bad hashes — catches near-identical variants that evade exact hash matching entirely; verified: a modified variant scores 100 similarity, an unrelated file scores 0 | `avd` + `corpus/fuzzy_hashes.txt` |
 | `v0.8.0` | Behavioral heuristics (rapid file writes, sensitive path writes, self-deleting binaries) | kernel (workqueue-deferred, same pattern as v0.1.0) |
 | `v0.9.0` | Evasion resistance — adversarial testing against your own engine (packing, obfuscation, timing-based sandbox detection) and documenting what does/doesn't get caught | test suite + report, not shipped code |
 | `v1.0.0` | Quarantine policy, structured logging, performance benchmarks | kernel + userspace |
@@ -102,6 +108,15 @@ directories.
 `v0.3.0-prep` is worth tagging on its own once verified — see
 `docs/netlink-protocol.md` for the full protocol design, including a
 documented fail-open-on-timeout decision worth discussing in your report.
+
+**Scope note on v0.7.0**: only ssdeep (via libfuzzy) was implemented,
+not TLSH. Both are valid fuzzy-hashing approaches with different
+tradeoffs (ssdeep is simpler and widely supported; TLSH is generally
+considered more robust for larger files) — worth mentioning as a
+deliberate scope decision in your report, and a reasonable stretch
+goal if you have time later (`libtlsh-dev` is available and would sit
+alongside the ssdeep check with essentially the same corpus-comparison
+structure).
 
 Tagging a milestone once it's working and tested:
 
@@ -448,6 +463,64 @@ Worth including in your report: these two rules are deliberately
 complementary rather than redundant — `High_Overall_Entropy` catches
 packers that strip sections (like UPX), `High_Entropy_Section` would
 catch ones that don't. Neither alone covers both cases.
+
+## Testing fuzzy hashing (v0.7.0)
+
+This is the one detection layer that genuinely does something the
+others can't: catch a file that's been slightly modified specifically
+to dodge exact hash matching. Demonstrate it directly:
+
+```bash
+sudo apt-get install -y ssdeep   # or: sudo pacman -S ssdeep
+
+# the corpus already contains the fuzzy hash of /tmp/ptrace_test (built
+# in the v0.4.0 section) - verify the seed hash still matches your build:
+ssdeep -b /tmp/ptrace_test
+
+# make a "variant" - same binary, a few bytes appended (simulating a
+# minor recompile/modification that would produce a COMPLETELY
+# different SHA-256, but should still fuzzy-match)
+cp /tmp/ptrace_test /tmp/ptrace_test_variant
+echo "extra padding" >> /tmp/ptrace_test_variant
+
+ssdeep -b /tmp/ptrace_test > /tmp/corpus_hash.txt
+ssdeep -m /tmp/corpus_hash.txt /tmp/ptrace_test_variant
+# expect: matches with a high score (100 in testing)
+
+ssdeep -m /tmp/corpus_hash.txt /bin/ls
+# expect: no output (unrelated file, no match)
+```
+
+Full round trip through `avd` (fuzzy matching only runs on a YARA
+miss, so use a file that doesn't already trigger `heuristics.yar` or
+`elf_analysis.yar` — the variant above works since it's a normal,
+unpacked binary):
+
+```bash
+sudo insmod av/av.ko
+cd userspace/avd && make && cd ../..
+sudo userspace/avd/avd rules corpus/fuzzy_hashes.txt
+
+# in another terminal
+/tmp/ptrace_test_variant
+```
+
+Expect in `avd`'s output:
+```
+avd: FUZZY MATCH "/tmp/ptrace_test_variant" -> "test-ptrace-sample" score=100
+```
+
+And in `dmesg`:
+```
+kernel-av: DETECTED "/tmp/ptrace_test_variant" via daemon, rule "Fuzzy:test-ptrace-sample(100)" (pid ...) - killing
+```
+
+**The threshold (60/100) is a starting point, not a tuned value** — it
+was picked because it sits well above the "unrelated files" baseline
+(0 in testing) and well below the "genuine minor variant" case (100),
+but real-world tuning needs an actual malware corpus with known
+variant families, which is out of scope here. Worth discussing this
+gap explicitly in your report rather than presenting 60 as validated.
 
 ## Toolchain support (GCC / Clang)
 

@@ -135,10 +135,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install libnl-genl and libyara
+      - name: Install libnl-genl, libyara, and libfuzzy
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnl-genl-3-dev libyara-dev pkg-config
+          sudo apt-get install -y libnl-genl-3-dev libyara-dev libfuzzy-dev pkg-config
       - name: Build avd
         run: make -C userspace/avd
 
@@ -183,6 +183,20 @@ jobs:
                   --set-section-flags .packed_data=alloc,contents \
                   /tmp/section_entropy_test
           yara rules/entropy.yar /tmp/section_entropy_test | grep -q High_Entropy_Section
+
+      - name: Smoke-test fuzzy hash corpus matching
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y ssdeep
+          # a minor variant (a few bytes appended) should score high
+          # similarity against the corpus-seed original - this is the
+          # whole point of fuzzy hashing vs exact hash matching
+          cp /tmp/ptrace_test /tmp/ptrace_test_variant
+          echo "extra padding for testing" >> /tmp/ptrace_test_variant
+          ssdeep -b /tmp/ptrace_test > /tmp/corpus_hash.txt
+          ssdeep -m /tmp/corpus_hash.txt /tmp/ptrace_test_variant | grep -q "matches"
+          # an unrelated file should NOT match
+          ! ssdeep -m /tmp/corpus_hash.txt /bin/ls | grep -q "matches"
 
       - uses: actions/upload-artifact@v4
         with:

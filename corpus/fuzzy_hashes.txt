@@ -1,0 +1,14 @@
+# fuzzy_hashes.txt - corpus of known-bad ssdeep fuzzy hashes.
+#
+# Format: <ssdeep_hash>,<name>
+# Lines starting with # are comments. Blank lines are ignored.
+#
+# TEST FIXTURE ONLY: the entry below is the fuzzy hash of a small,
+# harmless test binary built during development (a program that calls
+# ptrace() - see rules/heuristics.yar), NOT a real malware sample. It
+# exists so the fuzzy-matching *mechanism* can be demonstrated and
+# tested end to end. Populate this file with real sample hashes (e.g.
+# from a malware corpus you have legitimate access to for coursework)
+# once you're testing detection against actual threats rather than the
+# plumbing.
+96:R5d5Aq+TRB+B7YSYGtD35nw7/QBfxBpviOsM6:Rf+NwZSgpwEn/viD,test-ptrace-sample

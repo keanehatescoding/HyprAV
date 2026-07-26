@@ -6,6 +6,8 @@ LIBNL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnl-genl-3.0 2>/dev/null)
 LIBNL_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 2>/dev/null)
 YARA_CFLAGS  := $(shell $(PKG_CONFIG) --cflags yara 2>/dev/null)
 YARA_LIBS    := $(shell $(PKG_CONFIG) --libs yara 2>/dev/null)
+# libfuzzy (ssdeep) doesn't ship a pkg-config file - link manually.
+FUZZY_LIBS   := -lfuzzy
 
 avd: avd.c ../../av/netlink_proto.h
 	@if [ -z "$(LIBNL_LIBS)" ]; then \
@@ -20,7 +22,14 @@ avd: avd.c ../../av/netlink_proto.h
 		echo "  Debian/Ubuntu: sudo apt install libyara-dev"; \
 		exit 1; \
 	fi
-	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -o avd avd.c $(LIBNL_LIBS) $(YARA_LIBS)
+	@if ! echo 'int main(){return 0;}' | $(CC) -x c - -o /tmp/.avd_fuzzy_check $(FUZZY_LIBS) 2>/dev/null; then \
+		echo "ERROR: libfuzzy (ssdeep) not found."; \
+		echo "  Arch/CachyOS: sudo pacman -S ssdeep"; \
+		echo "  Debian/Ubuntu: sudo apt install libfuzzy-dev"; \
+		exit 1; \
+	fi
+	@rm -f /tmp/.avd_fuzzy_check
+	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -o avd avd.c $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS)
 
 clean:
 	rm -f avd

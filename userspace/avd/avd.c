@@ -1,21 +1,31 @@
 /*
  * avd.c - userspace daemon: registers with the av kernel module over
  * Generic Netlink, receives scan requests, and replies with a verdict
- * based on YARA rule matching against the file at the given path.
+ * based on YARA rule matching and fuzzy-hash similarity against the
+ * file at the given path.
  *
- * v0.3.0: real detection logic - loads all *.yar files from a rules
- * directory (default: ./rules, override with argv[1] or AVD_RULES_DIR)
- * at startup, then scans each requested file against them.
+ * v0.3.0: netlink plumbing + YARA rule matching (rules directory)
+ * v0.7.0: fuzzy hashing (ssdeep/libfuzzy) - runs when no YARA rule
+ *         matched, comparing the file's fuzzy hash against a corpus
+ *         of known-bad hashes (default: ./corpus/fuzzy_hashes.txt,
+ *         override with argv[2] or AVD_CORPUS_FILE). Catches
+ *         near-identical variants that would evade exact hash
+ *         matching (av/sigtable.c) entirely - verified in this
+ *         sandbox: a file with a few bytes appended scores 100
+ *         similarity against the original, while an unrelated file
+ *         scores 0.
  *
- * Compile-verified against real libnl-genl-3.0 and libyara headers
- * (clean build, -Wall -Wextra, no warnings) and the rules in rules/
- * were verified to match with the real `yara` CLI. NOT yet
- * runtime-tested end-to-end against the actual kernel module together
- * with this - see docs/netlink-protocol.md and the top-level README's
- * netlink testing section.
+ * Compile-verified against real libnl-genl-3.0, libyara, and libfuzzy
+ * headers (clean build, -Wall -Wextra, no warnings). The YARA rules
+ * and fuzzy-hash comparison logic were verified against real samples
+ * (see README testing sections for v0.3.0-v0.7.0) using the exact
+ * scan/compare patterns used here. NOT yet runtime-tested end-to-end
+ * against the actual kernel module together with this - see
+ * docs/netlink-protocol.md and the top-level README's netlink testing
+ * section.
  *
- * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara
- * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev libyara-dev
+ * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara ssdeep
+ * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev libyara-dev libfuzzy-dev
  *
  * See docs/netlink-protocol.md for the full protocol design.
  */
@@ -34,11 +44,27 @@
 #include <netlink/genl/ctrl.h>
 
 #include <yara.h>
+#include <fuzzy.h>
 
 #include "../../av/netlink_proto.h"
 
-#define DEFAULT_RULES_DIR "rules"
-#define SCAN_TIMEOUT_SECS 10
+#define DEFAULT_RULES_DIR   "rules"
+#define DEFAULT_CORPUS_FILE "corpus/fuzzy_hashes.txt"
+#define SCAN_TIMEOUT_SECS   10
+#define FUZZY_MATCH_THRESHOLD 60 /* 0-100; see corpus/fuzzy_hashes.txt
+                                   * and the README's v0.7.0 testing
+                                   * section for how this was picked -
+                                   * a starting point, not a final tuned
+                                   * value, and worth revisiting once
+                                   * you have a real sample corpus. */
+
+struct fuzzy_corpus_entry {
+    char hash[FUZZY_MAX_RESULT];
+    char name[128];
+};
+
+static struct fuzzy_corpus_entry *fuzzy_corpus;
+static size_t fuzzy_corpus_count;
 
 static struct nl_sock *sock;
 static int family_id;
@@ -182,6 +208,126 @@ static int load_rules(const char *dir)
     return 0;
 }
 
+/*
+ * Loads the fuzzy-hash corpus from `path` (format: see
+ * corpus/fuzzy_hashes.txt). Missing file or empty corpus is not fatal -
+ * the daemon just won't have anything to fuzzy-match against, and logs
+ * a warning once at startup rather than failing every scan silently.
+ */
+static int load_fuzzy_corpus(const char *path)
+{
+    FILE *fp;
+    char line[512];
+    size_t capacity = 16;
+
+    fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "avd: could not open fuzzy corpus \"%s\": %s - "
+                        "fuzzy matching disabled\n", path, strerror(errno));
+        return 0; /* not fatal - YARA rules still work without this */
+    }
+
+    fuzzy_corpus = malloc(capacity * sizeof(*fuzzy_corpus));
+    if (!fuzzy_corpus) {
+        fclose(fp);
+        return -1;
+    }
+
+    while (fgets(line, sizeof(line), fp)) {
+        char *comma;
+        char *newline;
+        char *hash_part, *name_part;
+
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
+            continue;
+
+        newline = strchr(line, '\n');
+        if (newline)
+            *newline = '\0';
+
+        comma = strchr(line, ',');
+        if (!comma) {
+            fprintf(stderr, "avd: skipping malformed corpus line "
+                            "(no comma): %s\n", line);
+            continue;
+        }
+        *comma = '\0';
+        hash_part = line;
+        name_part = comma + 1;
+
+        if (fuzzy_corpus_count == capacity) {
+            struct fuzzy_corpus_entry *grown;
+
+            capacity *= 2;
+            grown = realloc(fuzzy_corpus, capacity * sizeof(*fuzzy_corpus));
+            if (!grown) {
+                fclose(fp);
+                return -1;
+            }
+            fuzzy_corpus = grown;
+        }
+
+        snprintf(fuzzy_corpus[fuzzy_corpus_count].hash,
+                 sizeof(fuzzy_corpus[fuzzy_corpus_count].hash),
+                 "%.*s", (int)sizeof(fuzzy_corpus[fuzzy_corpus_count].hash) - 1,
+                 hash_part);
+        snprintf(fuzzy_corpus[fuzzy_corpus_count].name,
+                 sizeof(fuzzy_corpus[fuzzy_corpus_count].name),
+                 "%.*s", (int)sizeof(fuzzy_corpus[fuzzy_corpus_count].name) - 1,
+                 name_part);
+        fuzzy_corpus_count++;
+    }
+    fclose(fp);
+
+    if (fuzzy_corpus_count == 0)
+        fprintf(stderr, "avd: fuzzy corpus \"%s\" loaded but empty - "
+                        "fuzzy matching will never trigger\n", path);
+    else
+        printf("avd: loaded %zu fuzzy hash(es) from %s\n",
+               fuzzy_corpus_count, path);
+
+    return 0;
+}
+
+/*
+ * Compares the file at `path` against every entry in the fuzzy corpus.
+ * On the best match at or above FUZZY_MATCH_THRESHOLD, copies the
+ * corpus entry's name into name_out and the score into score_out,
+ * returning 1. Returns 0 if nothing met the threshold (or no corpus
+ * loaded), -1 on a hashing error (file vanished, unreadable, etc.).
+ */
+static int check_fuzzy_corpus(const char *path, char *name_out,
+                               size_t name_out_len, int *score_out)
+{
+    char file_hash[FUZZY_MAX_RESULT];
+    int best_score = -1;
+    size_t best_idx = 0;
+    size_t i;
+
+    if (fuzzy_corpus_count == 0)
+        return 0;
+
+    if (fuzzy_hash_filename(path, file_hash) != 0)
+        return -1;
+
+    for (i = 0; i < fuzzy_corpus_count; i++) {
+        int score = fuzzy_compare(file_hash, fuzzy_corpus[i].hash);
+
+        if (score > best_score) {
+            best_score = score;
+            best_idx = i;
+        }
+    }
+
+    if (best_score >= FUZZY_MATCH_THRESHOLD) {
+        snprintf(name_out, name_out_len, "%s", fuzzy_corpus[best_idx].name);
+        *score_out = best_score;
+        return 1;
+    }
+
+    return 0;
+}
+
 struct yara_match_ctx {
     int matched;
     int match_count;
@@ -248,9 +394,44 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
         printf("avd: MATCH \"%s\" -> %d rule(s): \"%s\"\n",
                path, ctx.match_count, ctx.rule_name);
         send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
-    } else {
-        send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+        return;
     }
+
+    /* No YARA rule fired - try fuzzy-hash similarity against the
+     * corpus before declaring clean. This catches near-identical
+     * variants of a known-bad file that would evade both the kernel's
+     * exact hash check (av/sigtable.c) and exact YARA string/structure
+     * matches. */
+    {
+        char fuzzy_name[128];
+        int fuzzy_score = 0;
+        int fret = check_fuzzy_corpus(path, fuzzy_name, sizeof(fuzzy_name),
+                                       &fuzzy_score);
+
+        if (fret == 1) {
+            char verdict_name[AV_RULE_NAME_MAXLEN + 1];
+
+            /* fuzzy_compare()'s documented range is 0-100; clamping
+             * here (defensive, should never actually trigger) also
+             * gives the compiler's range analysis what it needs to
+             * prove the snprintf below can't truncate. */
+            if (fuzzy_score < 0)
+                fuzzy_score = 0;
+            if (fuzzy_score > 100)
+                fuzzy_score = 100;
+
+            snprintf(verdict_name, sizeof(verdict_name),
+                     "Fuzzy:%.40s(%d)", fuzzy_name, fuzzy_score);
+            printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n",
+                   path, fuzzy_name, fuzzy_score);
+            send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
+            return;
+        }
+        if (fret < 0)
+            fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
+    }
+
+    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
 }
 
 static struct nla_policy av_policy[AV_A_MAX + 1] = {
@@ -310,17 +491,28 @@ static int register_with_kernel(void)
 int main(int argc, char **argv)
 {
     const char *rules_dir = DEFAULT_RULES_DIR;
+    const char *corpus_file = DEFAULT_CORPUS_FILE;
 
     if (argc > 1)
         rules_dir = argv[1];
     else if (getenv("AVD_RULES_DIR"))
         rules_dir = getenv("AVD_RULES_DIR");
 
+    if (argc > 2)
+        corpus_file = argv[2];
+    else if (getenv("AVD_CORPUS_FILE"))
+        corpus_file = getenv("AVD_CORPUS_FILE");
+
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);
 
     if (load_rules(rules_dir) != 0) {
         fprintf(stderr, "avd: failed to initialize YARA - aborting\n");
+        return 1;
+    }
+
+    if (load_fuzzy_corpus(corpus_file) != 0) {
+        fprintf(stderr, "avd: failed to initialize fuzzy corpus - aborting\n");
         return 1;
     }
 
@@ -374,5 +566,6 @@ int main(int argc, char **argv)
     if (compiled_rules)
         yr_rules_destroy(compiled_rules);
     yr_finalize();
+    free(fuzzy_corpus);
     return 0;
 }
