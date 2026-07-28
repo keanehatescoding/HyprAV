@@ -57,12 +57,12 @@ section "clean-file sanity check (should NOT be killed, should log as clean)"
 dmesg -C  # clear dmesg so we only see events from this point on
 /bin/ls >/dev/null
 sleep 1
-if dmesg | grep -q "execve(\"/bin/ls\").*clean"; then
+if dmesg | grep -q 'event=clean.*path="/bin/ls"'; then
     pass "clean file logged as clean"
 else
     fail "expected clean-file log line not found in dmesg"
 fi
-if dmesg | grep -q "DETECTED.*ls"; then
+if dmesg | grep -q 'event=detected.*path="/bin/ls"'; then
     fail "clean file was incorrectly flagged as a detection"
 else
     pass "clean file was not flagged"
@@ -86,7 +86,7 @@ dmesg -C
 "$EICAR_PATH" >/dev/null 2>&1
 sleep 1   # detection is async (workqueue) - give it a moment
 
-if dmesg | grep -qi "DETECTED.*EICAR-Test-File.*killing"; then
+if dmesg | grep -qi 'event=detected.*action=kill.*reason="signature:EICAR-Test-File"'; then
     pass "EICAR execution was detected and killed"
 else
     fail "expected DETECTED/killing log line not found in dmesg"
