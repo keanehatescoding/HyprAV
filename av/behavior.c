@@ -1,6 +1,20 @@
 /*
  * behavior.c - v0.8.0: behavioral heuristics implementation.
  * See behavior.h for the design summary.
+ *
+ * v0.8.1: per-PID entries in behavior_table were never reclaimed on
+ * process exit - fine for a demo session, a real leak on long uptime
+ * (every process that ever did a write-intent open or an execve leaves
+ * a permanent kzalloc'd entry). Fixed with a periodic GC sweep
+ * (behavior_gc_fn) rather than hooking process exit directly: our key
+ * is a tgid, and correctly detecting "the whole process is gone" from
+ * an exit hook means reasoning about thread-group-leader-vs-last-
+ * thread teardown timing, which is exactly the kind of version-
+ * fragile kernel API area main.c's openat/write() comment already
+ * avoids elsewhere. A sweep that checks liveness via
+ * pid_task(find_vpid(pid), PIDTYPE_TGID) gets the same end state
+ * (stale entries eventually reclaimed) without that fragility, and
+ * reuses the same delayed_work idiom as everything else here.
  */
 
 #include <linux/module.h>
@@ -13,6 +27,9 @@
 #include <linux/string.h>
 #include <linux/fcntl.h>
 #include <linux/stringhash.h>
+#include <linux/workqueue.h>
+#include <linux/pid.h>
+#include <linux/rcupdate.h>
 
 #include "behavior.h"
 
@@ -40,6 +57,15 @@
                                     * recent_path_hashes below for why
                                     * distinct-path counting exists at
                                     * all. */
+
+#define GC_INTERVAL_MS 30000 /* how often to sweep behavior_table for
+                              * entries whose process has since exited.
+                              * Tunable - not latency-sensitive (this
+                              * is purely memory reclamation, not a
+                              * detection path), and sweep cost is
+                              * O(number of tracked processes), which
+                              * stays small in practice. 30s is a
+                              * starting point, not a tuned value. */
 
 /* Paths under these prefixes are excluded from BOTH the rapid-write
  * counter and the sensitive-path check entirely - not just given a
@@ -111,6 +137,9 @@ struct av_behavior_entry {
 
 static DEFINE_HASHTABLE(behavior_table, BEHAVIOR_BITS);
 static DEFINE_MUTEX(behavior_lock);
+
+static struct workqueue_struct *behavior_gc_wq;
+static struct delayed_work behavior_gc_work;
 
 static u32 pid_key(pid_t pid)
 {
@@ -190,6 +219,58 @@ static void kill_with_reason(struct pid *target_pid, const char *path,
         send_sig(SIGKILL, task, 0);
     }
     rcu_read_unlock();
+}
+
+/* Periodic sweep: reclaims behavior_table entries for processes that
+ * have since exited. Runs from process context (workqueue), so it's
+ * fine to hold behavior_lock across the whole scan - this never runs
+ * on the atomic kprobe path.
+ *
+ * Liveness check: find_vpid(pid) resolves the tgid number back to a
+ * struct pid in this namespace (NULL if no such pid exists at all -
+ * fully exited and reaped); pid_task(..., PIDTYPE_TGID) then confirms
+ * a task in that thread group is still attached (NULL for a pid that
+ * exists only as, e.g., a distinct PID-namespace artifact). Either
+ * NULL means "gone" - safe to reclaim.
+ *
+ * Note on PID reuse: if the pid number gets recycled by an unrelated
+ * new process before this sweep runs, the stale entry looks "alive"
+ * and survives one more interval. That's fine - av_behavior_record_exec
+ * overwrites exec_path on the new process's first execve, and the
+ * write-open window/dedup state naturally resets on its own next
+ * window regardless of who "owns" the entry in between. Worst case is
+ * one GC_INTERVAL_MS of an entry outliving its original process. */
+static void behavior_gc_fn(struct work_struct *w)
+{
+    struct av_behavior_entry *e;
+    struct hlist_node *tmp;
+    int bkt;
+    unsigned int removed = 0;
+
+    mutex_lock(&behavior_lock);
+    hash_for_each_safe(behavior_table, bkt, tmp, e, node) {
+        struct pid *p;
+        bool alive;
+
+        rcu_read_lock();
+        p = find_vpid(e->pid);
+        alive = p && pid_task(p, PIDTYPE_TGID);
+        rcu_read_unlock();
+
+        if (!alive) {
+            hash_del(&e->node);
+            kfree(e);
+            removed++;
+        }
+    }
+    mutex_unlock(&behavior_lock);
+
+    if (removed)
+        pr_debug("kernel-av: event=gc type=behavioral reclaimed=%u\n",
+                 removed);
+
+    queue_delayed_work(behavior_gc_wq, &behavior_gc_work,
+                        msecs_to_jiffies(GC_INTERVAL_MS));
 }
 
 void av_behavior_record_exec(pid_t pid, const char *path)
@@ -300,6 +381,14 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
 int av_behavior_init(void)
 {
     hash_init(behavior_table);
+
+    behavior_gc_wq = alloc_workqueue("kernel_av_behavior_gc", WQ_UNBOUND, 0);
+    if (!behavior_gc_wq)
+        return -ENOMEM;
+
+    INIT_DELAYED_WORK(&behavior_gc_work, behavior_gc_fn);
+    queue_delayed_work(behavior_gc_wq, &behavior_gc_work,
+                        msecs_to_jiffies(GC_INTERVAL_MS));
     return 0;
 }
 
@@ -308,6 +397,14 @@ void av_behavior_exit(void)
     struct av_behavior_entry *e;
     struct hlist_node *tmp;
     int bkt;
+
+    /* _sync so no gc_fn invocation can still be running (or queued to
+     * run) once we start tearing down and freeing entries below. */
+    cancel_delayed_work_sync(&behavior_gc_work);
+    if (behavior_gc_wq) {
+        destroy_workqueue(behavior_gc_wq);
+        behavior_gc_wq = NULL;
+    }
 
     mutex_lock(&behavior_lock);
     hash_for_each_safe(behavior_table, bkt, tmp, e, node) {
