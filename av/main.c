@@ -198,24 +198,29 @@ out:
 
 /* Shared kill-and-log helper, mirroring behavior.c's kill_with_reason -
  * see its comment for why the PID-1 guard is unconditional and
- * non-negotiable regardless of what triggered detection. */
+ * non-negotiable regardless of what triggered detection.
+ *
+ * v1.0.0-merge: structured key=value log format (event=... type=...
+ * etc.) instead of free-form sentences, so dmesg output is grep/awk-
+ * parseable for any future log aggregation. Kept on one line per
+ * event deliberately. */
 static void av_kill(struct pid *target_pid, const char *path,
-                     const char *reason)
+                     const char *type, const char *reason)
 {
     struct task_struct *task;
 
     if (pid_nr(target_pid) == 1) {
-        pr_alert("kernel-av: SUPPRESSED kill of PID 1 (reason: %s, "
-                 "path \"%s\") - refusing to signal init under any "
-                 "circumstance\n", reason, path);
+        pr_alert("kernel-av: event=suppressed action=none type=%s "
+                 "path=\"%s\" reason=\"%s\" pid=1\n", type, path, reason);
         return;
     }
 
     rcu_read_lock();
     task = pid_task(target_pid, PIDTYPE_PID);
     if (task) {
-        pr_alert("kernel-av: DETECTED \"%s\" %s (pid %d) - killing\n",
-                 path, reason, pid_nr(target_pid));
+        pr_alert("kernel-av: event=detected action=kill type=%s "
+                 "path=\"%s\" reason=\"%s\" pid=%d\n",
+                 type, path, reason, pid_nr(target_pid));
         send_sig(SIGKILL, task, 0);
     }
     rcu_read_unlock();
@@ -245,8 +250,8 @@ static void av_work_fn(struct work_struct *w)
     av_behavior_record_exec(aw->tgid, aw->path);
 
     if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
-        snprintf(reason, sizeof(reason), "matches signature \"%s\"", sig_name);
-        av_kill(aw->target_pid, aw->path, reason);
+        snprintf(reason, sizeof(reason), "signature:%s", sig_name);
+        av_kill(aw->target_pid, aw->path, "signature", reason);
         goto out;
     }
 
@@ -266,19 +271,21 @@ static void av_work_fn(struct work_struct *w)
                                           sizeof(rule_name),
                                           DAEMON_TIMEOUT_MS);
         if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
-            snprintf(reason, sizeof(reason), "via daemon, rule \"%s\"", rule_name);
-            av_kill(aw->target_pid, aw->path, reason);
+            snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
+            av_kill(aw->target_pid, aw->path, "daemon", reason);
         } else if (nl_ret == 0) {
-            pr_info("kernel-av: execve(\"%s\") md5=%s sha1=%s sha256=%s "
-                    "clean (daemon)\n",
-                    aw->path, digest.md5, digest.sha1, digest.sha256);
+            pr_info("kernel-av: event=clean type=daemon path=\"%s\" pid=%d "
+                    "md5=%s sha1=%s sha256=%s\n",
+                    aw->path, pid_nr(aw->target_pid),
+                    digest.md5, digest.sha1, digest.sha256);
         } else {
             /* -ENOTCONN (no daemon), -ETIMEDOUT, or another error -
              * fail open, but log distinctly so this is visible/greppable
              * separately from a genuine daemon-confirmed clean verdict. */
-            pr_info("kernel-av: execve(\"%s\") md5=%s sha1=%s sha256=%s "
-                    "clean (no daemon verdict, err=%d)\n",
-                    aw->path, digest.md5, digest.sha1, digest.sha256, nl_ret);
+            pr_info("kernel-av: event=clean type=fail-open path=\"%s\" "
+                    "pid=%d md5=%s sha1=%s sha256=%s err=%d\n",
+                    aw->path, pid_nr(aw->target_pid),
+                    digest.md5, digest.sha1, digest.sha256, nl_ret);
         }
     }
 

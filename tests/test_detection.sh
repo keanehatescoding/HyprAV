@@ -69,6 +69,9 @@ else
 fi
 
 section "EICAR detection"
+# Single quotes are intentional: this string has literal $ characters
+# that must NOT be shell-expanded.
+# shellcheck disable=SC2016
 printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > "$EICAR_PATH"
 chmod +x "$EICAR_PATH"
 

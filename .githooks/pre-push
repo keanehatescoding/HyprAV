@@ -21,7 +21,7 @@ CHANGED_FILES=""
 
 # git feeds pre-push one line per ref being pushed, on stdin:
 #   <local ref> <local sha1> <remote ref> <remote sha1>
-while read -r local_ref local_sha remote_ref remote_sha; do
+while read -r _ local_sha _ remote_sha; do
     if [ "$local_sha" = "$ZERO_SHA" ]; then
         continue  # deleting a remote ref - nothing to test
     fi

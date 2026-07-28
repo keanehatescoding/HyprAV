@@ -40,16 +40,21 @@ av/                  - the actual antivirus module (single, evolving)
   Makefile
 rules/
   test.yar             - sample YARA rules used for testing avd (EICAR string
-                        match, a toy reverse-shell pattern)
+                        match, a toy reverse-shell pattern) - weight=100,
+                        override=true on both: explicit test fixtures meant
+                        to definitively trigger, not weak corroborating signals
   heuristics.yar        - v0.4.0: API import heuristics using YARA's elf
                         module (ptrace, memfd_create, mprotect, dlopen,
-                        plus a compound rule) - see the confidence notes
-                        in the file, these are individually weak signals
+                        plus a compound rule) - individually weak signals
+                        (weight 5-40); real testing killed zsh/sh/uwsm
+                        before weighted scoring existed - see v0.9.1 below
   elf_analysis.yar      - v0.5.0: ELF structural analysis (no section
                         headers, executable stack, RWX segments, entry
-                        point outside .text) - higher confidence than
-                        heuristics.yar, verified against a real UPX-packed
-                        binary
+                        point outside .text). No_Section_Headers and
+                        Executable_Stack carry override=true (convict
+                        alone, verified clean against real samples);
+                        Entry_Point_Outside_Text does NOT (confirmed
+                        false positive on uwsm in real testing)
   entropy.yar           - v0.6.0: whole-file and per-section Shannon
                         entropy - threshold (7.0/8.0) calibrated against
                         real samples, catches packers that strip AND
@@ -65,8 +70,11 @@ userspace/
     Makefile
   avd/                - daemon: receives scan requests over netlink, loads
                         rules/*.yar and corpus/fuzzy_hashes.txt at startup;
-                        replies with a verdict based on YARA matching, then
-                        (on a YARA miss) fuzzy-hash similarity
+                        replies with a verdict based on weighted YARA
+                        scoring (or an override-tier rule alone), then
+                        (on a miss) fuzzy-hash similarity. v1.0.0:
+                        quarantines the file on any MALICIOUS verdict
+                        (moves to /var/lib/av-quarantine/, chmod 0000)
     avd.c
     Makefile
 experiments/          - throwaway learning modules, not tagged/released
@@ -77,6 +85,9 @@ tests/
   test_sigtable.sh     - avctl/proc protocol tests (add/list/del/reject)
   test_detection.sh    - full build/load/detect/unload integration test
   run_all.sh           - runs both of the above (used by the pre-push hook)
+  benchmark.sh          - v1.0.0: execve/openat hook overhead, module
+                        loaded vs unloaded (needs root, real numbers only
+                        from your VM - see the benchmarking section)
   evasion/              - v0.9.0: adversarial tests against the engine itself
     test_dynamic_symbol_evasion.sh    - standalone, no kernel module needed
     test_fuzzy_evasion.sh              - standalone
@@ -116,7 +127,19 @@ directories.
 | `v0.7.0` ✅ | Fuzzy hashing (ssdeep/libfuzzy) against a corpus of known-bad hashes — catches near-identical variants that evade exact hash matching entirely; verified: a modified variant scores 100 similarity, an unrelated file scores 0 | `avd` + `corpus/fuzzy_hashes.txt` |
 | `v0.8.0` ✅ | Behavioral heuristics — rapid write-intent opens (ransomware-like), sensitive path writes/deletes, self-deleting binaries; hooks `openat`/`unlink`/`unlinkat` instead of `write()` to avoid risky cross-process fd→path resolution | kernel (workqueue-deferred, same pattern as v0.1.0) |
 | `v0.9.0` ✅ | Evasion resistance — 4 techniques tested against the real engine (dynamic symbol resolution, fuzzy-hash dilution, entropy dilution, slow-drip behavioral pacing); 3 of 4 evaded their target layer, but one (entropy dilution) was still caught by structural analysis running alongside it — the core validation of the layered-detection design | `tests/evasion/` + `docs/evasion-findings.md` |
-| `v1.0.0` | Quarantine policy, structured logging, performance benchmarks | kernel + userspace |
+| `v0.9.1` ✅ | Weighted YARA scoring — real testing killed `/usr/bin/zsh`, `/bin/sh`, and `uwsm` (legitimate binaries matching a single low-confidence rule each); conviction now requires matched rules' `weight` meta to sum past `MALICIOUS_SCORE_THRESHOLD` (100), with a below-threshold match falling through to fuzzy-hash corroboration instead of returning clean outright | `avd` + `weight` meta on every rule |
+| `v1.0.0` ✅ | Override tier (a small set of verified-clean rules convict alone regardless of score — added after discovering v0.9.1's scoring change silently broke the v0.9.0 entropy-dilution defense-in-depth finding), quarantine (userspace, `avd`-driven detections only), structured `key=value` kernel logging, performance benchmark harness | kernel + userspace |
+
+**Scope note on quarantine**: only detections that go through `avd`
+(YARA, API heuristics, ELF analysis, entropy, fuzzy hash) get their
+file quarantined (moved + `chmod 0000`). Kernel-only detections (exact
+signature match, behavioral heuristics) still only kill the process —
+doing file rename/unlink from kernel space needs `vfs_rename()`/
+`vfs_unlink()`, genuinely risky and version-fragile kernel API
+territory (the same category of problem the netlink `genl_family`
+layout caused earlier in this project). Userspace `rename()`/`chmod()`
+carries none of that risk, so quarantine lives in `avd` instead of
+`main.c`.
 
 `v0.3.0-prep` is worth tagging on its own once verified — see
 `docs/netlink-protocol.md` for the full protocol design, including a
@@ -300,7 +323,7 @@ ls
 ```
 
 Expect in `avd`'s output: `avd: scan request reqid=1 ...`, no `MATCH`
-line. In `dmesg`: `... clean (daemon)`.
+line. In `dmesg`: `kernel-av: event=clean type=daemon path="/usr/bin/ls" ...`.
 
 **YARA detection check** — since the EICAR file's SHA-256 is already a
 kernel-side signature, temporarily remove it so the request actually
@@ -316,20 +339,23 @@ chmod +x /tmp/eicar.com
 /tmp/eicar.com
 ```
 
-Expect in `avd`'s output:
+Expect in `avd`'s output (as of `v0.9.1`+, matches include the
+aggregate score and whether an override rule fired — `test.yar`'s
+`EICAR_Test_String` carries `override = true`, so it convicts on its
+own regardless of the numeric score):
 ```
-avd: MATCH "/tmp/eicar.com" -> rule "EICAR_Test_String"
+avd: MATCH "/tmp/eicar.com" -> 1 rule(s), score=100, override=1: "EICAR_Test_String"
 ```
 
-And in `dmesg`:
+And in `dmesg` (structured `key=value` format as of `v1.0.0`):
 ```
-kernel-av: DETECTED "/tmp/eicar.com" via daemon, rule "EICAR_Test_String" (pid ...) - killing
+kernel-av: event=detected action=kill type=daemon path="/tmp/eicar.com" reason="daemon:EICAR_Test_String" pid=...
 ```
 
 If `avd` isn't running, the same file should still log clean via the
-fail-open path — check for the `(no daemon verdict, err=...)` suffix
-(`-ENOTCONN` if `avd` never registered, `-ETIMEDOUT` if it registered
-but didn't reply in time).
+fail-open path — check for `type=fail-open` in the `dmesg` line
+(`err=-ENOTCONN`-style errno if `avd` never registered, `err=-ETIMEDOUT`
+if it registered but didn't reply in time).
 
 **What's actually been verified vs. what hasn't**: the kernel module
 (including `netlink_chan.c`) was compile/link-checked against real (if
@@ -713,6 +739,83 @@ not evade `elf_analysis.yar` running against the same file. That's the
 central validation of treating detection as several independent
 checks rather than one big score, and the strongest single piece of
 evidence for that design choice in the whole project.
+
+## Testing weighted scoring and the override tier (v0.9.1 / v1.0.0)
+
+Confirm the false-positive fix actually holds, and that the override
+tier didn't reintroduce the problem it was meant to fix:
+
+```bash
+# single weak import only - must NOT convict (the zsh/sh/uwsm case)
+cat > /tmp/ptrace_only.c << 'EOF'
+#include <sys/ptrace.h>
+#include <stddef.h>
+int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
+EOF
+gcc -o /tmp/ptrace_only /tmp/ptrace_only.c
+/tmp/ptrace_only
+dmesg | tail -3
+# expect: event=clean (or no daemon match logged as MALICIOUS) -
+#         Imports_Ptrace alone (weight 15) stays well under threshold
+
+# a real UPX-packed binary - must still convict (multiple weights sum,
+# or No_Section_Headers' override fires alone either way)
+upx --best -o /tmp/upx_test /tmp/ptrace_only
+/tmp/upx_test
+dmesg | tail -3
+# expect: event=detected ... reason="daemon:No_Section_Headers,..."
+```
+
+If you have `tests/evasion/test_entropy_dilution_evasion.sh` results
+from before the override tier existed, re-running it now is the most
+direct way to see the fix — the padded/diluted sample should convict
+again where it previously evaded (see `docs/evasion-findings.md`
+finding #3 for the full before/after story).
+
+## Testing quarantine, structured logs, and benchmarks (v1.0.0)
+
+**Quarantine** — trigger any `avd`-driven detection (the EICAR-via-
+daemon flow above works, or the UPX test just above):
+
+```bash
+ls -la /var/lib/av-quarantine/
+# expect: a file named <timestamp>_<original-basename>.quarantined
+#         with permissions ----------  (chmod 0000)
+```
+
+Confirm the original file is gone from its original location, and that
+the quarantined copy genuinely can't be read/executed even as root
+without an explicit `chmod` back first.
+
+**Structured logs** — every detection/clean/suppressed event is now a
+single grep/awk-parseable line:
+
+```bash
+dmesg | grep 'kernel-av: event='
+# event=detected action=kill type=signature path="..." reason="..." pid=N
+# event=clean type=daemon path="..." pid=N md5=... sha1=... sha256=...
+# event=suppressed action=none type=behavioral path="..." reason="..." pid=1
+```
+
+**Performance benchmark**:
+
+```bash
+sudo tests/benchmark.sh
+```
+
+Report both the raw baseline numbers AND the loaded-vs-unloaded
+delta/ratio. Two scenarios worth benchmarking separately, since they
+measure different things:
+
+- **`avd` not running**: `av_netlink_scan_request()` returns
+  `-ENOTCONN` immediately (no daemon registered → no wait at all) —
+  this measures just the kernel-side hashing + signature lookup cost.
+- **`avd` running** (`sudo userspace/avd/avd rules corpus/fuzzy_hashes.txt`
+  in another terminal first): this additionally measures the netlink
+  round trip and `avd`'s own scan time (YARA + fuzzy hash) for every
+  execve that misses the kernel-side signature check — the more
+  realistic end-to-end number, and the one worth reporting as the
+  "real" overhead.
 
 ## Toolchain support (GCC / Clang)
 

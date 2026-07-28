@@ -69,24 +69,49 @@ standalone detector.
 
 This is the most important finding of the four, because it tests the
 project's core design premise directly: **does evading one layer mean
-evading the engine?**
+evading the engine?** The answer changed twice as the project evolved,
+and the full sequence is worth documenting rather than just the final
+state.
 
-Padding a UPX-packed binary with 500KB of zero bytes dilutes the
-*whole-file* Shannon entropy average below the 7.0 threshold —
-verified: `entropy.yar`'s `High_Overall_Entropy` no longer fires on the
-padded file.
+**Original result (any-match-convicts era)**: padding a UPX-packed
+binary with 500KB of zero bytes dilutes the *whole-file* Shannon
+entropy average below the 7.0 threshold — `entropy.yar`'s
+`High_Overall_Entropy` no longer fires on the padded file. But the
+same padded file was still caught by `elf_analysis.yar`
+(`No_Section_Headers` + `Entry_Point_Outside_Text`), since padding with
+zero bytes doesn't restore the section headers UPX stripped. **Evading
+the entropy check did not evade the engine.**
 
-But the same padded file was run through `elf_analysis.yar` and both
-`No_Section_Headers` and `Entry_Point_Outside_Text` still fired —
-because padding the file with zero bytes doesn't restore the section
-headers UPX stripped, or fix the entry point. **Evading the entropy
-check did not evade the engine.**
+**Regression (v0.9.1 weighted-scoring era)**: after real testing killed
+`zsh`/`sh`/`uwsm` on single weak matches and the detection logic moved
+to summed rule weights against a 100-point threshold, the same
+evasion sample was re-scored: `No_Section_Headers`(55) +
+`Entry_Point_Outside_Text`(30) = **85**, below the new threshold. The
+fix for one real problem (false positives from single weak matches)
+silently broke this finding — evading entropy analysis now evaded the
+*whole pipeline*, not just one layer. This is a direct, mechanical
+tradeoff, not a coincidence: making conviction harder in general makes
+every individual evasion easier by the same amount.
 
-This is the strongest argument in the whole project for layering
-independent, differently-mechanismed checks rather than relying on any
-single detector, and worth making explicitly in your report as the
-central design validation of `v0.3.0`–`v0.8.0` being separate systems
-rather than one big scoring function.
+**Fix (override tier)**: rather than choosing between "some false
+positives" and "some false negatives" as a global setting, a small,
+deliberately narrow set of rules — verified against both real positive
+and negative samples, with no known false-positive history —
+now carry `override = true` and convict on their own regardless of
+aggregate score. `No_Section_Headers` and `Executable_Stack` qualify;
+`Entry_Point_Outside_Text` (the rule that actually false-positived on
+`uwsm`) and `Has_RWX_Segment` (never verified against a real sample)
+deliberately do not. Re-scored: `No_Section_Headers` alone now
+convicts via override, restoring the original conclusion — the
+numeric score is still 85/100 (override doesn't change the weight
+sum), but `override=1` means it convicts regardless of the number.
+
+The real lesson here isn't "the engine is robust" — it's that a fix
+for one failure mode (false positives) can silently reintroduce a
+different one (false negatives) if you don't re-run your adversarial
+tests after every change to the scoring logic. Evasion testing is not
+a one-time checkbox; it needs to be re-run whenever detection logic
+changes, and this finding is the concrete proof of why.
 
 ## 4. Slow-drip modification vs. rapid-write behavioral heuristic
 

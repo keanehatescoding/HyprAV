@@ -14,6 +14,22 @@
  *         sandbox: a file with a few bytes appended scores 100
  *         similarity against the original, while an unrelated file
  *         scores 0.
+ * v1.0.0-merge: quarantine (on any MALICIOUS verdict, the file is
+ *         moved to /var/lib/av-quarantine/ and chmod 0000'd - see
+ *         quarantine_file() below) and an `override` meta tier on top
+ *         of the v0.9.1 scoring system - a small set of rules convict
+ *         on their own regardless of aggregate score. Added after
+ *         discovering the pure-additive scoring model let the
+ *         v0.9.0 entropy-dilution evasion finding through the WHOLE
+ *         pipeline once Entry_Point_Outside_Text's weight was reduced
+ *         - see elf_analysis.yar and docs/evasion-findings.md.
+ *         SCOPE LIMIT: quarantine only covers detections that go
+ *         through avd (YARA, heuristics, fuzzy hash) - kernel-only
+ *         detections (exact signature match, behavioral heuristics)
+ *         still only kill, since file rename/unlink from KERNEL space
+ *         needs vfs_rename()/vfs_unlink(), genuinely risky and
+ *         version-fragile kernel API territory. Userspace rename()/
+ *         chmod() has none of that risk.
  *
  * Compile-verified against real libnl-genl-3.0, libyara, and libfuzzy
  * headers (clean build, -Wall -Wextra, no warnings). The YARA rules
@@ -38,6 +54,11 @@
 #include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <netlink/netlink.h>
 #include <netlink/genl/genl.h>
@@ -48,8 +69,9 @@
 
 #include "../../av/netlink_proto.h"
 
-#define DEFAULT_RULES_DIR   "rules"
-#define DEFAULT_CORPUS_FILE "corpus/fuzzy_hashes.txt"
+#define DEFAULT_RULES_DIR      "rules"
+#define DEFAULT_CORPUS_FILE    "corpus/fuzzy_hashes.txt"
+#define DEFAULT_QUARANTINE_DIR "/var/lib/av-quarantine"
 #define SCAN_TIMEOUT_SECS   10
 #define MALICIOUS_SCORE_THRESHOLD 100
     /* Sum of every matching rule's `weight` meta (see the .yar files under rules/) has
@@ -76,6 +98,7 @@ struct fuzzy_corpus_entry {
 
 static struct fuzzy_corpus_entry *fuzzy_corpus;
 static size_t fuzzy_corpus_count;
+static const char *quarantine_dir = DEFAULT_QUARANTINE_DIR;
 
 static struct nl_sock *sock;
 static int family_id;
@@ -344,6 +367,12 @@ struct yara_match_ctx {
     int match_count;
     int score; /* sum of every matched rule's `weight` meta - see
                 * MALICIOUS_SCORE_THRESHOLD above */
+    int override_matched; /* v1.0.0-merge: true if any matched rule
+                            * carries `override = true` - convicts
+                            * regardless of aggregate score. See
+                            * elf_analysis.yar's header comment for
+                            * why only a small, carefully-chosen set
+                            * of rules get this. */
     char rule_name[AV_RULE_NAME_MAXLEN + 1]; /* comma-joined, truncated to fit */
 };
 
@@ -371,7 +400,10 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
             if (meta->type == META_TYPE_INTEGER &&
                 strcmp(meta->identifier, "weight") == 0) {
                 ctx->score += (int)meta->integer;
-                break;
+            }
+            if (meta->type == META_TYPE_BOOLEAN && meta->integer &&
+                strcmp(meta->identifier, "override") == 0) {
+                ctx->override_matched = 1;
             }
         }
 
@@ -390,10 +422,107 @@ static int yara_callback(YR_SCAN_CONTEXT *context, int message,
     return CALLBACK_CONTINUE;
 }
 
+static int ensure_quarantine_dir(void)
+{
+    if (mkdir(quarantine_dir, 0700) == 0)
+        return 0;
+    if (errno == EEXIST)
+        return 0;
+    fprintf(stderr, "avd: could not create quarantine dir \"%s\": %s\n",
+            quarantine_dir, strerror(errno));
+    return -1;
+}
+
+/* Fallback for rename() failing with EXDEV (source and quarantine dir
+ * on different filesystems/mounts) - plain copy, then unlink the
+ * original. Not atomic like rename(), but correct. */
+static int copy_and_unlink(const char *src, const char *dst)
+{
+    int in_fd, out_fd;
+    char buf[65536];
+    ssize_t n;
+    int ret = 0;
+
+    in_fd = open(src, O_RDONLY);
+    if (in_fd < 0)
+        return -1;
+
+    out_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (out_fd < 0) {
+        close(in_fd);
+        return -1;
+    }
+
+    while ((n = read(in_fd, buf, sizeof(buf))) > 0) {
+        if (write(out_fd, buf, (size_t)n) != n) {
+            ret = -1;
+            break;
+        }
+    }
+    if (n < 0)
+        ret = -1;
+
+    close(in_fd);
+    close(out_fd);
+
+    if (ret == 0 && unlink(src) != 0)
+        ret = -1;
+    if (ret != 0)
+        unlink(dst); /* best-effort cleanup of the partial copy */
+
+    return ret;
+}
+
+/*
+ * Moves `path` into the quarantine directory and chmod's it to 0000
+ * (unreadable/unwritable/unexecutable by anyone, including root
+ * without an explicit chmod back - a deliberate speed bump against
+ * accidental re-execution, not real access control). Logs the outcome
+ * either way; a quarantine failure does NOT block the verdict already
+ * being sent back to the kernel for the kill.
+ */
+static void quarantine_file(const char *path)
+{
+    char dest[PATH_MAX];
+    const char *base;
+    time_t now;
+
+    if (ensure_quarantine_dir() != 0)
+        return;
+
+    base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    now = time(NULL);
+
+    snprintf(dest, sizeof(dest), "%s/%ld_%s.quarantined",
+             quarantine_dir, (long)now, base);
+
+    if (rename(path, dest) != 0) {
+        if (errno == EXDEV) {
+            if (copy_and_unlink(path, dest) != 0) {
+                fprintf(stderr, "avd: quarantine copy fallback failed for "
+                                "\"%s\": %s\n", path, strerror(errno));
+                return;
+            }
+        } else {
+            fprintf(stderr, "avd: quarantine rename failed for \"%s\": %s\n",
+                    path, strerror(errno));
+            return;
+        }
+    }
+
+    if (chmod(dest, 0000) != 0)
+        fprintf(stderr, "avd: quarantined \"%s\" to \"%s\" but chmod failed: "
+                        "%s\n", path, dest, strerror(errno));
+    else
+        printf("avd: QUARANTINED \"%s\" -> \"%s\"\n", path, dest);
+}
+
 static void handle_scan_request(uint64_t reqid, uint32_t pid,
                                  const char *path, const char *sha256_hex)
 {
-    struct yara_match_ctx ctx = { .matched = 0, .match_count = 0, .score = 0, .rule_name = "" };
+    struct yara_match_ctx ctx = { .matched = 0, .match_count = 0, .score = 0,
+                                   .override_matched = 0, .rule_name = "" };
     int ret;
 
     printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
@@ -423,16 +552,28 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
          * structural rule alone) is logged for visibility but no
          * longer enough by itself. See the threshold's own comment
          * for why: real testing killed zsh/sh/uwsm on exactly this
-         * single-weak-match pattern before this existed. */
-        if (ctx.score >= MALICIOUS_SCORE_THRESHOLD) {
-            printf("avd: MATCH \"%s\" -> %d rule(s), score=%d: \"%s\"\n",
-                   path, ctx.match_count, ctx.score, ctx.rule_name);
+         * single-weak-match pattern before this existed.
+         *
+         * EXCEPT: a small, deliberately narrow set of rules carry
+         * `override = true` and convict on their own regardless of
+         * score - added after discovering that pure additive scoring
+         * let the v0.9.0 entropy-dilution evasion through the WHOLE
+         * pipeline (not just the entropy layer) once Entry_Point_
+         * Outside_Text's weight was reduced for its own false
+         * positive. See elf_analysis.yar's header comment and
+         * docs/evasion-findings.md for the full story. */
+        if (ctx.override_matched || ctx.score >= MALICIOUS_SCORE_THRESHOLD) {
+            printf("avd: MATCH \"%s\" -> %d rule(s), score=%d, override=%d: \"%s\"\n",
+                   path, ctx.match_count, ctx.score, ctx.override_matched,
+                   ctx.rule_name);
+            quarantine_file(path);
             send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
             return;
         }
 
         printf("avd: %d rule(s) matched \"%s\" but score=%d is below "
-               "threshold (%d) - not convicting: \"%s\"\n",
+               "threshold (%d) and no override rule fired - not "
+               "convicting: \"%s\"\n",
                ctx.match_count, path, ctx.score,
                MALICIOUS_SCORE_THRESHOLD, ctx.rule_name);
         /* Falls through to the fuzzy-hash check below rather than
@@ -468,6 +609,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
                      "Fuzzy:%.40s(%d)", fuzzy_name, fuzzy_score);
             printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n",
                    path, fuzzy_name, fuzzy_score);
+            quarantine_file(path);
             send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
             return;
         }
@@ -546,6 +688,13 @@ int main(int argc, char **argv)
         corpus_file = argv[2];
     else if (getenv("AVD_CORPUS_FILE"))
         corpus_file = getenv("AVD_CORPUS_FILE");
+
+    if (argc > 3)
+        quarantine_dir = argv[3];
+    else if (getenv("AVD_QUARANTINE_DIR"))
+        quarantine_dir = getenv("AVD_QUARANTINE_DIR");
+
+    printf("avd: quarantine directory: %s\n", quarantine_dir);
 
     signal(SIGINT, handle_sigint);
     signal(SIGTERM, handle_sigint);

@@ -7,6 +7,22 @@
  * session manager) with no packing involved - see the note on that
  * rule below.
  *
+ * v1.0.0-merge: added `override = true` to No_Section_Headers and
+ * Executable_Stack - these convict on their own regardless of
+ * aggregate score, unlike everything else which is purely additive.
+ * Why these two specifically: both are verified against real positive
+ * AND negative samples (real UPX-packed binary / real -z execstack
+ * binary vs. /bin/ls), and structurally there's essentially no
+ * legitimate reason a normal binary has zero section headers or an
+ * executable stack. This was added after discovering that the
+ * additive-only scoring model let the v0.9.0 entropy-dilution evasion
+ * finding through the WHOLE pipeline (85/100, below threshold) where
+ * it previously only evaded the entropy layer specifically - see
+ * docs/evasion-findings.md for the full writeup. Entry_Point_Outside_
+ * Text and Has_RWX_Segment deliberately do NOT get override: the
+ * former has a confirmed real false positive (uwsm), the latter has
+ * never been verified against a real sample at all.
+ *
  * Every rule here was verified against a REAL packed binary (UPX 4.2.2,
  * packing a small test executable) as well as normal system binaries
  * (/bin/ls) to confirm no false positives - not just checked for valid
@@ -22,7 +38,8 @@
  * false positives should be rarer than the import-based heuristics.
  * UPDATE: Entry_Point_Outside_Text's real-world false positive on
  * uwsm shows even a "verified against a real sample" structural rule
- * isn't safe to convict on alone - see avd.c's scoring threshold.
+ * isn't automatically safe to convict on alone - hence why override
+ * status is decided per-rule, not applied to the whole file.
  */
 
 import "elf"
@@ -33,6 +50,7 @@ rule No_Section_Headers
         description = "No section headers present - legitimate compilers always emit them; packers (UPX and similar) commonly strip them since only program headers are needed at load time"
         confidence = "medium-high - verified against a real UPX-packed binary"
         weight = 55
+        override = true
     condition:
         elf.number_of_sections == 0
 }
@@ -43,6 +61,7 @@ rule Executable_Stack
         description = "GNU_STACK segment marked executable - the stack should never be executable on a modern system; either a very old/misconfigured toolchain (gcc -z execstack) or a deliberately weakened binary"
         confidence = "medium-high - verified against a binary built with -z execstack"
         weight = 55
+        override = true
     condition:
         for any i in (0..elf.number_of_segments - 1) : (
             elf.segments[i].type == elf.PT_GNU_STACK and

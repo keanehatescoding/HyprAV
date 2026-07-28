@@ -166,24 +166,27 @@ static bool path_is_sensitive(const char *path)
  * The real fix is not over-triggering in the first place (see the
  * path exclusions below), but this guard stays regardless - defense
  * in depth for a security tool that can SIGKILL things is worth the
- * one branch. */
+ * one branch.
+ *
+ * v1.0.0-merge: structured key=value log format, matching main.c's
+ * av_kill - see its comment for why. */
 static void kill_with_reason(struct pid *target_pid, const char *path,
                               const char *reason)
 {
     struct task_struct *task;
 
     if (pid_nr(target_pid) == 1) {
-        pr_alert("kernel-av: SUPPRESSED kill of PID 1 (reason: %s, "
-                 "path \"%s\") - refusing to signal init under any "
-                 "circumstance\n", reason, path);
+        pr_alert("kernel-av: event=suppressed action=none type=behavioral "
+                 "path=\"%s\" reason=\"%s\" pid=1\n", path, reason);
         return;
     }
 
     rcu_read_lock();
     task = pid_task(target_pid, PIDTYPE_PID);
     if (task) {
-        pr_alert("kernel-av: DETECTED behavioral: %s \"%s\" (pid %d) - "
-                 "killing\n", reason, path, pid_nr(target_pid));
+        pr_alert("kernel-av: event=detected action=kill type=behavioral "
+                 "path=\"%s\" reason=\"%s\" pid=%d\n",
+                 path, reason, pid_nr(target_pid));
         send_sig(SIGKILL, task, 0);
     }
     rcu_read_unlock();
