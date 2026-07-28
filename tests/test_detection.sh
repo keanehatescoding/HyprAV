@@ -28,6 +28,20 @@ pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 section() { echo; echo "== $1 =="; }
 
+# A module MUST be built with the same compiler family as the running
+# kernel (see the top-level README's toolchain section) - e.g. CachyOS
+# ships kernels built with Clang. We can't rely on inherited CC/LLVM
+# environment variables here: this script is meant to run under sudo
+# (for insmod/rmmod), and sudo resets the environment by default,
+# stripping any CC=clang LLVM=1 the user had exported. Detecting the
+# running kernel's actual build toolchain directly is robust regardless
+# of how this script gets invoked or what the caller's shell had set.
+MAKE_ARGS=()
+if grep -q "clang version" /proc/version 2>/dev/null; then
+    echo "Detected a Clang-built running kernel ($(uname -r)) - building with CC=clang LLVM=1"
+    MAKE_ARGS=(CC=clang LLVM=1)
+fi
+
 cleanup() {
     section "cleanup"
     rmmod av 2>/dev/null && echo "  module unloaded" || echo "  module already unloaded"
@@ -36,7 +50,8 @@ cleanup() {
 trap cleanup EXIT
 
 section "build"
-if make -C "$AV_DIR" clean >/tmp/build.log 2>&1 && make -C "$AV_DIR" >>/tmp/build.log 2>&1; then
+if make -C "$AV_DIR" "${MAKE_ARGS[@]}" clean >/tmp/build.log 2>&1 && \
+   make -C "$AV_DIR" "${MAKE_ARGS[@]}" >>/tmp/build.log 2>&1; then
     pass "module built"
 else
     fail "build failed - see /tmp/build.log"
