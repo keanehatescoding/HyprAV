@@ -495,8 +495,7 @@ static int copy_and_unlink(const char *src, const char *dst)
  * inode - would slip past an identity check alone), but it converts
  * an easy single-swap attack into a much harder timing race, which is
  * the same kind of risk-reduction-not-elimination tradeoff already
- * documented elsewhere in this codebase (see the accepted-risk note
- * on the remaining npm audit findings, or Has_RWX_Segment's scope
+ * documented elsewhere in this codebase (see Has_RWX_Segment's scope
  * note). A more complete fix would scan and quarantine via an fd
  * opened once at the top of handle_scan_request() (rename() accepts
  * /proc/self/fd/N as a source, which resolves to the fd's dentry

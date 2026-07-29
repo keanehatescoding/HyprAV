@@ -93,6 +93,13 @@ whole system; document this tradeoff explicitly.
   in every documented workflow, so this doesn't change how you run it -
   it just closes a gap where anything unprivileged previously could
   have disabled detection entirely by registering first.
+- **Module could be unloaded while a callback was still running.**
+  `genl_family` was missing `.module = THIS_MODULE`, so generic
+  netlink had no way to pin the module while `av_nl_register_doit()`
+  or `av_nl_verdict_doit()` was actively executing on another CPU —
+  an `rmmod` racing an in-flight callback from `avd` was a genuine
+  use-after-free of module `.text`, not just a theoretical one.
+  **Fixed** by adding `.module = THIS_MODULE` to the family struct.
 - **Fail-open on timeout/no-daemon**, as above — a deliberate but
   debatable choice.
 - **Kernel netlink API surface is version-sensitive**, same caveat as
@@ -101,5 +108,7 @@ whole system; document this tradeoff explicitly.
   code targets the layout used in kernels 5.10+, which covers all
   three CI targets (6.12/6.18/7.1.4), but is worth re-checking if you
   ever build against something older.
-- **Not yet wired into a real detector.** `avd` currently always
-  replies `clean` — this is plumbing, not v0.3.0's actual YARA feature.
+- `avd` now runs real detection logic (weighted YARA scoring with an
+  override tier, fuzzy hashing, quarantine) rather than a stub — see
+  the top-level README's `v0.3.0`–`v1.0.0` sections for how each layer
+  works and how to test it.

@@ -702,12 +702,18 @@ was, independent of the false positive that surfaced it.
   you find. The `/sys`, `/proc`, `/dev` exclusion and the distinct-path
   dedup remove the two false positives found in testing so far, but
   neither claims to make this heuristic false-positive-free.
-- Per-PID behavioral state is **never cleaned up** on process exit —
-  there's no exit hook, so entries accumulate for the lifetime of the
-  module. Fine for a demo/testing session, a real concern for long
-  uptimes. A natural `v0.8.1` fix would hook process exit (or add
-  periodic garbage collection of stale entries) — documented here as a
-  known limitation rather than silently left out.
+- Per-PID behavioral state is now reclaimed by a periodic GC sweep
+  (`behavior_gc_fn`, every `GC_INTERVAL_MS` = 30s) rather than
+  accumulating for the module's lifetime — added after this was
+  originally documented as a known gap. Liveness is checked via
+  `find_vpid()` + `pid_task(..., PIDTYPE_TGID)` rather than hooking
+  process exit directly, deliberately avoiding the same class of
+  thread-group-teardown-timing kernel API fragility this project has
+  been bitten by elsewhere (see the netlink `genl_family` history).
+  The 30s interval is a starting point, not a tuned value — worth
+  measuring actual memory growth under sustained load if you want a
+  number for your report rather than just "it gets cleaned up
+  eventually."
 - `openat` is the only open-family syscall hooked - `open()` (without
   `at`) and `creat()` are separate syscalls on some architectures/libc
   versions and could evade this specific hook. Modern glibc routes
@@ -786,6 +792,24 @@ ls -la /var/lib/av-quarantine/
 Confirm the original file is gone from its original location, and that
 the quarantined copy genuinely can't be read/executed even as root
 without an explicit `chmod` back first.
+
+**TOCTOU protection**: between `avd` scanning a file and actually
+quarantining it (`rename()`), there's a window where something with
+write access to a parent directory could swap the path for a symlink
+pointing elsewhere — `quarantine_file()` would then act on the wrong
+file. `avd` captures an `lstat()` (device+inode) baseline before the
+scan runs and re-checks it immediately before `rename()`, refusing to
+quarantine on a mismatch and logging `possible symlink swap`. This is
+risk-reduction, not elimination — a narrower timing race remains
+between the re-check and the `rename()` call itself, and a same-inode
+double-swap could theoretically slip past an identity check alone; a
+more complete fix (using an fd captured once and quarantining via
+`/proc/self/fd/N`) is a documented follow-up, not implemented here.
+Worth demonstrating deliberately for your report: swap
+`/tmp/eicar.com` for a symlink to something else immediately after
+triggering detection but before `avd` would normally quarantine it,
+and confirm you see the `possible symlink swap` refusal in `avd`'s
+output rather than the wrong file being moved.
 
 **Structured logs** — every detection/clean/suppressed event is now a
 single grep/awk-parseable line:
