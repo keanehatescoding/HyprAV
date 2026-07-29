@@ -159,6 +159,13 @@ static struct genl_family av_genl_family = {
     .policy  = av_genl_policy,
     .ops     = av_genl_ops,
     .n_ops   = ARRAY_SIZE(av_genl_ops),
+    .module  = THIS_MODULE, /* Without this, generic netlink has no way
+                              * to pin this module while av_nl_register_doit()
+                              * or av_nl_verdict_doit() is actively running
+                              * on another CPU - an rmmod racing an
+                              * in-flight callback from avd would then
+                              * be a genuine use-after-free of module
+                              * code, not just a theoretical one. */
 };
 
 /* ---- sending a scan request and waiting for the verdict ---- */

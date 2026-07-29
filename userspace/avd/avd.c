@@ -480,8 +480,32 @@ static int copy_and_unlink(const char *src, const char *dst)
  * accidental re-execution, not real access control). Logs the outcome
  * either way; a quarantine failure does NOT block the verdict already
  * being sent back to the kernel for the kill.
+ *
+ * `baseline`/`have_baseline`: identity of the file as captured by the
+ * caller *before* the YARA/fuzzy scan ran (see handle_scan_request()).
+ * `path` here is just a string, re-resolved by the kernel/libc at
+ * rename() time - if something with write access to a directory in
+ * that path swaps in a symlink between initial detection and this
+ * call, a path-only rename() would happily quarantine (or in the
+ * EXDEV fallback case, unlink()) whatever the attacker pointed it at
+ * instead of the file that was actually scanned. Re-checking st_dev/
+ * st_ino right before the rename can't close that window entirely
+ * (there's still a much narrower gap between this check and the
+ * rename() call itself, and a double-swap - back to the original
+ * inode - would slip past an identity check alone), but it converts
+ * an easy single-swap attack into a much harder timing race, which is
+ * the same kind of risk-reduction-not-elimination tradeoff already
+ * documented elsewhere in this codebase (see the accepted-risk note
+ * on the remaining npm audit findings, or Has_RWX_Segment's scope
+ * note). A more complete fix would scan and quarantine via an fd
+ * opened once at the top of handle_scan_request() (rename() accepts
+ * /proc/self/fd/N as a source, which resolves to the fd's dentry
+ * directly rather than re-walking the path) - noted as a follow-up,
+ * not done here since it also touches how YARA/fuzzy scanning read
+ * the file, a larger change than this function alone.
  */
-static void quarantine_file(const char *path)
+static void quarantine_file(const char *path, const struct stat *baseline,
+                             bool have_baseline)
 {
     char dest[PATH_MAX];
     const char *base;
@@ -489,6 +513,25 @@ static void quarantine_file(const char *path)
 
     if (ensure_quarantine_dir() != 0)
         return;
+
+    if (have_baseline) {
+        struct stat now_st;
+
+        if (lstat(path, &now_st) != 0) {
+            fprintf(stderr, "avd: refusing to quarantine \"%s\": lstat "
+                            "failed at quarantine time: %s\n",
+                            path, strerror(errno));
+            return;
+        }
+        if (now_st.st_dev != baseline->st_dev ||
+            now_st.st_ino != baseline->st_ino) {
+            fprintf(stderr, "avd: refusing to quarantine \"%s\": path now "
+                            "resolves to a different file than the one "
+                            "scanned (dev/ino changed) - possible symlink "
+                            "swap\n", path);
+            return;
+        }
+    }
 
     base = strrchr(path, '/');
     base = base ? base + 1 : path;
@@ -523,10 +566,22 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
 {
     struct yara_match_ctx ctx = { .matched = 0, .match_count = 0, .score = 0,
                                    .override_matched = 0, .rule_name = "" };
+    struct stat baseline_st;
+    bool have_baseline;
     int ret;
 
     printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
            (unsigned long long)reqid, pid, path, sha256_hex);
+
+    /* Captured before the scan runs (which can itself take up to
+     * SCAN_TIMEOUT_SECS) so the quarantine-time check below covers as
+     * much of the window as possible - see quarantine_file()'s comment
+     * for what this can and can't protect against. A failed lstat here
+     * just means quarantine_file() skips the identity check later
+     * (fail-open on the check itself, matching this codebase's existing
+     * stance on inconclusive information elsewhere) rather than
+     * blocking the scan. */
+    have_baseline = (lstat(path, &baseline_st) == 0);
 
     if (!compiled_rules) {
         send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
@@ -566,7 +621,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
             printf("avd: MATCH \"%s\" -> %d rule(s), score=%d, override=%d: \"%s\"\n",
                    path, ctx.match_count, ctx.score, ctx.override_matched,
                    ctx.rule_name);
-            quarantine_file(path);
+            quarantine_file(path, &baseline_st, have_baseline);
             send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name);
             return;
         }
@@ -609,7 +664,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid,
                      "Fuzzy:%.40s(%d)", fuzzy_name, fuzzy_score);
             printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n",
                    path, fuzzy_name, fuzzy_score);
-            quarantine_file(path);
+            quarantine_file(path, &baseline_st, have_baseline);
             send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
             return;
         }
