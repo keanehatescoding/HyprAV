@@ -85,9 +85,42 @@ static const char * const excluded_path_prefixes[] = {
 };
 #define NUM_EXCLUDED_PREFIXES ARRAY_SIZE(excluded_path_prefixes)
 
+/* Substring match (not prefix - these can appear anywhere in a path,
+ * e.g. /home/keane/.cache/zen/...) for directories whose whole PURPOSE
+ * is disposable, regenerable data - real ransomware has essentially no
+ * reason to target application cache, whereas the rapid-write heuristic
+ * can't tell that apart from bulk-encrypting user documents. Added
+ * after real testing: Zen browser's cache2 entries under ~/.cache/zen/
+ * tripped this heuristic (pid 1921) even after the earlier distinct-
+ * path-dedup fix, since the dedup fix only stops COUNTING REPEATS of
+ * the same file - it does nothing when 50+ genuinely distinct cache
+ * files get touched in one window, which is normal browser behavior. */
+static const char * const excluded_path_cache_substrings[] = {
+    "/.cache/",
+};
+#define NUM_EXCLUDED_CACHE_SUBSTRINGS ARRAY_SIZE(excluded_path_cache_substrings)
+
+/* Suffix match for SQLite's own transient implementation files.
+ * -journal and -wal files are created and deleted by SQLite as part of
+ * ordinary transaction commits - not user content, and their churn
+ * rate scales with how many SQLite databases an application has open,
+ * not with anything resembling malicious intent. Added after real
+ * testing: Zen/Firefox-style browsers keep many small SQLite databases
+ * (permissions, bounce-tracking-protection, places, etc.) and normal
+ * startup/browsing activity legitimately touches 50+ distinct -journal
+ * paths within a couple of seconds. -shm (SQLite's shared-memory index
+ * file) is the same family and included for the same reason. */
+static const char * const excluded_path_suffixes[] = {
+    "-journal",
+    "-wal",
+    "-shm",
+};
+#define NUM_EXCLUDED_SUFFIXES ARRAY_SIZE(excluded_path_suffixes)
+
 static bool path_is_excluded(const char *path)
 {
     size_t i;
+    size_t path_len = strlen(path);
 
     for (i = 0; i < NUM_EXCLUDED_PREFIXES; i++) {
         size_t len = strlen(excluded_path_prefixes[i]);
@@ -95,6 +128,20 @@ static bool path_is_excluded(const char *path)
         if (!strncmp(path, excluded_path_prefixes[i], len))
             return true;
     }
+
+    for (i = 0; i < NUM_EXCLUDED_CACHE_SUBSTRINGS; i++) {
+        if (strstr(path, excluded_path_cache_substrings[i]))
+            return true;
+    }
+
+    for (i = 0; i < NUM_EXCLUDED_SUFFIXES; i++) {
+        size_t suffix_len = strlen(excluded_path_suffixes[i]);
+
+        if (path_len >= suffix_len &&
+            !strcmp(path + path_len - suffix_len, excluded_path_suffixes[i]))
+            return true;
+    }
+
     return false;
 }
 

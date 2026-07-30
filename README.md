@@ -36,7 +36,11 @@ av/                  - the actual antivirus module (single, evolving)
   netlink_proto.h     - protocol definitions shared with userspace/avd
   behavior.c/.h        - v0.8.0: behavioral heuristics (rapid write-intent
                         opens, sensitive path writes/deletes, self-deleting
-                        binaries) - per-PID state, mutex-protected
+                        binaries) - per-PID state, mutex-protected. Excludes
+                        /sys, /proc, /dev, .cache dirs, and SQLite
+                        -journal/-wal/-shm files from counting - each
+                        exclusion added after a real false-positive kill,
+                        see the incident writeups in the testing section
   Makefile
 rules/
   test.yar             - sample YARA rules used for testing avd (EICAR string
@@ -702,6 +706,8 @@ was, independent of the false positive that surfaced it.
   you find. The `/sys`, `/proc`, `/dev` exclusion and the distinct-path
   dedup remove the two false positives found in testing so far, but
   neither claims to make this heuristic false-positive-free.
+
+
 - Per-PID behavioral state is now reclaimed by a periodic GC sweep
   (`behavior_gc_fn`, every `GC_INTERVAL_MS` = 30s) rather than
   accumulating for the module's lifetime — added after this was
@@ -719,6 +725,58 @@ was, independent of the false positive that surfaced it.
   versions and could evade this specific hook. Modern glibc routes
   through `openat` internally on Linux, so this covers the common
   case, but a determined evasion attempt might not.
+
+### Incident: cache directories and SQLite journal files
+
+The caveat above wasn't hypothetical — it predicted exactly what
+happened next. A third real false positive, same heuristic, same
+browser, but a genuinely different root cause from either fix above:
+
+```
+kernel-av: event=detected action=kill type=behavioral
+path="/home/keane/.cache/zen/<profile>/cache2/entries/8A56562BBBFACFFB09AAEFC7CEE620713C94D995"
+reason="rapid file modification (possible ransomware pattern)" pid=1921
+
+kernel-av: event=detected action=kill type=behavioral
+path="/home/keane/.zen/<profile>/permissions.sqlite-journal"
+reason="rapid file modification (possible ransomware pattern)" pid=120852
+```
+
+**Root cause**: unlike the previous incident (a handful of files
+rewritten *repeatedly*), this is genuinely many *distinct* files —
+exactly the case the distinct-path dedup fix explicitly does not help
+with. A browser like Zen/Firefox keeps many independent SQLite
+databases (permissions, bounce-tracking-protection, places, cookies,
+favicons...), and every transaction commit creates and deletes a
+`-journal` (or `-wal`) file as a normal SQLite implementation detail.
+Combined with `~/.cache/`'s cache2 entries (browsers routinely write
+dozens of small cache files per page load), legitimate startup/browsing
+activity comfortably clears 50 distinct paths in 2 seconds.
+
+**The fix**: two new, narrow exclusions, same spirit as `/sys`/`/proc`/
+`/dev` but for a structurally different reason — these paths are
+excluded not because they're kernel control-plane interfaces, but
+because their entire *purpose* is disposable/regenerable data that
+ransomware has no reason to target:
+- **`/.cache/` substring match** (not prefix — matches
+  `/home/<user>/.cache/...` for any user) — cache directories are
+  explicitly meant to be safely deletable; there's essentially no
+  legitimate reason ransomware would encrypt cache data specifically.
+- **`-journal`/`-wal`/`-shm` suffix match** — SQLite's own transient
+  transaction-implementation files, not user content.
+
+Verified against the exact paths from this incident (all three
+correctly excluded) and against normal target paths like
+`~/Documents/report.docx`, `~/Downloads/file.exe`, and `/etc/passwd`
+(all correctly still counted/flagged) — the fix doesn't quietly widen
+into "ignore anything under the home directory."
+
+**What this does NOT cover** (an honest gap, not silently glossed
+over): other applications' cache-like directories that don't use the
+`.cache` name specifically — e.g. some Chromium-based apps use
+`~/.config/<app>/Cache` outside the XDG `.cache` convention. If you
+hit a fourth false positive from one of those, the same substring-match
+pattern extends cleanly; it just hasn't been needed yet.
 
 ## Testing evasion resistance (v0.9.0)
 
