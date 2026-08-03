@@ -247,7 +247,7 @@ static void av_work_fn(struct work_struct *w)
      * immediately it'll never reach the unlink hook anyway, and this
      * keeps the recording logic in one place rather than duplicated
      * across the signature-match/daemon-match/clean branches. */
-    av_behavior_record_exec(aw->tgid, aw->path);
+    av_behavior_record_exec(aw->tgid, aw->path, digest.sha256);
 
     if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
         snprintf(reason, sizeof(reason), "signature:%s", sig_name);

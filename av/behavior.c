@@ -30,6 +30,9 @@
 #include <linux/workqueue.h>
 #include <linux/pid.h>
 #include <linux/rcupdate.h>
+#include <linux/proc_fs.h>
+#include <linux/seq_file.h>
+#include <linux/uaccess.h>
 
 #include "behavior.h"
 
@@ -180,6 +183,10 @@ struct av_behavior_entry {
     u32 recent_path_hashes[MAX_TRACKED_PATHS];
     unsigned int recent_path_next;   /* ring buffer write cursor */
     unsigned int recent_path_filled; /* valid entries, caps at MAX_TRACKED_PATHS */
+
+    bool trusted; /* set at record_exec time if this binary's SHA-256
+                    * is on the trust list - exempts the rapid-write
+                    * counter specifically, see behavior.h */
 };
 
 static DEFINE_HASHTABLE(behavior_table, BEHAVIOR_BITS);
@@ -187,6 +194,183 @@ static DEFINE_MUTEX(behavior_lock);
 
 static struct workqueue_struct *behavior_gc_wq;
 static struct delayed_work behavior_gc_work;
+
+/* ---- trusted-binary-hash table, mirroring sigtable.c's pattern ---- */
+
+#define TRUST_BITS 8 /* 256 buckets - plenty for a trusted-app list */
+#define SHA256_HEX_LEN 64
+#define TRUST_NAME_LEN 64
+
+struct av_trust_entry {
+    struct hlist_node node;
+    char sha256_hex[SHA256_HEX_LEN + 1];
+    char name[TRUST_NAME_LEN];
+};
+
+static DEFINE_HASHTABLE(trust_table, TRUST_BITS);
+static DEFINE_MUTEX(trust_lock);
+
+static u32 hex_key(const char *hex)
+{
+    return full_name_hash(NULL, hex, strlen(hex));
+}
+
+static bool hash_is_trusted(const char *sha256_hex, char *name_out, size_t name_out_len)
+{
+    /* e initialized to NULL only to satisfy static analyzers that
+     * can't expand hash_for_each_possible() without full kernel
+     * headers - see get_or_create_entry() above and av_sigtable_del()
+     * in sigtable.c for the same workaround. */
+    struct av_trust_entry *e = NULL;
+    bool found = false;
+
+    mutex_lock(&trust_lock);
+    hash_for_each_possible(trust_table, e, node, hex_key(sha256_hex)) {
+        if (!strncasecmp(e->sha256_hex, sha256_hex, SHA256_HEX_LEN)) {
+            if (name_out)
+                strscpy(name_out, e->name, name_out_len);
+            found = true;
+            break;
+        }
+    }
+    mutex_unlock(&trust_lock);
+    return found;
+}
+
+int av_behavior_trust_add(const char *sha256_hex, const char *name)
+{
+    struct av_trust_entry *e;
+
+    if (strlen(sha256_hex) != SHA256_HEX_LEN)
+        return -EINVAL;
+
+    e = kmalloc(sizeof(*e), GFP_KERNEL);
+    if (!e)
+        return -ENOMEM;
+
+    strscpy(e->sha256_hex, sha256_hex, sizeof(e->sha256_hex));
+    strscpy(e->name, name, sizeof(e->name));
+
+    mutex_lock(&trust_lock);
+    hash_add(trust_table, &e->node, hex_key(sha256_hex));
+    mutex_unlock(&trust_lock);
+
+    return 0;
+}
+
+int av_behavior_trust_del(const char *sha256_hex)
+{
+    /* Same NULL-initializer workaround as hash_is_trusted() above. */
+    struct av_trust_entry *e = NULL;
+    int ret = -ENOENT;
+
+    mutex_lock(&trust_lock);
+    hash_for_each_possible(trust_table, e, node, hex_key(sha256_hex)) {
+        if (!strncasecmp(e->sha256_hex, sha256_hex, SHA256_HEX_LEN)) {
+            hash_del(&e->node);
+            kfree(e);
+            ret = 0;
+            break;
+        }
+    }
+    mutex_unlock(&trust_lock);
+    return ret;
+}
+
+static int trust_proc_show(struct seq_file *m, void *v)
+{
+    struct av_trust_entry *e;
+    int bkt;
+
+    mutex_lock(&trust_lock);
+    hash_for_each(trust_table, bkt, e, node) {
+        seq_printf(m, "%s %s\n", e->sha256_hex, e->name);
+    }
+    mutex_unlock(&trust_lock);
+    return 0;
+}
+
+static int trust_proc_open(struct inode *inode, struct file *file)
+{
+    return single_open(file, trust_proc_show, NULL);
+}
+
+static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
+                                 size_t count, loff_t *ppos)
+{
+    char kbuf[192];
+    char cmd[8], hex[SHA256_HEX_LEN + 1], name[TRUST_NAME_LEN];
+    size_t len = min(count, sizeof(kbuf) - 1);
+    int n;
+
+    if (copy_from_user(kbuf, ubuf, len))
+        return -EFAULT;
+    kbuf[len] = '\0';
+
+    n = sscanf(kbuf, "%7s %64s %63[^\n]", cmd, hex, name);
+    if (n < 2)
+        return -EINVAL;
+
+    if (!strcasecmp(cmd, "add")) {
+        if (n < 3)
+            return -EINVAL;
+        if (av_behavior_trust_add(hex, name))
+            return -EINVAL;
+    } else if (!strcasecmp(cmd, "del")) {
+        /* cppcheck-suppress knownConditionTrueFalse
+         * False positive: cppcheck can't expand hash_for_each_possible()
+         * without full kernel headers, so its value-flow analysis
+         * concludes av_behavior_trust_del() always returns -ENOENT.
+         * At runtime the hashtable genuinely can contain a matching
+         * entry - this is a real condition, not dead code. Same class
+         * of false positive as av_sigtable_del() in sigtable.c;
+         * version-dependent whether a NULL-initializer alone silences
+         * it, hence the explicit suppression here instead. */
+        if (av_behavior_trust_del(hex))
+            return -ENOENT;
+    } else {
+        return -EINVAL;
+    }
+
+    return count;
+}
+
+static const struct proc_ops trust_proc_ops = {
+    .proc_open    = trust_proc_open,
+    .proc_read    = seq_read,
+    .proc_write   = trust_proc_write,
+    .proc_lseek   = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *trust_proc_entry;
+
+int av_behavior_trust_proc_init(void)
+{
+    trust_proc_entry = proc_create("kernel_av_trusted", 0644, NULL, &trust_proc_ops);
+    if (!trust_proc_entry)
+        return -ENOMEM;
+    return 0;
+}
+
+void av_behavior_trust_proc_exit(void)
+{
+    proc_remove(trust_proc_entry);
+}
+
+static void trust_table_destroy(void)
+{
+    struct av_trust_entry *e;
+    struct hlist_node *tmp;
+    int bkt;
+
+    mutex_lock(&trust_lock);
+    hash_for_each_safe(trust_table, bkt, tmp, e, node) {
+        hash_del(&e->node);
+        kfree(e);
+    }
+    mutex_unlock(&trust_lock);
+}
 
 static u32 pid_key(pid_t pid)
 {
@@ -320,14 +504,22 @@ static void behavior_gc_fn(struct work_struct *w)
                         msecs_to_jiffies(GC_INTERVAL_MS));
 }
 
-void av_behavior_record_exec(pid_t pid, const char *path)
+void av_behavior_record_exec(pid_t pid, const char *path, const char *sha256_hex)
 {
     struct av_behavior_entry *e;
+    /* cppcheck-suppress knownConditionTrueFalse
+     * Same false positive as av_behavior_trust_del() above -
+     * hash_is_trusted() genuinely returns true at runtime for a hash
+     * that was added via av_behavior_trust_add(); cppcheck just can't
+     * trace hash_for_each_possible() without full kernel headers. */
+    bool trusted = hash_is_trusted(sha256_hex, NULL, 0);
 
     mutex_lock(&behavior_lock);
     e = get_or_create_entry(pid);
-    if (e)
+    if (e) {
         strscpy(e->exec_path, path, sizeof(e->exec_path));
+        e->trusted = trusted;
+    }
     mutex_unlock(&behavior_lock);
 }
 
@@ -351,7 +543,12 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
 
     mutex_lock(&behavior_lock);
     e = get_or_create_entry(pid);
-    if (e) {
+    if (e && !e->trusted) {
+        /* Rapid-write counting is skipped ENTIRELY for a trusted
+         * process (see behavior.h) - not just given a higher
+         * threshold. The sensitive-path check above still applies
+         * regardless of trust; only the volume-based signal is
+         * exempted. */
         unsigned long window_ms = jiffies_to_msecs(
             jiffies - e->window_start_jiffies);
         bool new_window = (e->window_start_jiffies == 0 ||
@@ -427,11 +624,20 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
 
 int av_behavior_init(void)
 {
+    int ret;
+
     hash_init(behavior_table);
+    hash_init(trust_table);
+
+    ret = av_behavior_trust_proc_init();
+    if (ret)
+        return ret;
 
     behavior_gc_wq = alloc_workqueue("kernel_av_behavior_gc", WQ_UNBOUND, 0);
-    if (!behavior_gc_wq)
+    if (!behavior_gc_wq) {
+        av_behavior_trust_proc_exit();
         return -ENOMEM;
+    }
 
     INIT_DELAYED_WORK(&behavior_gc_work, behavior_gc_fn);
     queue_delayed_work(behavior_gc_wq, &behavior_gc_work,
@@ -459,4 +665,7 @@ void av_behavior_exit(void)
         kfree(e);
     }
     mutex_unlock(&behavior_lock);
+
+    av_behavior_trust_proc_exit();
+    trust_table_destroy();
 }

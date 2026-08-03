@@ -40,7 +40,12 @@ av/                  - the actual antivirus module (single, evolving)
                         /sys, /proc, /dev, .cache dirs, and SQLite
                         -journal/-wal/-shm files from counting - each
                         exclusion added after a real false-positive kill,
-                        see the incident writeups in the testing section
+                        see the incident writeups in the testing section.
+                        Also: a runtime-managed trusted-binary-hash list
+                        (/proc/kernel_av_trusted, via `avctl trust`) that
+                        exempts the rapid-write counter specifically for
+                        vouched-for binaries - added after path-pattern
+                        exclusions alone proved to be whack-a-mole
   Makefile
 rules/
   test.yar             - sample YARA rules used for testing avd (EICAR string
@@ -69,7 +74,12 @@ corpus/
                         fixture, not real malware; add real sample hashes
                         here once testing against actual threats
 userspace/
-  avctl/              - CLI for managing the signature DB via /proc
+  avctl/              - CLI for managing the signature DB (/proc/
+                        kernel_av_signatures) and the trusted-process
+                        list (/proc/kernel_av_trusted, `avctl trust
+                        add/del/list`) - see the storage-metadata
+                        incident in the behavioral heuristics testing
+                        section for why the trust list exists
     avctl.c
     Makefile
   avd/                - daemon: receives scan requests over netlink, loads
@@ -777,6 +787,63 @@ over): other applications' cache-like directories that don't use the
 `~/.config/<app>/Cache` outside the XDG `.cache` convention. If you
 hit a fourth false positive from one of those, the same substring-match
 pattern extends cleanly; it just hasn't been needed yet.
+
+### Incident: per-origin storage metadata, and stepping back from whack-a-mole
+
+A fourth real false positive, same heuristic, same browser:
+
+```
+kernel-av: event=detected action=kill type=behavioral
+path="/home/keane/.zen/<profile>/storage/default/https+++accounts.youtube.com^userContextId=6/.metadata-v2"
+reason="rapid file modification (possible ransomware pattern)" pid=188612
+```
+
+This one is structurally different from all three fixes above: it's
+neither a repeated file (already deduped), nor under `/.cache/`, nor
+`-journal`/`-wal`/`-shm` suffixed. It's a **new distinct path per
+website origin visited** — Firefox/Zen creates a `storage/default/
+<origin>/` directory per site, each with its own `.metadata-v2` file.
+Browse enough tabs in a burst and that's 50+ distinct paths again,
+under yet another naming convention the previous fixes don't cover.
+
+**Why this one didn't get its own path-pattern exclusion**: patching
+this specific pattern would almost certainly just delay a fifth one —
+IndexedDB files, Cache API storage, service worker data, whatever
+Firefox touches next. Four fixes in, chasing individual naming
+conventions stopped looking like "closing gaps" and started looking
+like an unwinnable, open-ended list. The code already predicted this
+outcome in an earlier comment (see the incident above this one) before
+it happened.
+
+**The actual fix: exempt the process, not the path.** A small,
+runtime-managed trusted-binary list (keyed by **SHA-256 hash, not
+path** — a path-based allowlist is trivially spoofable by naming
+malware `zen-bin` and dropping it in the expected directory; a hash
+isn't) exempts the rapid-write *counter specifically* for vouched-for
+binaries. Everything else — signature matching, YARA/heuristics,
+entropy, fuzzy hashing, the sensitive-path check, self-delete detection
+— still fully applies to a trusted binary. This only ever suppresses
+one volume-based signal, and only for an exact, cryptographically
+identified binary, never a name or location.
+
+```bash
+cd userspace/avctl && make && cd ../..
+sha256sum /opt/zen-browser-bin/zen-bin
+./userspace/avctl/avctl trust add <hash> "Zen Browser"
+./userspace/avctl/avctl trust list
+./userspace/avctl/avctl trust del <hash>
+```
+
+**Why this over the alternatives** (raising the threshold, or
+redesigning the signal around file-extension diversity): raising the
+threshold weakens detection against *every* process, not just
+browsers — a real attacker just needs to stay under whatever the new
+number is. A smarter signal (extension diversity, entropy-of-writes)
+is a genuinely better long-term answer but a much bigger lift than
+this project's scope justified once four real incidents made the
+tradeoff concrete. Trusted-process exemption is also the standard
+real-world EDR pattern for exactly this problem (publisher/hash
+allowlisting) — not a workaround invented for this project.
 
 ## Testing evasion resistance (v0.9.0)
 

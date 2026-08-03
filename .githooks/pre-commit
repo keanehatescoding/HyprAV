@@ -27,7 +27,8 @@ for f in $STAGED; do
             if command -v cppcheck >/dev/null 2>&1; then
                 echo "  - cppcheck: $f"
                 cppcheck --quiet --enable=warning,style,performance \
-                    --suppress=missingIncludeSystem --error-exitcode=1 "$f" || FAIL=1
+                    --suppress=missingIncludeSystem --inline-suppr \
+                    --error-exitcode=1 "$f" || FAIL=1
             else
                 echo "  ! cppcheck not installed - skipping static analysis for $f"
                 echo "    (sudo pacman -S cppcheck  /  apt install cppcheck)"
@@ -45,7 +46,8 @@ for f in $STAGED; do
             gcc -fsyntax-only -Wall -Wextra "$f" || FAIL=1
             if command -v cppcheck >/dev/null 2>&1; then
                 echo "  - cppcheck: $f"
-                cppcheck --quiet --enable=warning,style --error-exitcode=1 "$f" || FAIL=1
+                cppcheck --quiet --enable=warning,style --inline-suppr \
+                    --error-exitcode=1 "$f" || FAIL=1
             fi
             ;;
         userspace/avd/*.c)
