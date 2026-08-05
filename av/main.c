@@ -71,6 +71,18 @@
 
 #define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
 #define READ_CHUNK_SIZE     4096
+#define MAX_HASH_FILE_SIZE  (256 * 1024 * 1024) /* 256 MB cap on what
+                                   * hash_file_multi() will read - without
+                                   * it, execve of a multi-GB binary hashes
+                                   * the whole thing inline in the worker,
+                                   * and execve of a FIFO/device (which
+                                   * fails in the exec syscall itself, but
+                                   * still reaches record_exec's queued
+                                   * work) blocks kernel_read() forever on
+                                   * a FIFO with no writer. Neither is
+                                   * fatal on its own, but both tie up a
+                                   * workqueue thread indefinitely; see
+                                   * the S_ISREG/i_size checks below. */
 #define DAEMON_TIMEOUT_MS   2000 /* fail-open if the daemon doesn't answer
                                    * in time - see docs/netlink-protocol.md
                                    * for the fail-open vs fail-closed
@@ -140,6 +152,21 @@ static int hash_file_multi(const char *path, struct av_digest *out)
     f = filp_open(path, O_RDONLY, 0);
     if (IS_ERR(f))
         return PTR_ERR(f);
+
+    /* Only hash regular files, and only up to MAX_HASH_FILE_SIZE - see
+     * the macro comment. A FIFO/device/socket reaching here means the
+     * execve() that triggered this work already failed for the caller
+     * (you can't exec a FIFO), but av_work_fn() queued the work before
+     * that failure was knowable, so we still have to guard against it
+     * here rather than assume the caller filtered it out. */
+    if (!S_ISREG(file_inode(f)->i_mode)) {
+        ret = -EINVAL;
+        goto out;
+    }
+    if (i_size_read(file_inode(f)) > MAX_HASH_FILE_SIZE) {
+        ret = -EFBIG;
+        goto out;
+    }
 
     for (i = 0; i < 3; i++) {
         ctx[i].tfm = crypto_alloc_shash(ctx[i].crypto_name, 0, 0);
