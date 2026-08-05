@@ -300,12 +300,20 @@ static ssize_t trust_proc_write(struct file *file, const char __user *ubuf,
 {
     char kbuf[192];
     char cmd[8], hex[SHA256_HEX_LEN + 1], name[TRUST_NAME_LEN];
-    size_t len = min(count, sizeof(kbuf) - 1);
     int n;
 
-    if (copy_from_user(kbuf, ubuf, len))
+    /* Reject oversized writes instead of silently truncating them -
+     * same fix, same reasoning as sig_proc_write() in sigtable.c: the
+     * old min(count, sizeof(kbuf) - 1) truncated the copied prefix
+     * but still reported `count` bytes written, so a >191-byte write
+     * got silently mangled yet looked like a full success to the
+     * caller. */
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, ubuf, count))
         return -EFAULT;
-    kbuf[len] = '\0';
+    kbuf[count] = '\0';
 
     n = sscanf(kbuf, "%7s %64s %63[^\n]", cmd, hex, name);
     if (n < 2)

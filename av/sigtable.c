@@ -187,12 +187,21 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
     char kbuf[256];
     char cmd[8], algo_str[8], hex[AV_HASH_HEX_MAXLEN + 1], name[AV_SIG_NAME_LEN];
     enum av_algo algo;
-    size_t len = min(count, sizeof(kbuf) - 1);
     int n;
 
-    if (copy_from_user(kbuf, ubuf, len))
+    /* Reject oversized writes instead of silently truncating them.
+     * The old min(count, sizeof(kbuf) - 1) read a short prefix of an
+     * over-long write but still returned `count` as if the whole
+     * thing had been consumed - so "add <algo> <hex> <name>" followed
+     * by enough trailing garbage to push it past 255 bytes got
+     * silently truncated mid-token (a corrupted name, or the command
+     * itself cut off) yet reported to the caller as a full success. */
+    if (count >= sizeof(kbuf))
+        return -EINVAL;
+
+    if (copy_from_user(kbuf, ubuf, count))
         return -EFAULT;
-    kbuf[len] = '\0';
+    kbuf[count] = '\0';
 
     n = sscanf(kbuf, "%7s %7s %64s %63[^\n]", cmd, algo_str, hex, name);
     if (n < 3)
@@ -207,6 +216,16 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
         if (av_sigtable_add(algo, hex, name))
             return -EINVAL;
     } else if (!strcasecmp(cmd, "del")) {
+        /* cppcheck-suppress knownConditionTrueFalse
+         * False positive: cppcheck can't expand hash_for_each_possible()
+         * without full kernel headers, so its value-flow analysis
+         * concludes av_sigtable_del() always returns -ENOENT. At
+         * runtime the hashtable genuinely can contain a matching
+         * entry - this is a real condition, not dead code. Same class
+         * of false positive as av_behavior_trust_del()'s call site in
+         * behavior.c; the NULL-initializer inside av_sigtable_del()
+         * itself isn't enough to silence it here, hence the explicit
+         * suppression. */
         if (av_sigtable_del(algo, hex))
             return -ENOENT;
     } else {
