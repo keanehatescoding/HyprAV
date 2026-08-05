@@ -508,7 +508,7 @@ static void quarantine_file(const char *path, const struct stat *baseline,
 {
     char dest[PATH_MAX];
     const char *base;
-    time_t now;
+    struct timespec ts;
 
     if (ensure_quarantine_dir() != 0)
         return;
@@ -534,10 +534,18 @@ static void quarantine_file(const char *path, const struct stat *baseline,
 
     base = strrchr(path, '/');
     base = base ? base + 1 : path;
-    now = time(NULL);
 
-    snprintf(dest, sizeof(dest), "%s/%ld_%s.quarantined",
-             quarantine_dir, (long)now, base);
+    /* <pid>_<nanotime>_<base> rather than <epoch>_<base>: two files
+     * with the same basename quarantined within the same wall-clock
+     * second used to collide on this name, and the second rename()
+     * silently clobbered the first (avd is single-threaded today, but
+     * this shouldn't quietly break if that ever changes). PID plus a
+     * monotonic-clock nanosecond reading is unique per call even if
+     * two quarantines land in the same second. */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined",
+             quarantine_dir, (int)getpid(), (long)ts.tv_sec, ts.tv_nsec,
+             base);
 
     if (rename(path, dest) != 0) {
         if (errno == EXDEV) {
