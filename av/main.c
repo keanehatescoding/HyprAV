@@ -57,6 +57,8 @@
 #include <linux/uaccess.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
+#include <linux/fs_struct.h>
+#include <linux/namei.h>
 #include <linux/fcntl.h>
 #include <linux/crypto.h>
 #include <crypto/hash.h>
@@ -111,6 +113,15 @@ struct av_work {
                  * av_behavior_record_exec() keys behavior state by
                  * process rather than by the individual thread that
                  * happened to call execve(). */
+    struct path pwd; /* the exec'ing process's cwd at the moment
+                       * handler_pre() ran, captured via get_fs_pwd()
+                       * (atomic-safe: it's just a refcount bump under
+                       * current->fs->lock, no I/O). A relative `path`
+                       * below must be resolved against THIS, not
+                       * against whatever the workqueue thread's own
+                       * cwd happens to be by the time av_work_fn()
+                       * runs - see open_exec_target(). Released with
+                       * path_put() in av_work_fn()'s cleanup. */
     char path[PATH_MAX];
 };
 
@@ -132,9 +143,46 @@ static void bin_to_hex(const u8 *bin, size_t bin_len, char *hex_out)
     hex_out[bin_len * 2] = '\0';
 }
 
+/* Resolves and opens the exec target, honoring `path` as relative to
+ * `pwd` (the calling process's cwd at exec time - see the av_work
+ * comment) rather than to whatever directory this happens to run in.
+ * Called from av_work_fn(), i.e. sleepable process context, so
+ * vfs_path_lookup()'s potential I/O is fine here even though it would
+ * not have been back in handler_pre().
+ *
+ * An absolute path needs no resolution against pwd at all (and pwd may
+ * be garbage/unused in that case - filp_open() ignores it). This is
+ * also why plain filp_open(path, ...) worked "by accident" for every
+ * absolute-path exec: glibc's execvp() always resolves PATH lookups to
+ * an absolute path before the actual execve() syscall, so this bug
+ * only ever showed up for a program calling execve() directly with a
+ * relative filename. */
+static struct file *open_exec_target(const char *path, const struct path *pwd)
+{
+    struct file *f;
+
+    if (path[0] == '/') {
+        f = filp_open(path, O_RDONLY, 0);
+    } else {
+        struct path resolved;
+        int err;
+
+        err = vfs_path_lookup(pwd->dentry, pwd->mnt, path, LOOKUP_FOLLOW,
+                               &resolved);
+        if (err)
+            return ERR_PTR(err);
+
+        f = dentry_open(&resolved, O_RDONLY, current_cred());
+        path_put(&resolved);
+    }
+
+    return f;
+}
+
 /* Computes MD5, SHA-1, and SHA-256 of the file at `path` in a single
  * read pass. MUST be called from a sleepable (process) context only. */
-static int hash_file_multi(const char *path, struct av_digest *out)
+static int hash_file_multi(const char *path, const struct path *pwd,
+                            struct av_digest *out)
 {
     struct file *f;
     u8 md5_bin[16], sha1_bin[20], sha256_bin[32];
@@ -149,7 +197,7 @@ static int hash_file_multi(const char *path, struct av_digest *out)
     int ret = 0;
     int i;
 
-    f = filp_open(path, O_RDONLY, 0);
+    f = open_exec_target(path, pwd);
     if (IS_ERR(f))
         return PTR_ERR(f);
 
@@ -263,7 +311,7 @@ static void av_work_fn(struct work_struct *w)
     char reason[AV_SIG_NAME_LEN + 32];
     int ret;
 
-    ret = hash_file_multi(aw->path, &digest);
+    ret = hash_file_multi(aw->path, &aw->pwd, &digest);
     if (ret) {
         /* Couldn't open/hash it (permissions, already gone, etc.) -
          * not the job of the signature path, just skip. */
@@ -317,6 +365,7 @@ static void av_work_fn(struct work_struct *w)
     }
 
 out:
+    path_put(&aw->pwd);
     put_pid(aw->target_pid);
     kfree(aw);
 }
@@ -359,6 +408,14 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs)
 
     aw->target_pid = get_task_pid(current, PIDTYPE_PID);
     aw->tgid = task_tgid_nr(current);
+    /* get_fs_pwd() takes fs->lock and bumps refcounts under it - no
+     * sleeping, so this is fine in this atomic kprobe context. This is
+     * the fix for the relative-path evasion: capture the calling
+     * process's cwd HERE, while we're still running in its context,
+     * so a relative aw->path can be resolved correctly later even
+     * though av_work_fn() runs on a workqueue thread with an unrelated
+     * cwd of its own. Released via path_put() in av_work_fn(). */
+    get_fs_pwd(current->fs, &aw->pwd);
     INIT_WORK(&aw->work, av_work_fn);
     queue_work(av_wq, &aw->work);
 
