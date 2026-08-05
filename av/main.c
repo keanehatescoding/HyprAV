@@ -85,10 +85,25 @@
                                    * fatal on its own, but both tie up a
                                    * workqueue thread indefinitely; see
                                    * the S_ISREG/i_size checks below. */
-#define DAEMON_TIMEOUT_MS   2000 /* fail-open if the daemon doesn't answer
+#define DAEMON_TIMEOUT_MS   12000 /* fail-open if the daemon doesn't answer
                                    * in time - see docs/netlink-protocol.md
                                    * for the fail-open vs fail-closed
-                                   * discussion */
+                                   * discussion.
+                                   *
+                                   * Was 2000: avd's own SCAN_TIMEOUT_SECS
+                                   * (avd.c) is 10s, so any scan taking
+                                   * longer than 2s had its verdict
+                                   * dropped as an "unknown/expired reqid"
+                                   * here regardless of what avd decided -
+                                   * the exec got killed by THIS timeout's
+                                   * fail-open path, and avd's 10s budget
+                                   * was effectively dead code. 12000ms
+                                   * gives a couple seconds of headroom
+                                   * over avd's real worst case rather
+                                   * than matching it exactly, so a scan
+                                   * that legitimately takes close to 10s
+                                   * still gets to deliver its verdict
+                                   * instead of racing this timeout. */
 
 static struct kprobe kp_execve = {
     .symbol_name = "__x64_sys_execve",

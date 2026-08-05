@@ -51,7 +51,11 @@ in the kernel headers the way a raw `NETLINK_*` family would.
 ```
 
 The workqueue thread (`av_work_fn` in `main.c`) blocks waiting for the
-verdict with a timeout (default 2000ms) — this is safe because it's
+verdict with a timeout (default 12000ms — see `DAEMON_TIMEOUT_MS` in
+`main.c`; raised from an earlier 2000ms default that was shorter than
+avd's own `SCAN_TIMEOUT_SECS` of 10s, which meant any scan taking
+longer than 2s had its verdict dropped here regardless of what avd
+decided) — this is safe because it's
 process context, not the atomic kprobe path. If the daemon isn't
 running, isn't registered, or takes too long, the request fails
 gracefully and the file is treated as clean-by-default (fail-open) for
