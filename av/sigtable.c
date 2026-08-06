@@ -80,6 +80,10 @@ static int parse_algo(const char *s, enum av_algo *out)
 
 int av_sigtable_add(enum av_algo algo, const char *hex, const char *name)
 {
+    /* existing is initialized to NULL only to satisfy static analyzers
+     * that can't expand hash_for_each_possible() without full kernel
+     * headers - see av_sigtable_del() below for the same workaround. */
+    struct av_sig_entry *existing = NULL;
     struct av_sig_entry *e;
 
     if (algo >= AV_ALGO_COUNT)
@@ -97,6 +101,21 @@ int av_sigtable_add(enum av_algo algo, const char *hex, const char *name)
     strscpy(e->name, name, sizeof(e->name));
 
     mutex_lock(&sig_lock);
+    /* Reject a duplicate (same algo + hex) instead of silently adding
+     * a second entry alongside it - av_sigtable_match() would still
+     * only ever find one of them (whichever hash_for_each_possible()
+     * happens to walk to first), so a second copy was pure waste, not
+     * a second layer of anything. Checked under the same lock as the
+     * insert below - no separate pre-check, so no TOCTOU window
+     * between "no duplicate" and "insert". */
+    hash_for_each_possible(sig_table, existing, node, hex_key(e->hex)) {
+        if (existing->algo == algo &&
+            !strncasecmp(existing->hex, e->hex, algo_hexlen[algo])) {
+            mutex_unlock(&sig_lock);
+            kfree(e);
+            return -EEXIST;
+        }
+    }
     hash_add(sig_table, &e->node, hex_key(e->hex));
     sig_count++;
     mutex_unlock(&sig_lock);
@@ -211,10 +230,20 @@ static ssize_t sig_proc_write(struct file *file, const char __user *ubuf,
         return -EINVAL;
 
     if (!strcasecmp(cmd, "add")) {
+        int ret;
+
         if (n < 4)
             return -EINVAL;
-        if (av_sigtable_add(algo, hex, name))
-            return -EINVAL;
+        /* Propagate the real error - specifically -EEXIST for a
+         * duplicate add - rather than flattening every failure to
+         * -EINVAL. avctl's write_command() reports strerror(errno),
+         * so this is the difference between a caller seeing "File
+         * exists" (duplicate, an actionable answer) and "Invalid
+         * argument" (which duplicate adds used to report too, even
+         * though nothing about the input was actually invalid). */
+        ret = av_sigtable_add(algo, hex, name);
+        if (ret)
+            return ret;
     } else if (!strcasecmp(cmd, "del")) {
         /* cppcheck-suppress knownConditionTrueFalse
          * False positive: cppcheck can't expand hash_for_each_possible()

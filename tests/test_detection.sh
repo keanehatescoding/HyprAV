@@ -114,7 +114,6 @@ if rmmod av 2>/tmp/rmmod.log; then
 else
     fail "rmmod failed: $(cat /tmp/rmmod.log)"
 fi
-trap - EXIT   # already handled above
 
 echo
 echo "==================================="

@@ -154,10 +154,23 @@ static bool path_is_excluded(const char *path)
 static const char * const sensitive_path_substrings[] = {
     "/etc/passwd",
     "/etc/shadow",
-    "/boot/",
     "/.ssh/",
 };
 #define NUM_SENSITIVE_SUBSTRINGS ARRAY_SIZE(sensitive_path_substrings)
+
+/* Prefix match, not substring - "/boot/" as a bare substring flagged
+ * any path containing a directory literally named "boot" anywhere
+ * (Quasar/other web-framework src/boot/ directories, u-boot project
+ * trees, etc.), which is a common legitimate directory name and not
+ * remotely the same thing as the actual /boot filesystem. Unlike
+ * /etc/passwd, /etc/shadow, and /.ssh/ - specific enough that a
+ * substring match rarely fires outside the real path - "boot" alone
+ * needed the same anchored-prefix treatment path_is_excluded() above
+ * already uses for excluded_path_prefixes[]. */
+static const char * const sensitive_path_prefixes[] = {
+    "/boot/",
+};
+#define NUM_SENSITIVE_PREFIXES ARRAY_SIZE(sensitive_path_prefixes)
 
 struct av_behavior_entry {
     struct hlist_node node;
@@ -414,6 +427,13 @@ static struct av_behavior_entry *get_or_create_entry(pid_t pid)
 static bool path_is_sensitive(const char *path)
 {
     size_t i;
+
+    for (i = 0; i < NUM_SENSITIVE_PREFIXES; i++) {
+        size_t len = strlen(sensitive_path_prefixes[i]);
+
+        if (!strncmp(path, sensitive_path_prefixes[i], len))
+            return true;
+    }
 
     for (i = 0; i < NUM_SENSITIVE_SUBSTRINGS; i++) {
         if (strstr(path, sensitive_path_substrings[i]))

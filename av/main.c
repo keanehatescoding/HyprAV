@@ -106,7 +106,7 @@
                                    * instead of racing this timeout. */
 
 static struct kprobe kp_execve = {
-    .symbol_name = "__x64_sys_execve",
+    .symbol_name = HOOKED_SYSCALL_NAME,
 };
 static struct kprobe kp_openat = {
     .symbol_name = "__x64_sys_openat",
@@ -698,4 +698,4 @@ module_exit(av_exit);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Keane");
 MODULE_DESCRIPTION("Signature-based execve detection with runtime-managed signature DB and behavioral heuristics");
-MODULE_VERSION("0.8-pre");
+MODULE_VERSION("1.0.0");
