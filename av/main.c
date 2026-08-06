@@ -364,15 +364,28 @@ static void av_work_fn(struct work_struct *w)
             snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
             av_kill(aw->target_pid, aw->path, "daemon", reason);
         } else if (nl_ret == 0) {
-            pr_info("kernel-av: event=clean type=daemon path=\"%s\" pid=%d "
-                    "md5=%s sha1=%s sha256=%s\n",
+            /* pr_info_ratelimited, not plain pr_info: this fires for
+             * every exec that reaches the daemon path (i.e. every
+             * clean, non-signature-matched exec on the system), which
+             * used to mean an unconditional dmesg line per exec.
+             * Deliberately NOT pr_debug_ratelimited - that would make
+             * it a silent no-op by default (needs CONFIG_DYNAMIC_DEBUG
+             * enabled per call site, which this project doesn't set
+             * up anywhere, and would also break test_detection.sh's
+             * dmesg grep for this exact line below). _ratelimited()
+             * keeps it visible at its current pr_info level while
+             * capping it to the kernel's default rate limit
+             * (10 msgs/5s) instead of one line per exec. */
+            pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%s\" "
+                    "pid=%d md5=%s sha1=%s sha256=%s\n",
                     aw->path, pid_nr(aw->target_pid),
                     digest.md5, digest.sha1, digest.sha256);
         } else {
             /* -ENOTCONN (no daemon), -ETIMEDOUT, or another error -
              * fail open, but log distinctly so this is visible/greppable
-             * separately from a genuine daemon-confirmed clean verdict. */
-            pr_info("kernel-av: event=clean type=fail-open path=\"%s\" "
+             * separately from a genuine daemon-confirmed clean verdict.
+             * Same pr_info_ratelimited reasoning as above. */
+            pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%s\" "
                     "pid=%d md5=%s sha1=%s sha256=%s err=%d\n",
                     aw->path, pid_nr(aw->target_pid),
                     digest.md5, digest.sha1, digest.sha256, nl_ret);
