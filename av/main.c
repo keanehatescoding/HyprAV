@@ -551,7 +551,7 @@ static void av_work_fn(struct work_struct *w)
         char rule_name[AV_RULE_NAME_MAXLEN + 1] = "";
         int nl_ret;
 
-        nl_ret = av_netlink_scan_request(aw->path, digest.sha256,
+        nl_ret = av_netlink_scan_request(abs_path, digest.sha256,
                                           pid_nr(aw->target_pid),
                                           &verdict, rule_name,
                                           sizeof(rule_name),
