@@ -70,6 +70,26 @@
                               * stays small in practice. 30s is a
                               * starting point, not a tuned value. */
 
+#define RENAME_WINDOW_MS  2000
+#define RENAME_THRESHOLD  20  /* DISTINCT extension-append renames
+                               * within the window before this trips -
+                               * tunable, not derived from a real
+                               * ransomware sample. Deliberately LOWER
+                               * than WRITE_OPEN_THRESHOLD (50): this
+                               * only counts renames matching the
+                               * specific extension-append SHAPE (see
+                               * is_extension_append_rename() below),
+                               * not "any rename" the way the write
+                               * counter counts "any write-intent
+                               * open" - that's already a much rarer,
+                               * more specific signal, so it can trip
+                               * sooner without the same false-positive
+                               * exposure. */
+#define MAX_TRACKED_RENAMES RENAME_THRESHOLD
+                                   /* Same sizing rationale as
+                                    * MAX_TRACKED_PATHS above - sized
+                                    * to exactly cover the threshold. */
+
 /* Paths under these prefixes are excluded from BOTH the rapid-write
  * counter and the sensitive-path check entirely - not just given a
  * pass on one heuristic. These are pseudo-filesystems (sysfs, procfs)
@@ -196,6 +216,18 @@ struct av_behavior_entry {
     u32 recent_path_hashes[MAX_TRACKED_PATHS];
     unsigned int recent_path_next;   /* ring buffer write cursor */
     unsigned int recent_path_filled; /* valid entries, caps at MAX_TRACKED_PATHS */
+
+    /* Same dedup-ring-buffer idea as recent_path_hashes above, but for
+     * the rename heuristic: counts DISTINCT source files renamed with
+     * an extension-append shape in the window, keyed on the OLD path
+     * (the file's identity before the rename, mirroring "distinct
+     * paths written" for the write-open counter). See
+     * av_behavior_check_rename() and is_extension_append_rename(). */
+    unsigned int rename_count;
+    unsigned long rename_window_start_jiffies;
+    u32 recent_rename_hashes[MAX_TRACKED_RENAMES];
+    unsigned int recent_rename_next;
+    unsigned int recent_rename_filled;
 
     bool trusted; /* set at record_exec time if this binary's SHA-256
                     * is on the trust list - exempts the rapid-write
@@ -442,6 +474,42 @@ static bool path_is_sensitive(const char *path)
     return false;
 }
 
+static const char *path_basename(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+
+    return slash ? slash + 1 : path;
+}
+
+/* True if new_path's basename is old_path's basename with a non-empty
+ * ".something" suffix appended - the observable shape of ransomware's
+ * encryption pass (document.docx -> document.docx.crypt), independent
+ * of which specific extension string a given family happens to use.
+ *
+ * Deliberately does NOT match:
+ *   - moves that preserve the basename (mv file.txt newdir/file.txt -
+ *     same length, not "extended")
+ *   - ordinary renames to an unrelated name (draft.txt -> final.txt -
+ *     not a prefix relationship at all)
+ *   - atomic write-then-rename / temp-file finalization
+ *     (file.txt.tmp -> file.txt - shorter, not an addition)
+ * all of which are extremely common legitimate patterns that a bare
+ * "did the extension change" check would also have caught. */
+static bool is_extension_append_rename(const char *old_path,
+                                        const char *new_path)
+{
+    const char *old_base = path_basename(old_path);
+    const char *new_base = path_basename(new_path);
+    size_t old_len = strlen(old_base);
+    size_t new_len = strlen(new_base);
+
+    if (new_len <= old_len)
+        return false;
+    if (strncmp(old_base, new_base, old_len))
+        return false;
+    return new_base[old_len] == '.';
+}
+
 /* Shared kill-and-log helper - same pid_task/rcu_read_lock/send_sig
  * pattern used in main.c's execve path, duplicated here rather than
  * shared across modules to keep behavior.c self-contained.
@@ -648,6 +716,81 @@ void av_behavior_check_unlink(pid_t pid, const char *path,
                           "self-deleting binary (possible dropper/backdoor)");
     else if (sensitive)
         kill_with_reason(target_pid, path, "deletion of sensitive path");
+}
+
+void av_behavior_check_rename(pid_t pid, const char *oldpath,
+                               const char *newpath, struct pid *target_pid)
+{
+    struct av_behavior_entry *e;
+    bool sensitive;
+    bool rapid = false;
+
+    /* Pseudo-filesystem/device paths never count toward either
+     * heuristic here either - same reasoning as av_behavior_check_openat.
+     * Checked on BOTH ends: a rename touching /proc, /sys, or /dev on
+     * either side isn't a meaningful signal for either heuristic. */
+    if (path_is_excluded(oldpath) || path_is_excluded(newpath))
+        return;
+
+    /* Sensitive-path check applies to either end - renaming FROM a
+     * sensitive path (e.g. relocating /etc/shadow out from under the
+     * system) or TO one (e.g. clobbering /etc/passwd via rename) are
+     * both worth flagging, and neither direction is really "safer"
+     * than the other. */
+    sensitive = path_is_sensitive(oldpath) || path_is_sensitive(newpath);
+
+    if (is_extension_append_rename(oldpath, newpath)) {
+        mutex_lock(&behavior_lock);
+        e = get_or_create_entry(pid);
+        if (e && !e->trusted) {
+            /* Same sliding-window + distinct-source-file dedup pattern
+             * as av_behavior_check_openat's write-open counter, just
+             * with its own independent window/counter/ring-buffer
+             * fields - see the struct comment. Trust exemption is
+             * identical too: skips ONLY this volume-based signal, the
+             * sensitive-path check above still applies regardless. */
+            unsigned long window_ms = jiffies_to_msecs(
+                jiffies - e->rename_window_start_jiffies);
+            bool new_window = (e->rename_window_start_jiffies == 0 ||
+                                window_ms > RENAME_WINDOW_MS);
+            u32 path_hash = full_name_hash(NULL, oldpath, strlen(oldpath));
+            bool seen_before = false;
+            unsigned int i;
+
+            if (new_window) {
+                e->rename_window_start_jiffies = jiffies;
+                e->rename_count = 0;
+                e->recent_rename_next = 0;
+                e->recent_rename_filled = 0;
+            }
+
+            for (i = 0; i < e->recent_rename_filled; i++) {
+                if (e->recent_rename_hashes[i] == path_hash) {
+                    seen_before = true;
+                    break;
+                }
+            }
+
+            if (!seen_before) {
+                e->recent_rename_hashes[e->recent_rename_next] = path_hash;
+                e->recent_rename_next =
+                    (e->recent_rename_next + 1) % MAX_TRACKED_RENAMES;
+                if (e->recent_rename_filled < MAX_TRACKED_RENAMES)
+                    e->recent_rename_filled++;
+
+                e->rename_count++;
+                if (e->rename_count > RENAME_THRESHOLD)
+                    rapid = true;
+            }
+        }
+        mutex_unlock(&behavior_lock);
+    }
+
+    if (sensitive)
+        kill_with_reason(target_pid, newpath, "rename involving sensitive path");
+    else if (rapid)
+        kill_with_reason(target_pid, newpath,
+                          "rapid extension-append renames (possible ransomware encryption pass)");
 }
 
 int av_behavior_init(void)

@@ -29,8 +29,9 @@ scripts/
 docs/
   netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
 av/                  - the actual antivirus module (single, evolving)
-  main.c              - kprobe hooks (execve, openat, unlink, unlinkat),
-                        workqueue, multi-algorithm hashing
+  main.c              - kprobe hooks (execve, openat, unlink, unlinkat,
+                        rename, renameat, renameat2), workqueue,
+                        multi-algorithm hashing
   sigtable.c/.h       - kernel hashtable signature store + /proc interface
   netlink_chan.c/.h   - Generic Netlink channel to avd (see docs/netlink-protocol.md)
   netlink_proto.h     - protocol definitions shared with userspace/avd

@@ -1,7 +1,7 @@
 /*
  * behavior.h - v0.8.0: behavioral heuristics.
  *
- * Three signals, all deferred to a workqueue (never the atomic kprobe
+ * Four signals, all deferred to a workqueue (never the atomic kprobe
  * path - see main.c's architecture note, this is the same lesson from
  * v0.1.0 applied again):
  *   1. Rapid write-intent file opens in a short window (ransomware-like:
@@ -10,6 +10,10 @@
  *      (/etc/passwd, /etc/shadow, ~/.ssh, /boot)
  *   3. A process deleting the very executable it was started from
  *      (self-deleting binary - dropper/backdoor behavior)
+ *   4. Rapid extension-append renames in a short window (ransomware's
+ *      actual encryption-pass signature: document.docx ->
+ *      document.docx.crypt), plus renames touching a sensitive path
+ *      on either end - see av_behavior_check_rename() below
  *
  * All per-PROCESS state lives in a single mutex-protected hashtable,
  * since (unlike sigtable.c, which is read/written from arbitrary
@@ -83,6 +87,20 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
  * `pid` is the tgid - see the note above. */
 void av_behavior_check_unlink(pid_t pid, const char *path,
                                struct pid *target_pid);
+
+/* Called from the rename/renameat/renameat2 work handler. Flags a
+ * burst of "extension-append" renames (oldpath's basename with a
+ * non-empty ".something" suffix tacked on - e.g. document.docx ->
+ * document.docx.crypt) within a short window against DISTINCT source
+ * files: the observable shape of ransomware's encryption pass,
+ * regardless of which specific extension a given family happens to
+ * use, rather than a brittle hardcoded extension blocklist. Also
+ * flags a rename involving a sensitive path on either end. Same
+ * trust exemption as av_behavior_check_openat: trust skips the
+ * volume-based signal only, never the sensitive-path check. `pid` is
+ * the tgid - see the note above. */
+void av_behavior_check_rename(pid_t pid, const char *oldpath,
+                               const char *newpath, struct pid *target_pid);
 
 /* Trusted-binary-hash management, mirroring sigtable.c's pattern.
  * Returns 0 on success, negative errno on failure (-EINVAL for a

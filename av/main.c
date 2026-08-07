@@ -40,6 +40,16 @@
  * workqueue is a genuinely risky, version-fragile kernel API area
  * that this design avoids entirely).
  *
+ * Later addition: rename/renameat/renameat2 hooks, closing a
+ * previously-documented gap - ransomware's actual encryption-pass
+ * signature is renaming files to add an extension (document.docx ->
+ * document.docx.crypt), which none of the hooks above observed. Same
+ * atomic-context discipline again: pre-handlers copy TWO path strings
+ * and schedule work; av_behavior_check_rename() in behavior.c does
+ * the actual extension-append-shape detection, sliding-window
+ * counting, and sensitive-path check. See behavior.h/behavior.c and
+ * README.md for the detection design.
+ *
  * Build:   make
  * Load:    sudo insmod av.ko
  * Seed:    a default EICAR SHA-256 signature is added at module load
@@ -116,6 +126,15 @@ static struct kprobe kp_unlink = {
 };
 static struct kprobe kp_unlinkat = {
     .symbol_name = "__x64_sys_unlinkat",
+};
+static struct kprobe kp_rename = {
+    .symbol_name = "__x64_sys_rename",
+};
+static struct kprobe kp_renameat = {
+    .symbol_name = "__x64_sys_renameat",
+};
+static struct kprobe kp_renameat2 = {
+    .symbol_name = "__x64_sys_renameat2",
 };
 
 static struct workqueue_struct *av_wq;
@@ -600,6 +619,107 @@ static int handler_pre_unlinkat(struct kprobe *p, struct pt_regs *regs)
     return schedule_unlink_work((const char __user *)real_regs->si);
 }
 
+/* ---- rename/renameat/renameat2: extension-append burst + sensitive-
+ * path rename tracking. Same atomic-context discipline as every other
+ * hook here: pre-handlers only copy TWO path strings (GFP_ATOMIC) and
+ * schedule work; all logic lives in av_behavior_check_rename(). ---- */
+
+struct av_rename_work {
+    struct work_struct work;
+    struct pid *target_pid;
+    pid_t pid; /* tgid, not thread pid - see the note on av_openat_work
+                * above; keeps the rename counter keyed the same way
+                * as every other per-process heuristic here. */
+    char oldpath[PATH_MAX];
+    char newpath[PATH_MAX];
+};
+
+static void av_rename_work_fn(struct work_struct *w)
+{
+    struct av_rename_work *rw = container_of(w, struct av_rename_work, work);
+
+    av_behavior_check_rename(rw->pid, rw->oldpath, rw->newpath, rw->target_pid);
+
+    put_pid(rw->target_pid);
+    kfree(rw);
+}
+
+static int schedule_rename_work(const char __user *user_oldpath,
+                                 const char __user *user_newpath)
+{
+    struct av_rename_work *rw;
+
+    if (!user_oldpath || !user_newpath)
+        return 0;
+
+    rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+    if (!rw)
+        return 0;
+
+    {
+        ssize_t path_len;
+
+        path_len = strncpy_from_user(rw->oldpath, user_oldpath, PATH_MAX);
+        if (path_len <= 0 || path_len >= PATH_MAX) {
+            kfree(rw);
+            return 0;
+        }
+        path_len = strncpy_from_user(rw->newpath, user_newpath, PATH_MAX);
+        if (path_len <= 0 || path_len >= PATH_MAX) {
+            kfree(rw);
+            return 0;
+        }
+    }
+
+    rw->pid = task_tgid_nr(current);
+    rw->target_pid = get_task_pid(current, PIDTYPE_PID);
+    INIT_WORK(&rw->work, av_rename_work_fn);
+    queue_work(av_wq, &rw->work);
+
+    return 0;
+}
+
+/* rename(const char *oldname, const char *newname) - same register
+ * shape as unlink's single-arg case, just two of them: oldname is the
+ * first arg (di), newname is the second (si). */
+static int handler_pre_rename(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+
+    if (!real_regs)
+        return 0;
+    return schedule_rename_work((const char __user *)real_regs->di,
+                                 (const char __user *)real_regs->si);
+}
+
+/* renameat(int olddfd, const char *oldname, int newdfd, const char *newname)
+ * - oldname is the SECOND arg (si), newname is the FOURTH (r10, not r8 -
+ * standard x86_64 syscall arg order is di/si/dx/r10/r8/r9, since r10
+ * substitutes for rcx which the SYSCALL instruction itself clobbers). */
+static int handler_pre_renameat(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+
+    if (!real_regs)
+        return 0;
+    return schedule_rename_work((const char __user *)real_regs->si,
+                                 (const char __user *)real_regs->r10);
+}
+
+/* renameat2(int olddfd, const char *oldname, int newdfd, const char *newname,
+ * unsigned int flags) - same first four args as renameat (flags, the
+ * fifth/r8, isn't currently used - RENAME_EXCHANGE/RENAME_NOREPLACE/
+ * RENAME_WHITEOUT aren't distinguished by this heuristic today). */
+static int handler_pre_renameat2(struct kprobe *p, struct pt_regs *regs)
+{
+    const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+
+    if (!real_regs)
+        return 0;
+    return schedule_rename_work((const char __user *)real_regs->si,
+                                 (const char __user *)real_regs->r10);
+}
+
 static int __init av_init(void)
 {
     int ret;
@@ -667,9 +787,36 @@ static int __init av_init(void)
         goto err_kp_unlink;
     }
 
+    kp_rename.pre_handler = handler_pre_rename;
+    ret = register_kprobe(&kp_rename);
+    if (ret < 0) {
+        pr_err("kernel-av: register_kprobe(rename) failed: %d\n", ret);
+        goto err_kp_unlinkat;
+    }
+
+    kp_renameat.pre_handler = handler_pre_renameat;
+    ret = register_kprobe(&kp_renameat);
+    if (ret < 0) {
+        pr_err("kernel-av: register_kprobe(renameat) failed: %d\n", ret);
+        goto err_kp_rename;
+    }
+
+    kp_renameat2.pre_handler = handler_pre_renameat2;
+    ret = register_kprobe(&kp_renameat2);
+    if (ret < 0) {
+        pr_err("kernel-av: register_kprobe(renameat2) failed: %d\n", ret);
+        goto err_kp_renameat;
+    }
+
     pr_info("kernel-av: loaded, %zu signature(s) active\n", av_sigtable_count());
     return 0;
 
+err_kp_renameat:
+    unregister_kprobe(&kp_renameat);
+err_kp_rename:
+    unregister_kprobe(&kp_rename);
+err_kp_unlinkat:
+    unregister_kprobe(&kp_unlinkat);
 err_kp_unlink:
     unregister_kprobe(&kp_unlink);
 err_kp_openat:
@@ -691,6 +838,9 @@ err_sigtable:
 
 static void __exit av_exit(void)
 {
+    unregister_kprobe(&kp_renameat2);
+    unregister_kprobe(&kp_renameat);
+    unregister_kprobe(&kp_rename);
     unregister_kprobe(&kp_unlinkat);
     unregister_kprobe(&kp_unlink);
     unregister_kprobe(&kp_openat);
