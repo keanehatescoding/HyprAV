@@ -75,6 +75,8 @@
 #include <linux/sched/signal.h>
 #include <linux/workqueue.h>
 #include <linux/pid.h>
+#include <linux/file.h>
+#include <linux/dcache.h>
 
 #include "sigtable.h"
 #include "netlink_proto.h"
@@ -138,6 +140,99 @@ static struct kprobe kp_renameat2 = {
 };
 
 static struct workqueue_struct *av_wq;
+
+/* Resolves a syscall's `dfd` argument into a struct path suitable as
+ * the base for a later relative-path lookup, mirroring the get_fs_pwd()
+ * capture execve's handler_pre() already did. Callable from ATOMIC
+ * (kprobe) context: AT_FDCWD is by far the common case (plain
+ * openat/unlink/rename with no real base fd) and just reuses the same
+ * cwd capture; a real fd only needs fget_raw() to look up the
+ * descriptor table entry and bump its refcount - no I/O, no sleeping,
+ * same atomic-safety class as get_fs_pwd(). Uses fget_raw()/fput()
+ * rather than the newer fdget_raw()/fdput() struct-fd pair: the latter
+ * isn't EXPORT_SYMBOL'd for out-of-tree modules on every kernel (it
+ * modpost-failed as an undefined symbol on 7.1.6-cachyos), while
+ * fget_raw() is the long-standing exported entry point for exactly
+ * this "look up a file by fd, take a real reference" use case - same
+ * underlying RCU/refcount lookup, just a plain struct file* instead of
+ * struct fd. This is the fix for the
+ * dfd-ignored evasion: openat(fd_for_/etc, "shadow", ...) previously
+ * reached behavior.c as bare "shadow", which trivially bypassed every
+ * sensitive-path check. `out` is populated with a path reference the
+ * caller must path_put() - released in each work_fn's cleanup, same
+ * lifetime discipline as av_work's existing pwd field. Returns false
+ * (nothing to put) if dfd is a real fd but doesn't resolve to an open
+ * file - e.g. a bogus/already-closed fd racing the syscall itself. */
+static bool resolve_dfd_path(int dfd, struct path *out)
+{
+    if (dfd == AT_FDCWD) {
+        get_fs_pwd(current->fs, out);
+        return true;
+    }
+
+    {
+        struct file *f = fget_raw(dfd);
+
+        if (!f)
+            return false;
+
+        *out = f->f_path;
+        path_get(out);
+        fput(f);
+    }
+
+    return true;
+}
+
+/* Resolves `path` into a NUL-terminated absolute path string written
+ * into `out` (capacity out_len), using `base` (captured by
+ * resolve_dfd_path() above, in atomic context, back when `path` was
+ * still meaningful relative to the calling process) when `path` itself
+ * isn't already absolute. Must run from SLEEPABLE context - d_path()
+ * can be called under most locks but the whole point here is to be
+ * called from the workqueue, consistent with every other non-atomic-
+ * safe operation in this file.
+ *
+ * Deliberately does NOT use vfs_path_lookup()/full canonicalization:
+ * unlike open_exec_target() (which needs a real open fd and so must
+ * fully resolve the target), rename's newpath and an O_CREAT openat
+ * target may not exist yet, and unlink's target may be a symlink we
+ * must NOT follow. Instead this resolves only the base directory (dfd)
+ * to its absolute path via d_path() and string-concatenates the
+ * (still possibly containing "." / ".." components) relative
+ * remainder onto it. That's sufficient for behavior.c's prefix/
+ * substring matching and exec_path self-delete comparison - the
+ * literal path components a caller supplied are still present in the
+ * resulting string, just not collapsed - but note it for what it is:
+ * a pragmatic partial resolution, not a canonical realpath(). On any
+ * failure this falls back to copying `path` through unresolved rather
+ * than dropping the event - a degraded (pre-fix) check on this one
+ * call is better than silently skipping it. */
+static void resolve_absolute_path(const char *path, const struct path *base,
+                                   char *out, size_t out_len)
+{
+    char *tmp;
+    char *dirpath;
+
+    if (path[0] == '/') {
+        strscpy(out, path, out_len);
+        return;
+    }
+
+    tmp = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!tmp) {
+        strscpy(out, path, out_len);
+        return;
+    }
+
+    dirpath = d_path(base, tmp, PATH_MAX);
+    if (IS_ERR(dirpath))
+        strscpy(out, path, out_len);
+    else
+        snprintf(out, out_len, "%s/%s", dirpath, path);
+
+    kfree(tmp);
+}
 
 struct av_work {
     struct work_struct work;
@@ -343,7 +438,26 @@ static void av_work_fn(struct work_struct *w)
     struct av_digest digest;
     char sig_name[AV_SIG_NAME_LEN];
     char reason[AV_SIG_NAME_LEN + 32];
+    char *abs_path;
     int ret;
+
+    /* hash_file_multi()/open_exec_target() already resolve a relative
+     * aw->path against aw->pwd correctly for the purpose of opening the
+     * right file. But what gets RECORDED as this process's exec_path
+     * (for the unlink hook's self-delete comparison, av_behavior_check_
+     * unlink()) was still the raw, possibly-relative string - so
+     * `./payload` exec'd and `payload` unlinked from the same cwd never
+     * matched. Resolve once here so exec_path and the (now also
+     * resolved - see resolve_dfd_path()/resolve_absolute_path() above)
+     * unlink path are directly comparable strings. */
+    abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!abs_path) {
+        path_put(&aw->pwd);
+        put_pid(aw->target_pid);
+        kfree(aw);
+        return;
+    }
+    resolve_absolute_path(aw->path, &aw->pwd, abs_path, PATH_MAX);
 
     ret = hash_file_multi(aw->path, &aw->pwd, &digest);
     if (ret) {
@@ -356,11 +470,11 @@ static void av_work_fn(struct work_struct *w)
      * immediately it'll never reach the unlink hook anyway, and this
      * keeps the recording logic in one place rather than duplicated
      * across the signature-match/daemon-match/clean branches. */
-    av_behavior_record_exec(aw->tgid, aw->path, digest.sha256);
+    av_behavior_record_exec(aw->tgid, abs_path, digest.sha256);
 
     if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
         snprintf(reason, sizeof(reason), "signature:%s", sig_name);
-        av_kill(aw->target_pid, aw->path, "signature", reason);
+        av_kill(aw->target_pid, abs_path, "signature", reason);
         goto out;
     }
 
@@ -381,7 +495,7 @@ static void av_work_fn(struct work_struct *w)
                                           DAEMON_TIMEOUT_MS);
         if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
             snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
-            av_kill(aw->target_pid, aw->path, "daemon", reason);
+            av_kill(aw->target_pid, abs_path, "daemon", reason);
         } else if (nl_ret == 0) {
             /* pr_info_ratelimited, not plain pr_info: this fires for
              * every exec that reaches the daemon path (i.e. every
@@ -397,7 +511,7 @@ static void av_work_fn(struct work_struct *w)
              * (10 msgs/5s) instead of one line per exec. */
             pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%s\" "
                     "pid=%d md5=%s sha1=%s sha256=%s\n",
-                    aw->path, pid_nr(aw->target_pid),
+                    abs_path, pid_nr(aw->target_pid),
                     digest.md5, digest.sha1, digest.sha256);
         } else {
             /* -ENOTCONN (no daemon), -ETIMEDOUT, or another error -
@@ -406,12 +520,13 @@ static void av_work_fn(struct work_struct *w)
              * Same pr_info_ratelimited reasoning as above. */
             pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%s\" "
                     "pid=%d md5=%s sha1=%s sha256=%s err=%d\n",
-                    aw->path, pid_nr(aw->target_pid),
+                    abs_path, pid_nr(aw->target_pid),
                     digest.md5, digest.sha1, digest.sha256, nl_ret);
         }
     }
 
 out:
+    kfree(abs_path);
     path_put(&aw->pwd);
     put_pid(aw->target_pid);
     kfree(aw);
@@ -484,31 +599,60 @@ struct av_openat_work {
                 * writes across threads, since each thread got its own
                 * independent counter. */
     int flags;
+    struct path base; /* dfd resolved to a struct path at kprobe time -
+                        * see resolve_dfd_path(). `path` below is
+                        * resolved against THIS in av_openat_work_fn(),
+                        * not against whatever cwd the workqueue thread
+                        * happens to have - same reasoning as av_work's
+                        * pwd field. Released via path_put() in
+                        * av_openat_work_fn()'s cleanup. */
     char path[PATH_MAX];
 };
 
 static void av_openat_work_fn(struct work_struct *w)
 {
     struct av_openat_work *ow = container_of(w, struct av_openat_work, work);
+    char *abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
-    av_behavior_check_openat(ow->pid, ow->path, ow->flags, ow->target_pid);
+    if (!abs_path) {
+        path_put(&ow->base);
+        put_pid(ow->target_pid);
+        kfree(ow);
+        return;
+    }
 
+    resolve_absolute_path(ow->path, &ow->base, abs_path, PATH_MAX);
+    av_behavior_check_openat(ow->pid, abs_path, ow->flags, ow->target_pid);
+
+    kfree(abs_path);
+    path_put(&ow->base);
     put_pid(ow->target_pid);
     kfree(ow);
 }
 
 /* openat(int dfd, const char *filename, int flags, umode_t mode) - on
- * the x86_64 syscall ABI, filename is the SECOND argument (regs->si),
- * unlike execve where the filename is the first (regs->di). Getting
- * this register mapping wrong is a silent, hard-to-notice bug (you'd
- * just never see openat events, no crash) - verify with a kprobe_log-
- * style dmesg print if this hook seems to never fire. */
+ * the x86_64 syscall ABI, dfd is the FIRST argument (regs->di) and
+ * filename is the SECOND (regs->si), unlike execve where the filename
+ * is the first (regs->di). Getting this register mapping wrong is a
+ * silent, hard-to-notice bug (you'd just never see openat events, no
+ * crash) - verify with a kprobe_log-style dmesg print if this hook
+ * seems to never fire.
+ *
+ * dfd is now captured and resolved (resolve_dfd_path()) rather than
+ * ignored: a bare filename is only ever cwd-relative when dfd ==
+ * AT_FDCWD - openat(fd_for_some_other_dir, "shadow", ...) is relative
+ * to THAT fd's directory, and treating it as cwd-relative (or, as
+ * before this fix, not resolving it at all) let a caller reach
+ * /etc/shadow while behavior.c only ever saw the bare string
+ * "shadow". */
 static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs)
 {
     const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
     const char __user *user_filename;
+    int dfd;
     int flags;
     struct av_openat_work *ow;
+    struct path base;
 
     if (!real_regs)
         return 0;
@@ -517,6 +661,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs)
     if (!user_filename)
         return 0;
 
+    dfd = (int)real_regs->di;
     flags = (int)real_regs->dx;
     /* Skip the allocation/copy entirely for read-only opens - this is
      * the overwhelming majority of opens on a normal system, and
@@ -525,14 +670,24 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs)
     if (!(flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC)))
         return 0;
 
-    ow = kmalloc(sizeof(*ow), GFP_ATOMIC);
-    if (!ow)
+    /* Resolve dfd BEFORE allocating/copying anything else - if the fd
+     * doesn't resolve (bogus/racing close) there's nothing useful to
+     * queue work for. */
+    if (!resolve_dfd_path(dfd, &base))
         return 0;
+
+    ow = kmalloc(sizeof(*ow), GFP_ATOMIC);
+    if (!ow) {
+        path_put(&base);
+        return 0;
+    }
+    ow->base = base;
 
     {
         ssize_t path_len = strncpy_from_user(ow->path, user_filename, PATH_MAX);
 
         if (path_len <= 0 || path_len >= PATH_MAX) {
+            path_put(&ow->base);
             kfree(ow);
             return 0;
         }
@@ -556,34 +711,64 @@ struct av_unlink_work {
                 * above; self-delete correlation against exec_path
                 * needs to match the same key av_behavior_record_exec()
                 * used. */
+    struct path base; /* dfd resolved at kprobe time - see
+                        * resolve_dfd_path(). For plain unlink() (no
+                        * dfd arg) this is always the cwd capture, same
+                        * as AT_FDCWD would give unlinkat(). Released
+                        * via path_put() in av_unlink_work_fn(). */
     char path[PATH_MAX];
 };
 
 static void av_unlink_work_fn(struct work_struct *w)
 {
     struct av_unlink_work *uw = container_of(w, struct av_unlink_work, work);
+    char *abs_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
-    av_behavior_check_unlink(uw->pid, uw->path, uw->target_pid);
+    if (!abs_path) {
+        path_put(&uw->base);
+        put_pid(uw->target_pid);
+        kfree(uw);
+        return;
+    }
 
+    resolve_absolute_path(uw->path, &uw->base, abs_path, PATH_MAX);
+    av_behavior_check_unlink(uw->pid, abs_path, uw->target_pid);
+
+    kfree(abs_path);
+    path_put(&uw->base);
     put_pid(uw->target_pid);
     kfree(uw);
 }
 
-static int schedule_unlink_work(const char __user *user_path)
+/* `dfd` should be AT_FDCWD for plain unlink() (no base fd of its own -
+ * always cwd-relative) or the real dfd argument for unlinkat(). Same
+ * dfd-ignored evasion fix as openat: unlinkat(fd_for_/etc, "shadow", 0)
+ * previously reached behavior.c as bare "shadow", so it could never
+ * match /etc/shadow's sensitive-path check, and could never correlate
+ * against an exec_path recorded as an absolute path either. */
+static int schedule_unlink_work(const char __user *user_path, int dfd)
 {
     struct av_unlink_work *uw;
+    struct path base;
 
     if (!user_path)
         return 0;
 
-    uw = kmalloc(sizeof(*uw), GFP_ATOMIC);
-    if (!uw)
+    if (!resolve_dfd_path(dfd, &base))
         return 0;
+
+    uw = kmalloc(sizeof(*uw), GFP_ATOMIC);
+    if (!uw) {
+        path_put(&base);
+        return 0;
+    }
+    uw->base = base;
 
     {
         ssize_t path_len = strncpy_from_user(uw->path, user_path, PATH_MAX);
 
         if (path_len <= 0 || path_len >= PATH_MAX) {
+            path_put(&uw->base);
             kfree(uw);
             return 0;
         }
@@ -598,25 +783,28 @@ static int schedule_unlink_work(const char __user *user_path)
 }
 
 /* unlink(const char *pathname) - pathname is the first (and only)
- * argument, same register position as execve's filename. */
+ * argument, same register position as execve's filename. No dfd of
+ * its own, so always resolves relative to cwd (AT_FDCWD). */
 static int handler_pre_unlink(struct kprobe *p, struct pt_regs *regs)
 {
     const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
 
     if (!real_regs)
         return 0;
-    return schedule_unlink_work((const char __user *)real_regs->di);
+    return schedule_unlink_work((const char __user *)real_regs->di, AT_FDCWD);
 }
 
-/* unlinkat(int dfd, const char *pathname, int flag) - pathname is the
- * SECOND argument (regs->si), same position as openat's filename. */
+/* unlinkat(int dfd, const char *pathname, int flag) - dfd is the FIRST
+ * argument (regs->di), pathname is the SECOND (regs->si), same
+ * position as openat's filename. */
 static int handler_pre_unlinkat(struct kprobe *p, struct pt_regs *regs)
 {
     const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
 
     if (!real_regs)
         return 0;
-    return schedule_unlink_work((const char __user *)real_regs->si);
+    return schedule_unlink_work((const char __user *)real_regs->si,
+                                 (int)real_regs->di);
 }
 
 /* ---- rename/renameat/renameat2: extension-append burst + sensitive-
@@ -630,6 +818,18 @@ struct av_rename_work {
     pid_t pid; /* tgid, not thread pid - see the note on av_openat_work
                 * above; keeps the rename counter keyed the same way
                 * as every other per-process heuristic here. */
+    struct path old_base; /* olddfd resolved at kprobe time (AT_FDCWD
+                            * for rename(), which has no dfd args of
+                            * its own). old_base/new_base are
+                            * deliberately independent - renameat()
+                            * allows olddfd and newdfd to name
+                            * different directories entirely, so
+                            * oldpath and newpath cannot share a single
+                            * resolved base the way openat/unlink can.
+                            * Released via path_put() in
+                            * av_rename_work_fn(). */
+    struct path new_base; /* newdfd resolved at kprobe time - see
+                            * old_base above. */
     char oldpath[PATH_MAX];
     char newpath[PATH_MAX];
 };
@@ -637,35 +837,83 @@ struct av_rename_work {
 static void av_rename_work_fn(struct work_struct *w)
 {
     struct av_rename_work *rw = container_of(w, struct av_rename_work, work);
+    char *abs_old = kmalloc(PATH_MAX, GFP_KERNEL);
+    char *abs_new;
 
-    av_behavior_check_rename(rw->pid, rw->oldpath, rw->newpath, rw->target_pid);
+    if (!abs_old) {
+        path_put(&rw->old_base);
+        path_put(&rw->new_base);
+        put_pid(rw->target_pid);
+        kfree(rw);
+        return;
+    }
+    abs_new = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!abs_new) {
+        kfree(abs_old);
+        path_put(&rw->old_base);
+        path_put(&rw->new_base);
+        put_pid(rw->target_pid);
+        kfree(rw);
+        return;
+    }
 
+    resolve_absolute_path(rw->oldpath, &rw->old_base, abs_old, PATH_MAX);
+    resolve_absolute_path(rw->newpath, &rw->new_base, abs_new, PATH_MAX);
+    av_behavior_check_rename(rw->pid, abs_old, abs_new, rw->target_pid);
+
+    kfree(abs_new);
+    kfree(abs_old);
+    path_put(&rw->old_base);
+    path_put(&rw->new_base);
     put_pid(rw->target_pid);
     kfree(rw);
 }
 
-static int schedule_rename_work(const char __user *user_oldpath,
-                                 const char __user *user_newpath)
+/* `olddfd`/`newdfd` should each be AT_FDCWD for rename() (no dfd args
+ * of its own - both ends are always cwd-relative) or the real dfd
+ * arguments for renameat()/renameat2(). Same dfd-ignored evasion fix
+ * as openat/unlink: renameat(fd_for_/etc, "shadow", fd_for_/tmp,
+ * "leaked") previously reached behavior.c as bare "shadow"/"leaked",
+ * bypassing the sensitive-path check on the oldpath end entirely. */
+static int schedule_rename_work(const char __user *user_oldpath, int olddfd,
+                                 const char __user *user_newpath, int newdfd)
 {
     struct av_rename_work *rw;
+    struct path old_base, new_base;
 
     if (!user_oldpath || !user_newpath)
         return 0;
 
-    rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
-    if (!rw)
+    if (!resolve_dfd_path(olddfd, &old_base))
         return 0;
+    if (!resolve_dfd_path(newdfd, &new_base)) {
+        path_put(&old_base);
+        return 0;
+    }
+
+    rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
+    if (!rw) {
+        path_put(&old_base);
+        path_put(&new_base);
+        return 0;
+    }
+    rw->old_base = old_base;
+    rw->new_base = new_base;
 
     {
         ssize_t path_len;
 
         path_len = strncpy_from_user(rw->oldpath, user_oldpath, PATH_MAX);
         if (path_len <= 0 || path_len >= PATH_MAX) {
+            path_put(&rw->old_base);
+            path_put(&rw->new_base);
             kfree(rw);
             return 0;
         }
         path_len = strncpy_from_user(rw->newpath, user_newpath, PATH_MAX);
         if (path_len <= 0 || path_len >= PATH_MAX) {
+            path_put(&rw->old_base);
+            path_put(&rw->new_base);
             kfree(rw);
             return 0;
         }
@@ -681,21 +929,23 @@ static int schedule_rename_work(const char __user *user_oldpath,
 
 /* rename(const char *oldname, const char *newname) - same register
  * shape as unlink's single-arg case, just two of them: oldname is the
- * first arg (di), newname is the second (si). */
+ * first arg (di), newname is the second (si). No dfd args of its own,
+ * so both resolve relative to cwd (AT_FDCWD). */
 static int handler_pre_rename(struct kprobe *p, struct pt_regs *regs)
 {
     const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
 
     if (!real_regs)
         return 0;
-    return schedule_rename_work((const char __user *)real_regs->di,
-                                 (const char __user *)real_regs->si);
+    return schedule_rename_work((const char __user *)real_regs->di, AT_FDCWD,
+                                 (const char __user *)real_regs->si, AT_FDCWD);
 }
 
 /* renameat(int olddfd, const char *oldname, int newdfd, const char *newname)
- * - oldname is the SECOND arg (si), newname is the FOURTH (r10, not r8 -
- * standard x86_64 syscall arg order is di/si/dx/r10/r8/r9, since r10
- * substitutes for rcx which the SYSCALL instruction itself clobbers). */
+ * - olddfd is the FIRST arg (di), oldname the SECOND (si), newdfd the
+ * THIRD (dx), newname the FOURTH (r10, not r8 - standard x86_64
+ * syscall arg order is di/si/dx/r10/r8/r9, since r10 substitutes for
+ * rcx which the SYSCALL instruction itself clobbers). */
 static int handler_pre_renameat(struct kprobe *p, struct pt_regs *regs)
 {
     const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
@@ -703,7 +953,9 @@ static int handler_pre_renameat(struct kprobe *p, struct pt_regs *regs)
     if (!real_regs)
         return 0;
     return schedule_rename_work((const char __user *)real_regs->si,
-                                 (const char __user *)real_regs->r10);
+                                 (int)real_regs->di,
+                                 (const char __user *)real_regs->r10,
+                                 (int)real_regs->dx);
 }
 
 /* renameat2(int olddfd, const char *oldname, int newdfd, const char *newname,
@@ -717,7 +969,9 @@ static int handler_pre_renameat2(struct kprobe *p, struct pt_regs *regs)
     if (!real_regs)
         return 0;
     return schedule_rename_work((const char __user *)real_regs->si,
-                                 (const char __user *)real_regs->r10);
+                                 (int)real_regs->di,
+                                 (const char __user *)real_regs->r10,
+                                 (int)real_regs->dx);
 }
 
 static int __init av_init(void)
