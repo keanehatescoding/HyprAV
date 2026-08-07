@@ -80,7 +80,11 @@ userspace/
                         list (/proc/kernel_av_trusted, `avctl trust
                         add/del/list`) - see the storage-metadata
                         incident in the behavioral heuristics testing
-                        section for why the trust list exists
+                        section for why the trust list exists. Both
+                        are in-memory kernel hashtables with no
+                        persistence of their own - `avctl save <file>`/
+                        `avctl load <file>` dump/replay both across an
+                        rmmod+insmod cycle.
     avctl.c
     Makefile
   avd/                - daemon: receives scan requests over netlink, loads
@@ -845,6 +849,21 @@ this project's scope justified once four real incidents made the
 tradeoff concrete. Trusted-process exemption is also the standard
 real-world EDR pattern for exactly this problem (publisher/hash
 allowlisting) — not a workaround invented for this project.
+
+**Persistence: `avctl save`/`avctl load`.** Both `/proc/kernel_av_signatures`
+and `/proc/kernel_av_trusted` are in-memory kernel hashtables — everything
+in them vanishes on `rmmod`, and the module only ever auto-seeds the one
+EICAR test signature at `insmod` time. `avctl save <file>` dumps both the
+signature DB and the trust list into a single file as replayable
+write-commands; `avctl load <file>` replays them (an entry that already
+exists, e.g. the auto-seeded EICAR signature on a fresh load, is reported
+as skipped rather than an error):
+
+```bash
+./userspace/avctl/avctl save /etc/kernel-av/state.txt
+sudo rmmod av && sudo insmod av/av.ko
+./userspace/avctl/avctl load /etc/kernel-av/state.txt
+```
 
 ## Testing evasion resistance (v0.9.0)
 
