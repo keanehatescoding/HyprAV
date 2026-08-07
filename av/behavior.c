@@ -325,7 +325,7 @@ int av_behavior_trust_del(const char *sha256_hex) {
   hex_tolower(lower_hex);
 
   mutex_lock(&trust_lock);
-  hash_for_each_possible(trust_table, e, node, hex_key(sha256_hex)) {
+  hash_for_each_possible(trust_table, e, node, hex_key(lower_hex)) {
     if (!strncasecmp(e->sha256_hex, lower_hex, SHA256_HEX_LEN)) {
       hash_del(&e->node);
       kfree(e);
