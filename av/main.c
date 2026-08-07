@@ -185,6 +185,55 @@ static bool resolve_dfd_path(int dfd, struct path *out) {
 
   return true;
 }
+/* Lexically collapses "." / ".." components and duplicate '/'
+ * separators in `path` (which must already start with '/'), rewriting
+ * it in place. Pure string manipulation - matches what the shell/
+ * kernel do lexically, not a filesystem operation: by the time
+ * resolve_absolute_path() calls this the target may not exist yet
+ * (rename()'s newpath, an O_CREAT openat target) or may be a symlink
+ * unlink() must not follow, so this deliberately never touches the
+ * filesystem or resolves symlinks. Its only job is making two
+ * differently-spelled-but-lexically-identical paths (e.g.
+ * "/cwd/./foo" and "/cwd/foo") compare equal via strcmp() - see the
+ * self-delete correlation in behavior.c and the prefix/substring
+ * matching referenced in resolve_absolute_path()'s comment below,
+ * which this now actually delivers on. A ".." that would walk above
+ * the leading "/" is dropped rather than treated as an error - same
+ * as normal path semantics ("/.." collapses to "/"). On allocation
+ * failure, leaves `path` as the unnormalized (pre-fix) string rather
+ * than crashing or truncating it. */
+static void normalize_abs_path(char *path, size_t path_len) {
+  char *stack[128];
+  int depth = 0;
+  char *tmp, *saveptr, *tok;
+
+  tmp = kstrdup(path, GFP_KERNEL);
+  if (!tmp)
+    return;
+
+  saveptr = tmp;
+  while ((tok = strsep(&saveptr, "/")) != NULL) {
+    if (tok[0] == '\0' || (tok[0] == '.' && tok[1] == '\0'))
+      continue;
+    if (tok[0] == '.' && tok[1] == '.' && tok[2] == '\0') {
+      if (depth > 0)
+        depth--;
+      continue;
+    }
+    if (depth < ARRAY_SIZE(stack))
+      stack[depth++] = tok;
+  }
+
+  path[0] = '\0';
+  if (depth == 0)
+    strlcat(path, "/", path_len);
+  for (int i = 0; i < depth; i++) {
+    strlcat(path, "/", path_len);
+    strlcat(path, stack[i], path_len);
+  }
+
+  kfree(tmp);
+}
 
 /* Resolves `path` into a NUL-terminated absolute path string written
  * into `out` (capacity out_len), using `base` (captured by
@@ -203,10 +252,10 @@ static bool resolve_dfd_path(int dfd, struct path *out) {
  * to its absolute path via d_path() and string-concatenates the
  * (still possibly containing "." / ".." components) relative
  * remainder onto it. That's sufficient for behavior.c's prefix/
- * substring matching and exec_path self-delete comparison - the
- * literal path components a caller supplied are still present in the
- * resulting string, just not collapsed - but note it for what it is:
- * a pragmatic partial resolution, not a canonical realpath(). On any
+ * substring matching and exec_path self-delete comparison once
+ * normalize_abs_path() (below) collapses those components - lexical
+ * normalization only, not a canonical realpath() (no symlink
+ * resolution, no filesystem access to confirm anything exists). On any
  * failure this falls back to copying `path` through unresolved rather
  * than dropping the event - a degraded (pre-fix) check on this one
  * call is better than silently skipping it. */
@@ -217,6 +266,7 @@ static void resolve_absolute_path(const char *path, const struct path *base,
 
   if (path[0] == '/') {
     strscpy(out, path, out_len);
+    normalize_abs_path(out, out_len);
     return;
   }
 
@@ -229,8 +279,10 @@ static void resolve_absolute_path(const char *path, const struct path *base,
   dirpath = d_path(base, tmp, PATH_MAX);
   if (IS_ERR(dirpath))
     strscpy(out, path, out_len);
-  else
+  else {
     snprintf(out, out_len, "%s/%s", dirpath, path);
+    normalize_abs_path(out, out_len);
+  }
 
   kfree(tmp);
 }

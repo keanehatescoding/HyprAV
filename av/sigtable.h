@@ -21,9 +21,13 @@ enum av_algo {
 
 /* All three digests of one file, computed together in a single read
  * pass (see hash_file_multi() in main.c). */
+
 struct av_digest {
+  /* cppcheck-suppress unusedStructMember */
   char md5[33];
+  /* cppcheck-suppress unusedStructMember */
   char sha1[41];
+  /* cppcheck-suppress unusedStructMember */
   char sha256[65];
 };
 
