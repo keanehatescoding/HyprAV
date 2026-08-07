@@ -77,6 +77,7 @@
 #include <linux/pid.h>
 #include <linux/file.h>
 #include <linux/dcache.h>
+#include <linux/kdev_t.h>
 
 #include "sigtable.h"
 #include "netlink_proto.h"
@@ -263,6 +264,20 @@ struct algo_ctx {
     char *digest_hex;   /* points into the matching field of av_digest */
 };
 
+/* Captures the identity of the file that was ACTUALLY opened and
+ * hashed by hash_file_multi(), so a signature/daemon verdict can be
+ * logged against something more forensically specific than a path
+ * string alone. This does NOT close the TOCTOU described on
+ * av_work_fn() below - it's captured well after the real exec already
+ * happened, from our own (possibly-already-raced) open - it just makes
+ * a post-incident "was this really the file that ran" check possible
+ * from the dmesg record instead of impossible. */
+struct av_file_identity {
+    dev_t dev;
+    unsigned long ino;
+    loff_t size;
+};
+
 static void bin_to_hex(const u8 *bin, size_t bin_len, char *hex_out)
 {
     size_t i;
@@ -309,9 +324,13 @@ static struct file *open_exec_target(const char *path, const struct path *pwd)
 }
 
 /* Computes MD5, SHA-1, and SHA-256 of the file at `path` in a single
- * read pass. MUST be called from a sleepable (process) context only. */
+ * read pass. MUST be called from a sleepable (process) context only.
+ * `ident_out` (optional, may be NULL) is filled in with the identity
+ * of the file actually opened - see struct av_file_identity above and
+ * the TOCTOU note on av_work_fn(). */
 static int hash_file_multi(const char *path, const struct path *pwd,
-                            struct av_digest *out)
+                            struct av_digest *out,
+                            struct av_file_identity *ident_out)
 {
     struct file *f;
     u8 md5_bin[16], sha1_bin[20], sha256_bin[32];
@@ -343,6 +362,18 @@ static int hash_file_multi(const char *path, const struct path *pwd,
     if (i_size_read(file_inode(f)) > MAX_HASH_FILE_SIZE) {
         ret = -EFBIG;
         goto out;
+    }
+
+    /* Identity of the file we're about to hash - captured here, right
+     * after confirming it's a regular file we're actually going to
+     * read, so it reflects the exact inode the digest below was
+     * computed from. */
+    if (ident_out) {
+        struct inode *inode = file_inode(f);
+
+        ident_out->dev = inode->i_sb->s_dev;
+        ident_out->ino = inode->i_ino;
+        ident_out->size = i_size_read(inode);
     }
 
     for (i = 0; i < 3; i++) {
@@ -409,7 +440,8 @@ out:
  * parseable for any future log aggregation. Kept on one line per
  * event deliberately. */
 static void av_kill(struct pid *target_pid, const char *path,
-                     const char *type, const char *reason)
+                     const char *type, const char *reason,
+                     const struct av_file_identity *ident)
 {
     struct task_struct *task;
 
@@ -423,19 +455,50 @@ static void av_kill(struct pid *target_pid, const char *path,
     task = pid_task(target_pid, PIDTYPE_PID);
     if (task) {
         pr_alert("kernel-av: event=detected action=kill type=%s "
-                 "path=\"%s\" reason=\"%s\" pid=%d\n",
-                 type, path, reason, pid_nr(target_pid));
+                 "path=\"%s\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
+                 type, path, reason, pid_nr(target_pid),
+                 MAJOR(ident->dev), MINOR(ident->dev), ident->ino,
+                 (long long)ident->size);
         send_sig(SIGKILL, task, 0);
     }
     rcu_read_unlock();
 }
 
 /* Runs in a kernel worker thread - safe to sleep, do file I/O, use
- * GFP_KERNEL. This is where all "heavy" work happens. */
+ * GFP_KERNEL. This is where all "heavy" work happens.
+ *
+ * KNOWN TOCTOU (see review item #3 / README): by the time this runs,
+ * the real execve() already completed and the target process is
+ * already running - the kernel resolved and mapped ITS OWN copy of
+ * the executable well before this workqueue item was even scheduled.
+ * hash_file_multi() below does a SEPARATE, LATER open of `aw->path`
+ * (resolved against the cwd captured back in handler_pre() - see
+ * av_work's pwd field) to compute a hash for the signature/daemon
+ * check. Nothing guarantees these are the same inode: an attacker who
+ * can win the race (replace the file, or repoint a symlink in the
+ * path, between the real exec and this open) can make the signature
+ * check run against a swapped-in decoy while their actual malicious
+ * code is already executing, undetected. This is inherent to the
+ * defer-to-workqueue design (see the ARCHITECTURE NOTE at the top of
+ * this file - hashing can't happen in the atomic kprobe path) and
+ * can't be closed from a kprobe on the syscall boundary; genuinely
+ * closing it means moving to a hook with access to the kernel's own
+ * already-resolved struct file for the exec (e.g. an LSM
+ * bprm_check_security hook), which is a real redesign, not a patch.
+ * Two things this file does instead, short of that redesign: (1)
+ * av_file_identity below records exactly which inode was hashed, so a
+ * post-incident dmesg review can at least tell whether that inode
+ * still matches what's on disk; (2) O_NOFOLLOW was deliberately NOT
+ * added to open_exec_target() - it would only guard the narrow case
+ * where the final path component itself is a symlink, at the cost of
+ * breaking hashing for every LEGITIMATELY symlinked binary (/usr/bin/
+ * python and friends), while doing nothing for a same-path file
+ * replacement, which is the more general form of this race. */
 static void av_work_fn(struct work_struct *w)
 {
     struct av_work *aw = container_of(w, struct av_work, work);
     struct av_digest digest;
+    struct av_file_identity ident;
     char sig_name[AV_SIG_NAME_LEN];
     char reason[AV_SIG_NAME_LEN + 32];
     char *abs_path;
@@ -459,7 +522,7 @@ static void av_work_fn(struct work_struct *w)
     }
     resolve_absolute_path(aw->path, &aw->pwd, abs_path, PATH_MAX);
 
-    ret = hash_file_multi(aw->path, &aw->pwd, &digest);
+    ret = hash_file_multi(aw->path, &aw->pwd, &digest, &ident);
     if (ret) {
         /* Couldn't open/hash it (permissions, already gone, etc.) -
          * not the job of the signature path, just skip. */
@@ -474,7 +537,7 @@ static void av_work_fn(struct work_struct *w)
 
     if (av_sigtable_match(&digest, sig_name, sizeof(sig_name))) {
         snprintf(reason, sizeof(reason), "signature:%s", sig_name);
-        av_kill(aw->target_pid, abs_path, "signature", reason);
+        av_kill(aw->target_pid, abs_path, "signature", reason, &ident);
         goto out;
     }
 
@@ -495,7 +558,7 @@ static void av_work_fn(struct work_struct *w)
                                           DAEMON_TIMEOUT_MS);
         if (nl_ret == 0 && verdict == AV_VERDICT_MALICIOUS) {
             snprintf(reason, sizeof(reason), "daemon:%s", rule_name);
-            av_kill(aw->target_pid, abs_path, "daemon", reason);
+            av_kill(aw->target_pid, abs_path, "daemon", reason, &ident);
         } else if (nl_ret == 0) {
             /* pr_info_ratelimited, not plain pr_info: this fires for
              * every exec that reaches the daemon path (i.e. every
@@ -510,9 +573,10 @@ static void av_work_fn(struct work_struct *w)
              * capping it to the kernel's default rate limit
              * (10 msgs/5s) instead of one line per exec. */
             pr_info_ratelimited("kernel-av: event=clean type=daemon path=\"%s\" "
-                    "pid=%d md5=%s sha1=%s sha256=%s\n",
+                    "pid=%d md5=%s sha1=%s sha256=%s dev=%u:%u ino=%lu\n",
                     abs_path, pid_nr(aw->target_pid),
-                    digest.md5, digest.sha1, digest.sha256);
+                    digest.md5, digest.sha1, digest.sha256,
+                    MAJOR(ident.dev), MINOR(ident.dev), ident.ino);
         } else {
             /* -ENOTCONN (no daemon), -ETIMEDOUT, or another error -
              * fail open, but log distinctly so this is visible/greppable
