@@ -85,6 +85,11 @@
 #include "sigtable.h"
 
 #define HOOKED_SYSCALL_NAME "__x64_sys_execve" /* see README re: arch */
+#define HOOKED_SYSCALLAT_NAME                                                  \
+  "__x64_sys_execveat" /* see README re: arch -                                \
+                        * same x86_64-only caveat as                           \
+                        * HOOKED_SYSCALL_NAME; the arm64                       \
+                        * equivalent is __arm64_sys_execveat. */
 #define READ_CHUNK_SIZE 4096
 #define MAX_HASH_FILE_SIZE                                                     \
   (256 * 1024 * 1024) /* 256 MB cap on what                                    \
@@ -122,6 +127,9 @@
 
 static struct kprobe kp_execve = {
     .symbol_name = HOOKED_SYSCALL_NAME,
+};
+static struct kprobe kp_execveat = {
+    .symbol_name = HOOKED_SYSCALLAT_NAME,
 };
 static struct kprobe kp_openat = {
     .symbol_name = "__x64_sys_openat",
@@ -713,6 +721,78 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 
   return 0;
 }
+/* execveat(2): int execveat(int dirfd, const char *pathname,
+ * char *const argv[], char *const envp[], int flags). x86_64 syscall
+ * argument order puts dirfd in the first slot (real_regs->di) and
+ * pathname in the second (real_regs->si) - same slot pattern as
+ * openat's dfd/filename below, NOT the same as execve's filename-only
+ * first slot. Reuses struct av_work / av_work_fn unchanged: the only
+ * difference from handler_pre() is that the base directory for a
+ * relative pathname comes from resolving `dirfd` (AT_FDCWD or a real
+ * fd, via resolve_dfd_path() - see openat/unlink for the identical
+ * pattern) instead of unconditionally being the calling process's cwd.
+ *
+ * Without this hook, execveat() was a complete bypass of every
+ * exec-based check: no hash/signature match, no daemon scan, and no
+ * av_behavior_record_exec() call - so the self-delete heuristic lost
+ * its exec_path key for anything launched this way too. This is the
+ * syscall containers, some language runtimes, and memfd_create()+
+ * execveat() fileless-exec loaders actually use, so it's not a
+ * theoretical gap. Doesn't attempt to special-case the AT_EMPTY_PATH
+ * fd-only-exec form (flags argument, real_regs->r8) - that path
+ * fexecve()-style callers use still queues work with whatever
+ * (possibly empty) pathname string glibc passed, and hash_file_multi()
+ * further down already opens by resolved path rather than by fd, so
+ * an AT_EMPTY_PATH caller currently just fails to hash cleanly rather
+ * than silently bypassing detection - worth hardening as a follow-up
+ * but not a bypass in the meantime. */
+static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
+  const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
+  const char __user *user_filename;
+  struct av_work *aw;
+  struct path base;
+  int dfd;
+
+  if (!real_regs)
+    return 0;
+
+  user_filename = (const char __user *)real_regs->si;
+  if (!user_filename)
+    return 0;
+
+  dfd = (int)real_regs->di;
+
+  /* Resolve dfd BEFORE allocating/copying anything else - same
+   * ordering as handler_pre_openat() and for the same reason: a
+   * bogus/already-closed fd racing the syscall leaves nothing
+   * useful to queue work for. */
+  if (!resolve_dfd_path(dfd, &base))
+    return 0;
+
+  aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
+  if (!aw) {
+    path_put(&base);
+    return 0;
+  }
+  aw->pwd = base;
+
+  {
+    ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
+
+    if (path_len <= 0 || path_len >= PATH_MAX) {
+      path_put(&aw->pwd);
+      kfree(aw);
+      return 0;
+    }
+  }
+
+  aw->target_pid = get_task_pid(current, PIDTYPE_PID);
+  aw->tgid = task_tgid_nr(current);
+  INIT_WORK(&aw->work, av_work_fn);
+  queue_work(av_wq, &aw->work);
+
+  return 0;
+}
 
 /* ---- openat: write-intent open tracking (rapid modification +
  * sensitive-path-write heuristics) ---- */
@@ -1137,11 +1217,18 @@ static int __init av_init(void) {
     goto err_netlink;
   }
 
+  kp_execveat.pre_handler = handler_pre_execveat;
+  ret = register_kprobe(&kp_execveat);
+  if (ret < 0) {
+    pr_err("kernel-av: register_kprobe(execveat) failed: %d\n", ret);
+    goto err_kp_execve;
+  }
+
   kp_openat.pre_handler = handler_pre_openat;
   ret = register_kprobe(&kp_openat);
   if (ret < 0) {
     pr_err("kernel-av: register_kprobe(openat) failed: %d\n", ret);
-    goto err_kp_execve;
+    goto err_kp_execveat;
   }
 
   kp_unlink.pre_handler = handler_pre_unlink;
@@ -1192,6 +1279,8 @@ err_kp_unlink:
   unregister_kprobe(&kp_unlink);
 err_kp_openat:
   unregister_kprobe(&kp_openat);
+err_kp_execveat:
+  unregister_kprobe(&kp_execveat);
 err_kp_execve:
   unregister_kprobe(&kp_execve);
 err_netlink:
@@ -1214,6 +1303,7 @@ static void __exit av_exit(void) {
   unregister_kprobe(&kp_unlinkat);
   unregister_kprobe(&kp_unlink);
   unregister_kprobe(&kp_openat);
+  unregister_kprobe(&kp_execveat);
   unregister_kprobe(&kp_execve);
   /* destroy_workqueue() flushes all pending work first, so no work
    * item can run against unloaded module .text after this returns. */
