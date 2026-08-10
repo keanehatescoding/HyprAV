@@ -22,6 +22,16 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# A module MUST be built with the same compiler family as the running
+# kernel (see the top-level README's toolchain section and
+# test_detection.sh). Detect it the same way test_detection.sh does,
+# rather than inheriting CC/LLVM from the environment.
+MAKE_ARGS=()
+if grep -q "clang version" /proc/version 2>/dev/null; then
+    echo "Detected a Clang-built running kernel ($(uname -r)) - building with CC=clang LLVM=1"
+    MAKE_ARGS=(CC=clang LLVM=1)
+fi
+
 echo "=== Building benchmark harness ==="
 cat > /tmp/av_bench_harness.c << 'EOF'
 /* Small timing harness: N iterations of fork+execve+wait (/bin/true),
@@ -86,7 +96,7 @@ rmmod av 2>/dev/null || true
 
 echo
 echo "=== Loading module ==="
-make -C "$REPO_ROOT/av" >/dev/null
+make -C "$REPO_ROOT/av" "${MAKE_ARGS[@]}" >/dev/null
 insmod "$REPO_ROOT/av/av.ko"
 sleep 1
 

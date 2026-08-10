@@ -11,3 +11,4 @@ Module.symvers
 modules.order
 userspace/avctl/avctl
 userspace/avd/avd
+av/compile_commands.json

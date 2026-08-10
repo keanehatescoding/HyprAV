@@ -214,6 +214,7 @@ static void normalize_abs_path(char *path, size_t path_len) {
   char *stack[128];
   int depth = 0;
   char *tmp, *saveptr, *tok;
+  bool overflowed = false;
 
   tmp = kstrdup(path, GFP_KERNEL);
   if (!tmp)
@@ -228,8 +229,26 @@ static void normalize_abs_path(char *path, size_t path_len) {
         depth--;
       continue;
     }
-    if (depth < ARRAY_SIZE(stack))
+    if (depth < ARRAY_SIZE(stack)) {
       stack[depth++] = tok;
+    } else {
+      /* Path has more components than we can track. Silently
+       * dropping the excess would collapse two genuinely different
+       * deep paths onto the same normalized string (e.g. two
+       * distinct files under a shared >128-component prefix), which
+       * downstream self-delete/trust checks treat as identity via
+       * strcmp. Bail out instead of producing a lossy, potentially
+       * colliding result - leave `path` untouched (still the
+       * original, un-normalized string) so callers compare the real
+       * path rather than a truncated stand-in. */
+      overflowed = true;
+      break;
+    }
+  }
+
+  if (overflowed) {
+    kfree(tmp);
+    return;
   }
 
   path[0] = '\0';

@@ -2,8 +2,8 @@
 #
 # .githooks/pre-push - runs the full build+load+detect+unload test suite
 # before anything leaves your machine, but ONLY when the push actually
-# touches av/ or userspace/avctl/ - a docs-only push shouldn't insmod a
-# kernel module.
+# touches av/, userspace/avctl/, or userspace/avd/ - a docs-only push
+# shouldn't insmod a kernel module.
 #
 # This needs sudo (insmod/rmmod) and should only run inside your VM.
 #
@@ -36,12 +36,12 @@ while read -r _ local_sha _ remote_sha; do
 $files"
 done
 
-if ! printf '%s' "$CHANGED_FILES" | grep -qE '^(av/|userspace/avctl/)'; then
-    echo "pre-push: no changes under av/ or userspace/avctl/ - skipping test suite"
+if ! printf '%s' "$CHANGED_FILES" | grep -qE '^(av/|userspace/avctl/|userspace/avd/)'; then
+    echo "pre-push: no changes under av/, userspace/avctl/, or userspace/avd/ - skipping test suite"
     exit 0
 fi
 
-echo "==> pre-push: changes detected in av/ or userspace/avctl/"
+echo "==> pre-push: changes detected in av/, userspace/avctl/, or userspace/avd/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
 if ! sudo -v; then
