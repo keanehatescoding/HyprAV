@@ -36,7 +36,7 @@ jobs:
 
       - name: Open PR if the matrix changed
         if: steps.update.outputs.changed == 'true'
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: "ci: bump kernel matrix versions to current kernel.org releases"
           title: "ci: bump kernel matrix versions"
