@@ -152,6 +152,42 @@ static struct kprobe kp_renameat2 = {
 
 static struct workqueue_struct *av_wq;
 
+/* Bound on struct av_work / av_openat_work / av_unlink_work /
+ * av_rename_work allocations currently in flight - kmalloc'd by a
+ * kprobe *_pre handler in atomic context, not yet kfree'd by the
+ * matching *_work_fn() once it runs on av_wq. Each of these structs
+ * carries one or two PATH_MAX buffers, so with no cap here a fast
+ * unlink/rename/openat storm (rm -rf on a big tree, a git checkout,
+ * a container build, or an attacker's own loop) queues an unbounded
+ * number of GFP_ATOMIC allocations - gigabytes off the atomic
+ * reserves - before a single item is drained by the workqueue.
+ * Past this bound, handlers fail open (skip the event, exec/open/
+ * unlink/rename proceeds unobserved) rather than allocate further -
+ * a handful of dropped behavioral events under extreme, sustained
+ * load is a far smaller risk than exhausting atomic memory
+ * system-wide, which affects every other kernel subsystem too. */
+#define AV_MAX_INFLIGHT_WORK 4096
+static atomic_t av_inflight_work = ATOMIC_INIT(0);
+
+/* Call before allocating a *_work struct in a *_pre handler. Returns
+ * true if under the cap (caller may proceed to kmalloc); false if at
+ * or over it (caller must skip the event without allocating). Must be
+ * paired with exactly one av_work_release() call on every path that
+ * follows a true return, whether the *_pre handler bails out early
+ * afterward (validation failure) or the work item runs to completion
+ * on the workqueue. */
+static inline bool av_work_admit(void) {
+  if (atomic_inc_return(&av_inflight_work) > AV_MAX_INFLIGHT_WORK) {
+    atomic_dec(&av_inflight_work);
+    return false;
+  }
+  return true;
+}
+
+static inline void av_work_release(void) {
+  atomic_dec(&av_inflight_work);
+}
+
 /* Resolves a syscall's `dfd` argument into a struct path suitable as
  * the base for a later relative-path lookup, mirroring the get_fs_pwd()
  * capture execve's handler_pre() already did. Callable from ATOMIC
@@ -614,6 +650,7 @@ static void av_work_fn(struct work_struct *w) {
     path_put(&aw->pwd);
     put_pid(aw->target_pid);
     kfree(aw);
+    av_work_release();
     return;
   }
   resolve_absolute_path(aw->path, &aw->pwd, abs_path, PATH_MAX);
@@ -688,6 +725,7 @@ out:
   path_put(&aw->pwd);
   put_pid(aw->target_pid);
   kfree(aw);
+  av_work_release();
 }
 
 /* Atomic context - the ONLY things allowed here: copying small amounts
@@ -704,9 +742,14 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
   if (!user_filename)
     return 0;
 
-  aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
-  if (!aw)
+  if (!av_work_admit())
     return 0;
+
+  aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
+  if (!aw) {
+    av_work_release();
+    return 0;
+  }
 
   /* strncpy_from_user() returns the copied length (excluding NUL) on
    * success, a negative errno on fault - but if the source string is
@@ -721,6 +764,7 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
 
     if (path_len <= 0 || path_len >= PATH_MAX) {
       kfree(aw);
+      av_work_release();
       return 0;
     }
   }
@@ -788,9 +832,15 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   if (!resolve_dfd_path(dfd, &base))
     return 0;
 
+  if (!av_work_admit()) {
+    path_put(&base);
+    return 0;
+  }
+
   aw = kmalloc(sizeof(*aw), GFP_ATOMIC);
   if (!aw) {
     path_put(&base);
+    av_work_release();
     return 0;
   }
   aw->pwd = base;
@@ -801,6 +851,7 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
     if (path_len <= 0 || path_len >= PATH_MAX) {
       path_put(&aw->pwd);
       kfree(aw);
+      av_work_release();
       return 0;
     }
   }
@@ -846,6 +897,7 @@ static void av_openat_work_fn(struct work_struct *w) {
     path_put(&ow->base);
     put_pid(ow->target_pid);
     kfree(ow);
+    av_work_release();
     return;
   }
 
@@ -856,6 +908,7 @@ static void av_openat_work_fn(struct work_struct *w) {
   path_put(&ow->base);
   put_pid(ow->target_pid);
   kfree(ow);
+  av_work_release();
 }
 
 /* openat(int dfd, const char *filename, int flags, umode_t mode) - on
@@ -903,9 +956,15 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
   if (!resolve_dfd_path(dfd, &base))
     return 0;
 
+  if (!av_work_admit()) {
+    path_put(&base);
+    return 0;
+  }
+
   ow = kmalloc(sizeof(*ow), GFP_ATOMIC);
   if (!ow) {
     path_put(&base);
+    av_work_release();
     return 0;
   }
   ow->base = base;
@@ -916,6 +975,7 @@ static int handler_pre_openat(struct kprobe *p, struct pt_regs *regs) {
     if (path_len <= 0 || path_len >= PATH_MAX) {
       path_put(&ow->base);
       kfree(ow);
+      av_work_release();
       return 0;
     }
   }
@@ -954,6 +1014,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
     path_put(&uw->base);
     put_pid(uw->target_pid);
     kfree(uw);
+    av_work_release();
     return;
   }
 
@@ -964,6 +1025,7 @@ static void av_unlink_work_fn(struct work_struct *w) {
   path_put(&uw->base);
   put_pid(uw->target_pid);
   kfree(uw);
+  av_work_release();
 }
 
 /* `dfd` should be AT_FDCWD for plain unlink() (no base fd of its own -
@@ -982,9 +1044,15 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
   if (!resolve_dfd_path(dfd, &base))
     return 0;
 
+  if (!av_work_admit()) {
+    path_put(&base);
+    return 0;
+  }
+
   uw = kmalloc(sizeof(*uw), GFP_ATOMIC);
   if (!uw) {
     path_put(&base);
+    av_work_release();
     return 0;
   }
   uw->base = base;
@@ -995,6 +1063,7 @@ static int schedule_unlink_work(const char __user *user_path, int dfd) {
     if (path_len <= 0 || path_len >= PATH_MAX) {
       path_put(&uw->base);
       kfree(uw);
+      av_work_release();
       return 0;
     }
   }
@@ -1067,6 +1136,7 @@ static void av_rename_work_fn(struct work_struct *w) {
     path_put(&rw->new_base);
     put_pid(rw->target_pid);
     kfree(rw);
+    av_work_release();
     return;
   }
   abs_new = kmalloc(PATH_MAX, GFP_KERNEL);
@@ -1076,6 +1146,7 @@ static void av_rename_work_fn(struct work_struct *w) {
     path_put(&rw->new_base);
     put_pid(rw->target_pid);
     kfree(rw);
+    av_work_release();
     return;
   }
 
@@ -1089,6 +1160,7 @@ static void av_rename_work_fn(struct work_struct *w) {
   path_put(&rw->new_base);
   put_pid(rw->target_pid);
   kfree(rw);
+  av_work_release();
 }
 
 /* `olddfd`/`newdfd` should each be AT_FDCWD for rename() (no dfd args
@@ -1112,10 +1184,17 @@ static int schedule_rename_work(const char __user *user_oldpath, int olddfd,
     return 0;
   }
 
+  if (!av_work_admit()) {
+    path_put(&old_base);
+    path_put(&new_base);
+    return 0;
+  }
+
   rw = kmalloc(sizeof(*rw), GFP_ATOMIC);
   if (!rw) {
     path_put(&old_base);
     path_put(&new_base);
+    av_work_release();
     return 0;
   }
   rw->old_base = old_base;
@@ -1129,6 +1208,7 @@ static int schedule_rename_work(const char __user *user_oldpath, int olddfd,
       path_put(&rw->old_base);
       path_put(&rw->new_base);
       kfree(rw);
+      av_work_release();
       return 0;
     }
     path_len = strncpy_from_user(rw->newpath, user_newpath, PATH_MAX);
@@ -1136,6 +1216,7 @@ static int schedule_rename_work(const char __user *user_oldpath, int olddfd,
       path_put(&rw->old_base);
       path_put(&rw->new_base);
       kfree(rw);
+      av_work_release();
       return 0;
     }
   }
@@ -1216,7 +1297,16 @@ static int __init av_init(void) {
     goto err_proc;
   }
 
-  av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, 0);
+  /* max_active bounded to AV_WQ_MAX_ACTIVE rather than 0 (per-CPU
+   * default, effectively unbounded for WQ_UNBOUND at this queue's
+   * volume) - caps how many *_work_fn instances run concurrently
+   * across all CPUs, so a burst (build, checkout, rm -rf) can't spin
+   * up hundreds of worker threads all doing PATH_MAX kmallocs and
+   * path resolution at once. Pending items beyond that still queue
+   * (bounded separately by av_inflight_work / AV_MAX_INFLIGHT_WORK
+   * above) and drain as workers free up, rather than being dropped. */
+#define AV_WQ_MAX_ACTIVE 32
+  av_wq = alloc_workqueue("kernel_av_wq", WQ_UNBOUND, AV_WQ_MAX_ACTIVE);
   if (!av_wq) {
     pr_err("kernel-av: failed to allocate workqueue\n");
     ret = -ENOMEM;
