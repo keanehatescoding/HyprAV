@@ -249,15 +249,37 @@ static int do_trust(int argc, char **argv)
         return do_trust_list();
     } else if (!strcmp(argv[2], "add")) {
         char cmd[256];
+        char name[192];
+        size_t off = 0;
+        int i;
 
         if (argc < 5) {
             usage(argv[0]);
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "add %s %s", argv[3], argv[4]);
+
+        /* Join every remaining argv[] into one space-separated name
+         * instead of using only argv[4] - the kernel side's
+         * trust_proc_write() already parses the rest of the line as
+         * the name via "%63[^\n]" (save/load round-trip multi-word
+         * names fine through that same path), so an unquoted
+         * multi-word name like `avctl trust add <hash> My Program`
+         * was silently losing everything after the first word only
+         * because avctl itself dropped it before it ever reached the
+         * kernel. */
+        name[0] = '\0';
+        for (i = 4; i < argc && off < sizeof(name) - 1; i++) {
+            int n = snprintf(name + off, sizeof(name) - off, "%s%s",
+                              i > 4 ? " " : "", argv[i]);
+            if (n < 0)
+                break;
+            off += (size_t)n;
+        }
+
+        snprintf(cmd, sizeof(cmd), "add %s %s", argv[3], name);
         if (write_command_to(TRUST_PROC_PATH, cmd))
             return 1;
-        printf("trusted: %s (%s)\n", argv[3], argv[4]);
+        printf("trusted: %s (%s)\n", argv[3], name);
     } else if (!strcmp(argv[2], "del")) {
         char cmd[256];
 

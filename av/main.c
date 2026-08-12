@@ -588,10 +588,26 @@ static void av_kill(struct pid *target_pid, const char *path, const char *type,
   rcu_read_lock();
   task = pid_task(target_pid, PIDTYPE_PID);
   if (task) {
-    pr_alert("kernel-av: event=detected action=kill type=%s "
-             "path=\"%s\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
-             type, path, reason, pid_nr(target_pid), MAJOR(ident->dev),
-             MINOR(ident->dev), ident->ino, (long long)ident->size);
+    /* The only current callers always pass &ident (a local struct,
+     * never NULL) - but av_kill() takes a pointer and this is a
+     * module that SIGKILLs things, so a cheap guard against a future
+     * caller passing NULL (or ident becoming optional) is worth it
+     * over a kernel NULL-deref here. Falls back to a log line
+     * without the dev/ino/size identity fields rather than skipping
+     * the kill - inconclusive identity info doesn't mean don't act
+     * on the type/reason that got us to av_kill() in the first
+     * place. */
+    if (ident) {
+      pr_alert(
+          "kernel-av: event=detected action=kill type=%s "
+          "path=\"%s\" reason=\"%s\" pid=%d dev=%u:%u ino=%lu size=%lld\n",
+          type, path, reason, pid_nr(target_pid), MAJOR(ident->dev),
+          MINOR(ident->dev), ident->ino, (long long)ident->size);
+    } else {
+      pr_alert("kernel-av: event=detected action=kill type=%s "
+               "path=\"%s\" reason=\"%s\" pid=%d\n",
+               type, path, reason, pid_nr(target_pid));
+    }
     send_sig(SIGKILL, task, 0);
   }
   rcu_read_unlock();

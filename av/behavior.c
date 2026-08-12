@@ -460,6 +460,31 @@ static struct av_behavior_entry *get_or_create_entry(pid_t pid) {
   return e;
 }
 
+/* strstr() alone treats "/etc/passwd" as a substring match against
+ * "/etc/passwd.bak", "/etc/passwd.new", or any other .../etc/passwd*
+ * path - not just the real file. Since this feeds a heuristic that
+ * can get a process killed (path_is_sensitive() below, via
+ * av_behavior_check_openat()/_unlink()/_rename()), a backup/staging
+ * file with the real name as a prefix shouldn't count as touching
+ * the sensitive path itself. Requires a '/' or end-of-string right
+ * after the match - i.e. the matched segment has to be a complete
+ * path component, not merely a prefix of one. Needles that already
+ * end in '/' (like "/.ssh/") are self-anchored on that side by
+ * construction - a false positive on this side of a
+ * "/.ssh/id_rsa"-style match structurally can't happen. */
+static bool path_has_bounded_substring(const char *path, const char *needle) {
+  size_t needle_len = strlen(needle);
+  bool self_anchored = needle_len > 0 && needle[needle_len - 1] == '/';
+  const char *p = path;
+
+  while ((p = strstr(p, needle)) != NULL) {
+    if (self_anchored || p[needle_len] == '\0' || p[needle_len] == '/')
+      return true;
+    p++;
+  }
+  return false;
+}
+
 static bool path_is_sensitive(const char *path) {
   size_t i;
 
@@ -471,7 +496,7 @@ static bool path_is_sensitive(const char *path) {
   }
 
   for (i = 0; i < NUM_SENSITIVE_SUBSTRINGS; i++) {
-    if (strstr(path, sensitive_path_substrings[i]))
+    if (path_has_bounded_substring(path, sensitive_path_substrings[i]))
       return true;
   }
   return false;
