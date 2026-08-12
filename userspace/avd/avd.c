@@ -51,6 +51,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -75,6 +76,21 @@
 #define DEFAULT_QUARANTINE_DIR "/var/lib/av-quarantine"
 #define SCAN_TIMEOUT_SECS 10
 #define MALICIOUS_SCORE_THRESHOLD 100
+/* handle_scan_request() (YARA scan, up to SCAN_TIMEOUT_SECS, plus the
+ * fuzzy-hash pass) used to run synchronously inside msg_handler(),
+ * called directly from the single nl_recvmsgs_default() loop in
+ * main(). A second SCAN_REQUEST arriving while a scan was in
+ * progress got no verdict at all until the first one finished - the
+ * kernel side's own DAEMON_TIMEOUT_MS would then fire and fail open,
+ * so any burst of concurrent execs (or an attacker deliberately
+ * racing many at once) silently dropped detection to zero for
+ * everything but the first. Fixed by moving the scan itself onto a
+ * fixed-size worker pool (AVD_SCAN_THREADS) fed by a bounded queue
+ * (AVD_SCAN_QUEUE_MAX) - msg_handler() now only copies the request
+ * and enqueues it, keeping the netlink recv loop free to keep
+ * accepting new requests while scans run in parallel. */
+#define AVD_SCAN_THREADS 8
+#define AVD_SCAN_QUEUE_MAX 256
 /* Sum of every matching rule's `weight` meta (see the .yar files under rules/)
  * has to clear this before avd convicts. Added after real testing killed
  * /usr/bin/zsh, /bin/sh, and /usr/bin/uwsm - all legitimate binaries that each
@@ -105,6 +121,41 @@ static struct nl_sock *sock;
 static int family_id;
 static volatile sig_atomic_t running = 1;
 static YR_RULES *compiled_rules;
+
+/* nl_send_auto() touches `sock`'s internal sequence-number/port state,
+ * which libnl does not guarantee is safe for concurrent callers - so
+ * every send_verdict() call (now potentially from any of the
+ * AVD_SCAN_THREADS worker threads) takes this around the actual send.
+ * Held only around message construction+send, never around the scan
+ * itself, so contention is negligible. compiled_rules and
+ * fuzzy_corpus need no such lock: both are populated once at startup
+ * (load_rules()/load_fuzzy_corpus()) before any worker thread exists
+ * and are read-only from then on - yr_rules_scan_file() against a
+ * shared, unmodified YR_RULES is documented as safe for concurrent
+ * callers on that basis. */
+static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* Bounded producer/consumer queue between msg_handler() (the single
+ * netlink recv thread - producer) and the AVD_SCAN_THREADS scan
+ * workers (consumers). A linked list rather than a ring buffer since
+ * depth is small and this isn't a hot path relative to the scan
+ * itself. `shutting_down` lets both a full queue's producer-side wait
+ * and an empty queue's consumer-side wait unblock cleanly on
+ * SIGINT/SIGTERM instead of hanging the process past `running = 0`. */
+struct scan_task {
+  struct scan_task *next;
+  uint64_t reqid;
+  uint32_t pid;
+  char path[PATH_MAX];
+  char sha256_hex[65];
+};
+
+static struct scan_task *queue_head, *queue_tail;
+static size_t queue_len;
+static pthread_mutex_t queue_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t queue_not_empty = PTHREAD_COND_INITIALIZER;
+static pthread_cond_t queue_not_full = PTHREAD_COND_INITIALIZER;
+static bool shutting_down;
 
 static void handle_sigint(int signum) {
   (void)signum;
@@ -139,7 +190,9 @@ static int send_verdict(uint64_t reqid, uint8_t verdict,
   if (rule_name && rule_name[0])
     NLA_PUT_STRING(msg, AV_A_RULE_NAME, rule_name);
 
+  pthread_mutex_lock(&send_lock);
   ret = nl_send_auto(sock, msg);
+  pthread_mutex_unlock(&send_lock);
   nlmsg_free(msg);
 
   if (ret < 0) {
@@ -695,6 +748,88 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
   send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
 }
 
+/* Producer side (called only from msg_handler(), the netlink recv
+ * thread). Copies the request into a heap task and blocks if the
+ * queue is at AVD_SCAN_QUEUE_MAX rather than growing unbounded - this
+ * is deliberate backpressure: if every worker is busy and the queue
+ * is full, pausing the recv loop is no worse than the pre-fix
+ * behavior (a scan already blocked the loop outright), and the
+ * kernel's own DAEMON_TIMEOUT_MS still bounds how long any single
+ * request waits before that side fails open. Returns false only on
+ * shutdown or allocation failure, in which case the caller drops the
+ * request (matching this codebase's existing fail-open stance). */
+static bool enqueue_scan_task(uint64_t reqid, uint32_t pid, const char *path,
+                              const char *sha256_hex) {
+  struct scan_task *task = malloc(sizeof(*task));
+
+  if (!task)
+    return false;
+
+  task->next = NULL;
+  task->reqid = reqid;
+  task->pid = pid;
+  snprintf(task->path, sizeof(task->path), "%s", path ? path : "");
+  snprintf(task->sha256_hex, sizeof(task->sha256_hex), "%s",
+           sha256_hex ? sha256_hex : "");
+
+  pthread_mutex_lock(&queue_lock);
+  while (queue_len >= AVD_SCAN_QUEUE_MAX && !shutting_down)
+    pthread_cond_wait(&queue_not_full, &queue_lock);
+
+  if (shutting_down) {
+    pthread_mutex_unlock(&queue_lock);
+    free(task);
+    return false;
+  }
+
+  if (queue_tail)
+    queue_tail->next = task;
+  else
+    queue_head = task;
+  queue_tail = task;
+  queue_len++;
+  pthread_cond_signal(&queue_not_empty);
+  pthread_mutex_unlock(&queue_lock);
+
+  return true;
+}
+
+/* Consumer side - runs on each of the AVD_SCAN_THREADS worker
+ * threads. Blocks for work, exits once shutting_down is set AND the
+ * queue has drained (rather than abandoning whatever's still queued,
+ * since those requests are otherwise silently lost with no verdict
+ * sent). */
+static void *scan_worker_main(void *arg) {
+  (void)arg;
+
+  for (;;) {
+    struct scan_task *task;
+
+    pthread_mutex_lock(&queue_lock);
+    while (!queue_head && !shutting_down)
+      pthread_cond_wait(&queue_not_empty, &queue_lock);
+
+    if (!queue_head && shutting_down) {
+      pthread_mutex_unlock(&queue_lock);
+      break;
+    }
+
+    task = queue_head;
+    queue_head = task->next;
+    if (!queue_head)
+      queue_tail = NULL;
+    queue_len--;
+    pthread_cond_signal(&queue_not_full);
+    pthread_mutex_unlock(&queue_lock);
+
+    handle_scan_request(task->reqid, task->pid, task->path,
+                        task->sha256_hex);
+    free(task);
+  }
+
+  return NULL;
+}
+
 static struct nla_policy av_policy[AV_A_MAX + 1] = {
     [AV_A_REQID] = {.type = NLA_U64},
     [AV_A_PID] = {.type = NLA_U32},
@@ -718,11 +853,15 @@ static int msg_handler(struct nl_msg *msg, void *arg) {
       fprintf(stderr, "avd: malformed SCAN_REQUEST (missing attrs)\n");
       return NL_SKIP;
     }
-    handle_scan_request(nla_get_u64(attrs[AV_A_REQID]),
-                        attrs[AV_A_PID] ? nla_get_u32(attrs[AV_A_PID]) : 0,
-                        nla_get_string(attrs[AV_A_PATH]),
-                        attrs[AV_A_SHA256] ? nla_get_string(attrs[AV_A_SHA256])
-                                           : "");
+    if (!enqueue_scan_task(
+            nla_get_u64(attrs[AV_A_REQID]),
+            attrs[AV_A_PID] ? nla_get_u32(attrs[AV_A_PID]) : 0,
+            nla_get_string(attrs[AV_A_PATH]),
+            attrs[AV_A_SHA256] ? nla_get_string(attrs[AV_A_SHA256]) : ""))
+      fprintf(stderr,
+              "avd: dropped SCAN_REQUEST reqid=%llu (shutting down or "
+              "out of memory) - kernel side will fail open on timeout\n",
+              (unsigned long long)nla_get_u64(attrs[AV_A_REQID]));
   }
 
   return NL_OK;
@@ -818,15 +957,49 @@ int main(int argc, char **argv) {
   printf("avd: registered with kernel module (family id %d), listening...\n",
          family_id);
 
-  while (running) {
-    int ret = nl_recvmsgs_default(sock);
-    if (ret < 0 && ret != -NLE_INTR) {
-      fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n", nl_geterror(ret));
-      break;
+  {
+    pthread_t workers[AVD_SCAN_THREADS];
+    int i, spawned = 0;
+
+    for (i = 0; i < AVD_SCAN_THREADS; i++) {
+      if (pthread_create(&workers[i], NULL, scan_worker_main, NULL) != 0) {
+        fprintf(stderr, "avd: pthread_create failed for worker %d: %s\n", i,
+                strerror(errno));
+        break;
+      }
+      spawned++;
     }
+    if (spawned == 0) {
+      fprintf(stderr, "avd: no scan workers could be started - aborting\n");
+      nl_socket_free(sock);
+      return 1;
+    }
+    if (spawned < AVD_SCAN_THREADS)
+      fprintf(stderr,
+              "avd: only %d/%d scan workers started - continuing with "
+              "reduced concurrency\n",
+              spawned, AVD_SCAN_THREADS);
+
+    while (running) {
+      int ret = nl_recvmsgs_default(sock);
+      if (ret < 0 && ret != -NLE_INTR) {
+        fprintf(stderr, "avd: nl_recvmsgs_default error: %s\n",
+                nl_geterror(ret));
+        break;
+      }
+    }
+
+    printf("avd: shutting down, draining %zu queued scan(s)...\n", queue_len);
+    pthread_mutex_lock(&queue_lock);
+    shutting_down = true;
+    pthread_cond_broadcast(&queue_not_empty);
+    pthread_cond_broadcast(&queue_not_full);
+    pthread_mutex_unlock(&queue_lock);
+
+    for (i = 0; i < spawned; i++)
+      pthread_join(workers[i], NULL);
   }
 
-  printf("avd: shutting down\n");
   nl_socket_free(sock);
   if (compiled_rules)
     yr_rules_destroy(compiled_rules);

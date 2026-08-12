@@ -29,7 +29,7 @@ avd: avd.c ../../av/netlink_proto.h
 		exit 1; \
 	fi
 	@rm -f /tmp/.avd_fuzzy_check
-	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -o avd avd.c $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS)
+	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -o avd avd.c $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) -lpthread
 
 clean:
 	rm -f avd
