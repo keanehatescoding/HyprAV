@@ -17,12 +17,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Update these as kernel.org publishes new point releases.
-        # Format must match the tarball name exactly, e.g. 6.12.96.
+        # Auto-updated weekly by .github/workflows/update-kernel-matrix.yml
+        # (see .github/scripts/update-kernel-matrix.sh) - edits between the
+        # BEGIN/END markers get overwritten by that job, so hand-edit
+        # outside the markers if you need to add e.g. a one-off version.
         kernel_version:
+          # BEGIN kernel_version
           - "6.12.96"  # LTS
           - "6.18.21"  # LTS
-          - "7.1.4"    # current stable
+          - "7.1.4"  # current stable
+          # END kernel_version
         # A module generally must be built with the same compiler family
         # as the target kernel, especially under LTO/CFI configs - e.g.
         # CachyOS ships a Clang-built kernel variant. Rather than branch

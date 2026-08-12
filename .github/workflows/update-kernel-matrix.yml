@@ -1,0 +1,55 @@
+name: Update kernel matrix versions
+
+# Dependabot can't do this: there's no "kernel.org release" package
+# ecosystem, and unlike Renovate, Dependabot has no custom-regex manager
+# for arbitrary version strings inside a workflow file. This is the
+# hand-rolled equivalent, scoped to exactly the versions build-matrix.yml
+# actually needs - the 2 currently active (non-EOL) longterm/LTS branches
+# and the current stable release, re-derived from kernel.org's own EOL
+# flag every run rather than hardcoded, so it keeps working unchanged
+# once today's 6.12/6.18 lines are eventually retired.
+#
+# github-actions itself (actions/checkout, actions/cache, ...) IS a real
+# Dependabot ecosystem - that's handled separately via .github/dependabot.yml.
+
+on:
+  schedule:
+    # Weekly, matching kernel.org's own "stable releases roughly once a
+    # week" cadence (see kernel.org/category/releases.html) - more
+    # frequent than that wouldn't find anything new most runs.
+    - cron: "0 6 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-kernel-matrix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run update-kernel-matrix.sh
+        id: update
+        run: .github/scripts/update-kernel-matrix.sh
+
+      - name: Open PR if the matrix changed
+        if: steps.update.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "ci: bump kernel matrix versions to current kernel.org releases"
+          title: "ci: bump kernel matrix versions"
+          body: |
+            Automated update from `.github/scripts/update-kernel-matrix.sh`,
+            re-derived from https://www.kernel.org/releases.json:
+            - the 2 most recent non-EOL longterm (LTS) branches
+            - the current stable release
+
+            Review the diff in `build-matrix.yml` before merging - this PR
+            does not itself run the build-matrix workflow's kernel
+            build/smoke-test jobs; those run automatically once this PR
+            exists (see `on: pull_request` in build-matrix.yml).
+          branch: ci/update-kernel-matrix
+          labels: ci, dependencies
+          delete-branch: true

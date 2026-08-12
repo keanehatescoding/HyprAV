@@ -1,0 +1,13 @@
+version: 2
+updates:
+  # Keeps actions/checkout, actions/cache, actions/upload-artifact,
+  # peter-evans/create-pull-request, etc. up to date. This is the one
+  # part of "keep CI current" Dependabot actually covers natively -
+  # there's no equivalent ecosystem for the kernel.org release versions
+  # in build-matrix.yml's `kernel_version` matrix, which is why that's
+  # handled separately by .github/workflows/update-kernel-matrix.yml
+  # instead.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
