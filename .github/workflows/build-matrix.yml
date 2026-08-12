@@ -50,7 +50,7 @@ jobs:
 
       - name: Cache built kernel tree
         id: cache-kernel
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
           key: kernel-tree-v5-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
