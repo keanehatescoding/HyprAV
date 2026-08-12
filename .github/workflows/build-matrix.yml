@@ -34,7 +34,7 @@ jobs:
         # with the same compiler on each leg of this matrix.
         toolchain: [gcc, clang]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies (gcc)
         if: matrix.toolchain == 'gcc'
@@ -152,7 +152,7 @@ jobs:
   build-avctl:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build avctl
         run: make -C userspace/avctl
       - uses: actions/upload-artifact@v7
@@ -164,7 +164,7 @@ jobs:
   build-avd:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install libnl-genl, libyara, and libfuzzy
         run: |
           sudo apt-get update
