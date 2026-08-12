@@ -96,6 +96,32 @@ jobs:
             make -C av KDIR="$KDIR"
           fi
 
+      - name: Verify netlink_chan.o actually linked into av.ko
+        run: |
+          set -euxo pipefail
+          # A compile-only leg is only meaningful if every source file
+          # that's SUPPOSED to be in av.ko actually got compiled and
+          # linked in. genl_register_family()/genlmsg_*() (used by
+          # netlink_chan.c) don't sit behind a separate Kconfig symbol
+          # on current kernels - net/netlink/ (genetlink.c included) is
+          # unconditionally obj-y under net/Makefile, gated only by the
+          # CONFIG_NET this workflow already enables, and there is no
+          # "CONFIG_GENERIC_NETLINK" symbol in mainline to check for
+          # (confirmed by grepping every Kconfig* in torvalds/linux -
+          # it doesn't exist as a selectable option). So instead of
+          # checking a config bit that isn't real, check the actual
+          # thing that matters: that av_netlink_init() - a non-static
+          # function only defined in netlink_chan.c - shows up in the
+          # built module's symbol table. If a future kernel version
+          # ever *does* gate genetlink behind something this workflow
+          # doesn't enable, netlink_chan.c would fail to compile
+          # (missing genl_register_family() etc.) long before this
+          # step, and if it's silently excluded some other way, this
+          # is what catches it instead of a green compile-only build
+          # giving false confidence.
+          nm av/av.ko | grep -q ' T av_netlink_init$' || \
+            (echo "::error::av_netlink_init not found in av.ko - netlink_chan.o did not link in" && exit 1)
+
       - name: Build experiments/ against this kernel tree
         run: |
           set -euxo pipefail
