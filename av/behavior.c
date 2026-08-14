@@ -433,7 +433,15 @@ static void trust_table_destroy(void) {
   mutex_unlock(&trust_lock);
 }
 
-static u32 pid_key(pid_t pid) { return hash_32((u32)pid, BEHAVIOR_BITS); }
+/* Returns the raw key for hash_add()/hash_for_each_possible() to hash
+ * themselves via hash_min() - same convention as hex_key() above.
+ * Previously pre-hashed with hash_32(pid, BEHAVIOR_BITS), which already
+ * folds down to a BEHAVIOR_BITS-wide value; hash_min() then hashed that
+ * *again* down to the same width. Harmless (insert and lookup used the
+ * same function, so entries were always found), just redundant work
+ * repeated on every insert and lookup - hash_min() already does the one
+ * reduction that is needed. */
+static u32 pid_key(pid_t pid) { return (u32)pid; }
 
 /* Finds or creates the entry for `pid`. Always called under
  * behavior_lock. Returns NULL only on allocation failure. */
