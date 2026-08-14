@@ -1,0 +1,35 @@
+[Unit]
+Description=HyprAV userspace scanning daemon (YARA/fuzzy-hash/quarantine)
+Documentation=https://github.com/keanehatescoding/HyprAV
+After=network.target
+
+# The av kernel module (av.ko) is loaded manually via insmod - this
+# project doesn't ship a systemd unit for the module itself (see the
+# top-level README), so there's no unit to order After=/Requires=
+# against, and no way to guarantee av_genl's netlink family already
+# exists by the time this unit starts. avd itself already fails fast
+# with a clear error if genl_ctrl_resolve() can't find "av_genl" (see
+# avd.c's main()) - Restart=on-failure below, with no burst limit
+# (StartLimitIntervalSec=0), means systemd just keeps retrying on a
+# fixed backoff until the module happens to be loaded, rather than
+# requiring precise ordering against something systemd doesn't manage.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# Deliberately root, deliberately unsandboxed (no ProtectSystem=,
+# ProtectHome=, DynamicUser=, etc.): avd's whole job is reading
+# arbitrary files anywhere on the system (whatever a process just
+# exec'd could be anywhere) and rename()/chmod()'ing malicious ones
+# into quarantine - a privileged, system-wide daemon by nature, not
+# something that can be usefully confined behind a restricted
+# filesystem view without breaking the thing it exists to do.
+User=root
+ExecStart=/usr/local/bin/avd /etc/hyprav/rules /etc/hyprav/fuzzy_hashes.txt /var/lib/av-quarantine
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

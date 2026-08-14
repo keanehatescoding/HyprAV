@@ -28,6 +28,9 @@ scripts/
   setup-hooks.sh       - one-time: git config core.hooksPath .githooks
 docs/
   netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
+packaging/
+  avd.service          - systemd unit for running avd persistently -
+                        see "Running avd persistently" below
 av/                  - the actual antivirus module (single, evolving)
   main.c              - kprobe hooks (execve, openat, unlink, unlinkat,
                         rename, renameat, renameat2), workqueue,
@@ -201,6 +204,50 @@ make
 sudo insmod av.ko
 dmesg | tail -20
 sudo rmmod av
+```
+
+## Running `avd` persistently
+
+The testing sections further down (`Testing the kernel↔daemon YARA
+path` etc.) run `avd` by hand in a foreground terminal, which is the
+right way to develop against it but not to actually run it day to day
+— it doesn't survive a logout, a crash, or a reboot that way.
+`userspace/avd/Makefile` has an `install` target for that:
+
+```bash
+cd userspace/avd
+make
+sudo make install     # binary -> /usr/local/bin/avd
+                       # unit   -> /usr/lib/systemd/system/avd.service
+                       # rules/corpus -> /etc/hyprav/
+sudo systemctl daemon-reload
+sudo systemctl enable --now avd.service
+journalctl -u avd -f  # avd's stdout/stderr, same output as running it by hand
+```
+
+`install` does **not** enable or start the service itself — reviewing
+`packaging/avd.service` before enabling anything that scans and
+quarantines files with root privileges is worth the extra step. The
+unit runs `avd` as root with no sandboxing (`ProtectSystem=`,
+`DynamicUser=`, etc. would break it — see the unit's own comments):
+`avd`'s whole job is reading arbitrary files anywhere on the system
+and moving malicious ones into quarantine, which is fundamentally
+privileged, system-wide work.
+
+The `av` kernel module itself still has no systemd unit — `insmod` is
+a manual, documented step (see Building above), so there's nothing to
+order `avd.service` against. `avd` fails fast with a clear error if
+the module isn't loaded yet (can't resolve the `av_genl` netlink
+family); the unit's `Restart=on-failure` with no burst limit means
+systemd just keeps retrying on a fixed backoff until the module shows
+up, rather than requiring precise unit ordering against something it
+doesn't manage.
+
+Override the install paths the usual GNU way if you're packaging this
+for a distro instead of installing directly:
+
+```bash
+sudo make install PREFIX=/usr DESTDIR=/tmp/pkgroot
 ```
 
 ## A note on kernel version / architecture
