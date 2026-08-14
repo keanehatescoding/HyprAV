@@ -848,26 +848,43 @@ static int msg_handler(struct nl_msg *msg, void *arg) {
     return NL_SKIP;
   }
 
-  /* AV_C_SCAN_REQUEST must originate from the kernel (nlmsg_pid == 0).
-   * Unlike AV_C_VERDICT on the kernel side (see the daemon_portid check
-   * in netlink_chan.c's av_nl_verdict_doit()), nothing here restricts
-   * who may unicast a message straight to this socket's portid: this
-   * process never registers its own genl_family, so GENL_ADMIN_PERM
-   * (which only gates access to a *kernel*-registered .doit handler)
-   * doesn't apply to it at all. Any local process that knows avd's
-   * portid - which defaults to avd's own pid via netlink autobind, so
-   * it's as discoverable as `pgrep avd` - could otherwise forge a
-   * SCAN_REQUEST with an arbitrary path/reqid directly to this socket,
-   * bypassing the kernel (and any CAP_NET_ADMIN requirement) entirely:
-   * flooding the bounded scan queue to starve real detection, or
-   * directing this (typically root) daemon to scan/quarantine a
-   * path of the attacker's choosing. */
-  if (gnlh->cmd == AV_C_SCAN_REQUEST && nlh->nlmsg_pid != 0) {
-    fprintf(stderr,
-            "avd: SCAN_REQUEST from non-kernel portid %u ignored "
-            "(possible spoofed request)\n",
-            nlh->nlmsg_pid);
-    return NL_SKIP;
+  /* AV_C_SCAN_REQUEST must originate from the kernel (source portid ==
+   * 0). Unlike AV_C_VERDICT on the kernel side (see the daemon_portid
+   * check in netlink_chan.c's av_nl_verdict_doit()), nothing here
+   * restricts who may unicast a message straight to this socket's
+   * portid: this process never registers its own genl_family, so
+   * GENL_ADMIN_PERM (which only gates access to a *kernel*-registered
+   * .doit handler) doesn't apply to it at all. Any local process that
+   * knows avd's portid - which defaults to avd's own pid via netlink
+   * autobind, so it's as discoverable as `pgrep avd` - could otherwise
+   * forge a SCAN_REQUEST with an arbitrary path/reqid directly to this
+   * socket, bypassing the kernel (and any CAP_NET_ADMIN requirement)
+   * entirely: flooding the bounded scan queue to starve real
+   * detection, or directing this (typically root) daemon to
+   * scan/quarantine a path of the attacker's choosing.
+   *
+   * MUST check nlmsg_get_src(msg)->nl_pid, NOT nlh->nlmsg_pid: the
+   * latter is part of the message payload itself, written by whoever
+   * constructed the message (our own kernel code happens to put 0
+   * there via genlmsg_put()'s `port` argument, but nothing stops a
+   * forged message from claiming the same value) - checking it
+   * defeats the whole point of this guard, since the exact spoofer
+   * this is meant to stop would just set that field to 0 themselves.
+   * nlmsg_get_src() instead returns the sockaddr_nl the kernel itself
+   * populated from the delivering socket's real, kernel-enforced
+   * portid (via the recvmsg() call's out-of-band source address, same
+   * trust boundary as genl_info->snd_portid on the kernel side) -
+   * that's not attacker-writable. */
+  if (gnlh->cmd == AV_C_SCAN_REQUEST) {
+    struct sockaddr_nl *src = nlmsg_get_src(msg);
+
+    if (!src || src->nl_pid != 0) {
+      fprintf(stderr,
+              "avd: SCAN_REQUEST from non-kernel portid %u ignored "
+              "(possible spoofed request)\n",
+              src ? src->nl_pid : (uint32_t)-1);
+      return NL_SKIP;
+    }
   }
 
   if (gnlh->cmd == AV_C_SCAN_REQUEST) {
