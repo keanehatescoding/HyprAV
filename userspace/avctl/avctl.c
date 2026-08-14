@@ -1,6 +1,6 @@
 /*
- * avctl - userspace CLI for /proc/kernel_av_signatures and
- * /proc/kernel_av_trusted.
+ * avctl - userspace CLI for /proc/kernel_av_signatures,
+ * /proc/kernel_av_trusted, and /proc/kernel_av_protected.
  *
  * Usage:
  *   avctl add <md5|sha1|sha256> <hex> <name>
@@ -9,6 +9,9 @@
  *   avctl trust add <sha256-hex> <name>
  *   avctl trust del <sha256-hex>
  *   avctl trust list
+ *   avctl protect add <absolute-path>
+ *   avctl protect del <absolute-path>
+ *   avctl protect list
  *   avctl save <file>
  *   avctl load <file>
  *
@@ -22,9 +25,11 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 
 #define PROC_PATH "/proc/kernel_av_signatures"
 #define TRUST_PROC_PATH "/proc/kernel_av_trusted"
+#define PROTECTED_PROC_PATH "/proc/kernel_av_protected"
 
 static void usage(const char *prog)
 {
@@ -36,9 +41,12 @@ static void usage(const char *prog)
         "  %s trust add <sha256-hex> <name>\n"
         "  %s trust del <sha256-hex>\n"
         "  %s trust list\n"
+        "  %s protect add <absolute-path>\n"
+        "  %s protect del <absolute-path>\n"
+        "  %s protect list\n"
         "  %s save <file>\n"
         "  %s load <file>\n",
-        prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
 }
 
 static int do_list_generic(const char *path, const char *header_algo)
@@ -82,6 +90,32 @@ static int do_trust_list(void)
     return do_list_generic(TRUST_PROC_PATH, NULL);
 }
 
+/* Not do_list_generic(): the protected-path list is one path per
+ * line, not hash/name pairs. */
+static int do_protect_list(void)
+{
+    FILE *f = fopen(PROTECTED_PROC_PATH, "r");
+    char line[PATH_MAX + 8];
+
+    if (!f) {
+        fprintf(stderr, "avctl: could not open %s: %s\n"
+                         "(is the av module loaded? try: sudo insmod av.ko)\n",
+                PROTECTED_PROC_PATH, strerror(errno));
+        return 1;
+    }
+
+    printf("PROTECTED PATH\n");
+    while (fgets(line, sizeof(line), f)) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] == '\n')
+            line[len - 1] = '\0';
+        if (line[0])
+            printf("%s\n", line);
+    }
+    fclose(f);
+    return 0;
+}
+
 static int write_command_to(const char *path, const char *cmd)
 {
     int fd = open(path, O_WRONLY);
@@ -116,20 +150,22 @@ static int write_command(const char *cmd)
 
 /* save/load: /proc/kernel_av_signatures and /proc/kernel_av_trusted are
  * both in-memory kernel hashtables with no persistence of their own -
- * everything vanishes on `rmmod`. save dumps both into one file as
+ * everything vanishes on `rmmod`. save dumps all three into one file as
  * replayable write-commands (not the pretty-printed list() format);
- * load replays them. A "sig " or "trust " line prefix says which /proc
- * file each line targets; the rest of the line is passed through
- * VERBATIM as the write() payload, so names containing spaces round-
- * trip correctly (the underlying /proc write handlers already treat
- * everything after the hash as the rest-of-line name - see
- * sig_proc_write()/trust_proc_write() in the kernel module). */
+ * load replays them. A "sig ", "trust ", or "protect " line prefix says
+ * which /proc file each line targets; the rest of the line is passed
+ * through VERBATIM as the write() payload, so names/paths containing
+ * spaces round-trip correctly (the underlying /proc write handlers
+ * already treat everything after the hash/command as the rest-of-line
+ * value - see sig_proc_write()/trust_proc_write()/protected_proc_write()
+ * in the kernel module). Line buffer sized for PATH_MAX (protected-path
+ * entries can be much longer than a sha256 signature/name line). */
 static int do_save(const char *path)
 {
     FILE *out;
     FILE *in;
-    char line[512];
-    int sig_count = 0, trust_count = 0;
+    char line[PATH_MAX + 16];
+    int sig_count = 0, trust_count = 0, protect_count = 0;
 
     out = fopen(path, "w");
     if (!out) {
@@ -176,16 +212,37 @@ static int do_save(const char *path)
     }
     fclose(in);
 
+    in = fopen(PROTECTED_PROC_PATH, "r");
+    if (!in) {
+        fprintf(stderr, "avctl: could not open %s: %s\n"
+                         "(is the av module loaded? try: sudo insmod av.ko)\n",
+                PROTECTED_PROC_PATH, strerror(errno));
+        fclose(out);
+        return 1;
+    }
+    while (fgets(line, sizeof(line), in)) {
+        size_t len = strlen(line);
+
+        if (len > 0 && line[len - 1] == '\n')
+            line[len - 1] = '\0';
+        if (line[0]) {
+            fprintf(out, "protect add %s\n", line);
+            protect_count++;
+        }
+    }
+    fclose(in);
+
     fclose(out);
-    printf("saved %d signature(s), %d trusted entr%s to %s\n",
-           sig_count, trust_count, trust_count == 1 ? "y" : "ies", path);
+    printf("saved %d signature(s), %d trusted entr%s, %d protected path%s to %s\n",
+           sig_count, trust_count, trust_count == 1 ? "y" : "ies",
+           protect_count, protect_count == 1 ? "" : "s", path);
     return 0;
 }
 
 static int do_load(const char *path)
 {
     FILE *f = fopen(path, "r");
-    char line[512];
+    char line[PATH_MAX + 16];
     int loaded = 0, skipped = 0, errors = 0;
 
     if (!f) {
@@ -209,9 +266,13 @@ static int do_load(const char *path)
         } else if (!strncmp(line, "trust ", 6)) {
             rest = line + 6;
             ret = write_command_to(TRUST_PROC_PATH, rest);
+        } else if (!strncmp(line, "protect ", 8)) {
+            rest = line + 8;
+            ret = write_command_to(PROTECTED_PROC_PATH, rest);
         } else {
             fprintf(stderr, "avctl: load: malformed line (expected "
-                             "'sig ' or 'trust ' prefix): %s\n", line);
+                             "'sig ', 'trust ', or 'protect ' prefix): %s\n",
+                    line);
             errors++;
             continue;
         }
@@ -299,6 +360,49 @@ static int do_trust(int argc, char **argv)
     return 0;
 }
 
+static int do_protect(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (!strcmp(argv[2], "list")) {
+        return do_protect_list();
+    } else if (!strcmp(argv[2], "add")) {
+        char cmd[PATH_MAX + 8];
+
+        if (argc < 4) {
+            usage(argv[0]);
+            return 1;
+        }
+        if (argv[3][0] != '/') {
+            fprintf(stderr, "avctl: protect add requires an absolute path\n");
+            return 1;
+        }
+        snprintf(cmd, sizeof(cmd), "add %s", argv[3]);
+        if (write_command_to(PROTECTED_PROC_PATH, cmd))
+            return 1;
+        printf("protected: %s\n", argv[3]);
+    } else if (!strcmp(argv[2], "del")) {
+        char cmd[PATH_MAX + 8];
+
+        if (argc < 4) {
+            usage(argv[0]);
+            return 1;
+        }
+        snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
+        if (write_command_to(PROTECTED_PROC_PATH, cmd))
+            return 1;
+        printf("unprotected: %s\n", argv[3]);
+    } else {
+        usage(argv[0]);
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -310,6 +414,8 @@ int main(int argc, char **argv)
         return do_list();
     } else if (!strcmp(argv[1], "trust")) {
         return do_trust(argc, argv);
+    } else if (!strcmp(argv[1], "protect")) {
+        return do_protect(argc, argv);
     } else if (!strcmp(argv[1], "save")) {
         if (argc < 3) {
             usage(argv[0]);

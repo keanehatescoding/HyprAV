@@ -115,4 +115,56 @@ int av_behavior_trust_del(const char *sha256_hex);
 int av_behavior_trust_proc_init(void);
 void av_behavior_trust_proc_exit(void);
 
+/* Protected-path allow-list: an operator-managed set of exact absolute
+ * exe paths that av_kill() (main.c) and kill_with_reason() (this file)
+ * refuse to SIGKILL regardless of what triggered detection - logged
+ * as suppressed, same shape as the unconditional PID-1 guard, which
+ * stays in place independent of this list's contents. This exists
+ * because a loadable module has no portable way to know which
+ * binaries are "critical" on a given distro (systemd's own path,
+ * sshd, etc. all vary) - see behavior.c's own comment on this. Exact
+ * path match, not prefix: protecting one binary should not silently
+ * protect everything under its directory. Returns 0 on success,
+ * negative errno on failure (-EINVAL for a non-absolute or oversized
+ * path, -ENOMEM on allocation failure, -ENOENT from _del if no such
+ * entry exists). */
+int av_behavior_protect_add(const char *path);
+int av_behavior_protect_del(const char *path);
+
+/* Creates/removes /proc/kernel_av_protected for runtime management
+ * (add/del/list), same usage pattern as the trust list above. Call
+ * after av_behavior_init() / before av_behavior_exit(). */
+int av_behavior_protect_proc_init(void);
+void av_behavior_protect_proc_exit(void);
+
+/* Resolves target_pid's own exe path (task->mm->exe_file - what the
+ * process actually IS, not any path string a caller happens to be
+ * passing around for logging) and checks it against the protected
+ * list above. Sleepable - callable only from process/workqueue
+ * context, same as every other kill-path helper in this codebase.
+ * `path_out` (optional, may be NULL) is filled with the resolved path
+ * on a match, so callers can log which protected binary was matched.
+ * Returns false (not protected) for a task with no mm (kernel thread,
+ * already past exit_mm()) - same fail-open-on-inconclusive-info stance
+ * as the rest of this codebase, not a security hole: such a task
+ * cannot be "the" protected binary anyway.
+ *
+ * SCOPING NOTE, confirmed during testing: since this checks the
+ * target's CURRENT exe_file, it only protects a process that has
+ * actually BECOME the protected binary by the time av_kill()/
+ * kill_with_reason() runs (async, on the workqueue - see the TOCTOU
+ * note in main.c). For av_kill()'s exec-time signature path
+ * specifically, that means a still-in-flight or failed execve() (e.g.
+ * a non-executable file, or a real race) is not protected - the
+ * calling process's exe_file is still whatever it was BEFORE the
+ * attempted exec, not the (never-completed) target. This is the
+ * intended, correct behavior for the actual use case (don't kill a
+ * currently-running critical service on a false positive - by the
+ * time this check runs, a successfully-exec'd protected binary's
+ * exe_file already correctly reflects it) rather than a gap: a
+ * process that never became the flagged binary was never really "the"
+ * protected binary to begin with. */
+bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
+                                     size_t path_out_len);
+
 #endif /* AV_BEHAVIOR_H */

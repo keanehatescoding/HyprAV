@@ -577,13 +577,34 @@ out:
 static void av_kill(struct pid *target_pid, const char *path, const char *type,
                     const char *reason, const struct av_file_identity *ident) {
   struct task_struct *task;
+  /* PATH_MAX (4096) is far too large for the kernel stack - heap-
+   * allocate rather than declare a PATH_MAX array here, same reasoning
+   * as kill_with_reason()'s identical pattern in behavior.c. Sleepable
+   * context (workqueue), GFP_KERNEL is fine. A kmalloc failure just
+   * drops the protected-exe path from the log line, not the check
+   * itself - av_behavior_target_is_protected() tolerates NULL path_out. */
+  char *protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
   if (pid_nr(target_pid) == 1) {
     pr_alert("kernel-av: event=suppressed action=none type=%s "
              "path=\"%s\" reason=\"%s\" pid=1\n",
              type, path, reason);
+    kfree(protected_path);
     return;
   }
+
+  /* See behavior.h's comment on av_behavior_target_is_protected() -
+   * an operator-managed allow-list, same suppressed-not-skipped
+   * treatment as the PID-1 guard above. */
+  if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
+    pr_alert("kernel-av: event=suppressed action=none type=%s "
+             "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
+             type, path, reason, pid_nr(target_pid),
+             protected_path ? protected_path : "?");
+    kfree(protected_path);
+    return;
+  }
+  kfree(protected_path);
 
   rcu_read_lock();
   task = pid_task(target_pid, PIDTYPE_PID);
