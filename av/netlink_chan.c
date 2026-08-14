@@ -314,13 +314,23 @@ int av_netlink_init(void)
 {
     int ret;
 
-    ret = genl_register_family(&av_genl_family);
+    /* Notifier registered BEFORE the genl_family, and unregistered
+     * AFTER it below (reverse order) - this is the only ordering that
+     * closes the race entirely: once genl_register_family() returns,
+     * avd can immediately resolve the family and send AV_C_REGISTER.
+     * If the notifier weren't already listening at that exact moment,
+     * a daemon that registers and then crashes within that narrow
+     * window would leave daemon_registered stuck true with nothing
+     * left listening for its NETLINK_URELEASE. Registering the
+     * notifier first means no registration can ever happen before
+     * we're already watching for its release. */
+    ret = netlink_register_notifier(&av_netlink_notifier);
     if (ret)
         return ret;
 
-    ret = netlink_register_notifier(&av_netlink_notifier);
+    ret = genl_register_family(&av_genl_family);
     if (ret) {
-        genl_unregister_family(&av_genl_family);
+        netlink_unregister_notifier(&av_netlink_notifier);
         return ret;
     }
 
@@ -331,8 +341,13 @@ void av_netlink_exit(void)
 {
     struct av_pending_scan *p, *tmp;
 
-    netlink_unregister_notifier(&av_netlink_notifier);
+    /* Reverse of av_netlink_init()'s registration order - see its
+     * comment. Unregistering the family first means no new
+     * AV_C_REGISTER can land after this point, so there is nothing
+     * left for the notifier to meaningfully catch by the time it goes
+     * too. */
     genl_unregister_family(&av_genl_family);
+    netlink_unregister_notifier(&av_netlink_notifier);
 
     /* Wake up (with a "no verdict" result) anything still waiting - by
      * this point the kprobe is already unregistered and the workqueue
