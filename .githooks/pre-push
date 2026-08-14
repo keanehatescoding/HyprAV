@@ -26,9 +26,30 @@ while read -r _ local_sha _ remote_sha; do
         continue  # deleting a remote ref - nothing to test
     fi
     if [ "$remote_sha" = "$ZERO_SHA" ]; then
-        # new branch/tag on the remote - diff isn't meaningful, just
-        # list every file in the pushed tree
-        files="$(git diff-tree --no-commit-id --name-only -r "$local_sha")"
+        # New branch/tag on the remote. git diff-tree on a single commit
+        # only shows that ONE commit's own changes, not the full range
+        # being introduced - on a multi-commit new branch this silently
+        # missed every commit but the tip, which could let an av/avctl/
+        # avd change reach GitHub with the test suite never having run.
+        # Diff against the merge-base with the default branch instead,
+        # so every commit on the new branch is actually inspected.
+        base="$(git merge-base "$local_sha" origin/HEAD 2>/dev/null)"
+        if [ -z "$base" ]; then
+            base="$(git merge-base "$local_sha" origin/master 2>/dev/null)"
+        fi
+        if [ -n "$base" ]; then
+            files="$(git diff --name-only "$base" "$local_sha")"
+        else
+            # No usable base found (e.g. pushing to a remote with no
+            # default/master branch yet). git diff-tree on a single
+            # commit has the same "only the tip commit's own delta"
+            # problem this whole branch fixed - list every file that
+            # actually exists in the resulting tree instead (not a
+            # diff at all), so an av/avctl/avd file already present at
+            # local_sha is never missed regardless of how many commits
+            # got it there.
+            files="$(git ls-tree -r --name-only "$local_sha")"
+        fi
     else
         files="$(git diff --name-only "$remote_sha" "$local_sha")"
     fi
@@ -36,7 +57,15 @@ while read -r _ local_sha _ remote_sha; do
 $files"
 done
 
-if ! printf '%s' "$CHANGED_FILES" | grep -qE '^(av/|userspace/avctl/|userspace/avd/)'; then
+# A herestring, not `printf ... | grep -qE ...`: with `pipefail` set
+# above, grep -qE's early exit on the first match closes its stdin
+# pipe while printf may still be writing later lines, so printf can
+# get killed by SIGPIPE - and pipefail then reports THAT (non-zero,
+# from printf) as the pipeline's exit status instead of grep's actual
+# match result, so a real match could be misreported as "no match"
+# and the test suite silently skipped. A herestring has no second
+# process and no pipe to close early, so this can't happen.
+if ! grep -qE '^(av/|userspace/avctl/|userspace/avd/)' <<< "$CHANGED_FILES"; then
     echo "pre-push: no changes under av/, userspace/avctl/, or userspace/avd/ - skipping test suite"
     exit 0
 fi
@@ -44,13 +73,12 @@ fi
 echo "==> pre-push: changes detected in av/, userspace/avctl/, or userspace/avd/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
-if ! sudo -v; then
-    echo
-    echo "pre-push: could not get sudo - aborting push. Run manually, then push again:"
-    echo "  sudo tests/run_all.sh"
-    exit 1
-fi
-
+# No separate 'sudo -v' preflight: it validates a general credential
+# refresh, which a command-scoped NOPASSWD sudoers rule (e.g. for
+# exactly 'tests/run_all.sh') does not satisfy even though the actual
+# command below would succeed non-interactively under that same rule.
+# 'sudo tests/run_all.sh' fails on its own, with its own clear error,
+# if sudo genuinely is not available - no need to duplicate that check.
 if sudo tests/run_all.sh; then
     echo "pre-push: all tests passed"
     exit 0
