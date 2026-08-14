@@ -848,6 +848,28 @@ static int msg_handler(struct nl_msg *msg, void *arg) {
     return NL_SKIP;
   }
 
+  /* AV_C_SCAN_REQUEST must originate from the kernel (nlmsg_pid == 0).
+   * Unlike AV_C_VERDICT on the kernel side (see the daemon_portid check
+   * in netlink_chan.c's av_nl_verdict_doit()), nothing here restricts
+   * who may unicast a message straight to this socket's portid: this
+   * process never registers its own genl_family, so GENL_ADMIN_PERM
+   * (which only gates access to a *kernel*-registered .doit handler)
+   * doesn't apply to it at all. Any local process that knows avd's
+   * portid - which defaults to avd's own pid via netlink autobind, so
+   * it's as discoverable as `pgrep avd` - could otherwise forge a
+   * SCAN_REQUEST with an arbitrary path/reqid directly to this socket,
+   * bypassing the kernel (and any CAP_NET_ADMIN requirement) entirely:
+   * flooding the bounded scan queue to starve real detection, or
+   * directing this (typically root) daemon to scan/quarantine a
+   * path of the attacker's choosing. */
+  if (gnlh->cmd == AV_C_SCAN_REQUEST && nlh->nlmsg_pid != 0) {
+    fprintf(stderr,
+            "avd: SCAN_REQUEST from non-kernel portid %u ignored "
+            "(possible spoofed request)\n",
+            nlh->nlmsg_pid);
+    return NL_SKIP;
+  }
+
   if (gnlh->cmd == AV_C_SCAN_REQUEST) {
     if (!attrs[AV_A_REQID] || !attrs[AV_A_PATH]) {
       fprintf(stderr, "avd: malformed SCAN_REQUEST (missing attrs)\n");

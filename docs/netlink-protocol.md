@@ -97,6 +97,19 @@ whole system; document this tradeoff explicitly.
   in every documented workflow, so this doesn't change how you run it -
   it just closes a gap where anything unprivileged previously could
   have disabled detection entirely by registering first.
+- **`avd` did not authenticate the sender of `AV_C_SCAN_REQUEST`.** The
+  kernel side checks `AV_C_VERDICT` against the registered daemon's
+  portid (see above), but `avd` itself never registers a `genl_family`
+  of its own - it's a plain client socket, so `GENL_ADMIN_PERM` (which
+  only gates access to a *kernel*-registered `.doit` handler) never
+  applied to messages arriving at `avd`. Any local process that knew
+  `avd`'s portid (which defaults to its pid via netlink autobind, so
+  as discoverable as `pgrep avd`) could unicast a forged
+  `SCAN_REQUEST` straight to it, bypassing the kernel and any
+  `CAP_NET_ADMIN` requirement - flooding the scan queue, or directing
+  the (typically root) daemon to scan/quarantine an attacker-chosen
+  path. **Fixed:** `msg_handler()` in `avd.c` now rejects any
+  `AV_C_SCAN_REQUEST` whose `nlmsg_pid` isn't `0` (kernel-origin).
 - **Module could be unloaded while a callback was still running.**
   `genl_family` was missing `.module = THIS_MODULE`, so generic
   netlink had no way to pin the module while `av_nl_register_doit()`
