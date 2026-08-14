@@ -26,9 +26,25 @@ while read -r _ local_sha _ remote_sha; do
         continue  # deleting a remote ref - nothing to test
     fi
     if [ "$remote_sha" = "$ZERO_SHA" ]; then
-        # new branch/tag on the remote - diff isn't meaningful, just
-        # list every file in the pushed tree
-        files="$(git diff-tree --no-commit-id --name-only -r "$local_sha")"
+        # New branch/tag on the remote. git diff-tree on a single commit
+        # only shows that ONE commit's own changes, not the full range
+        # being introduced - on a multi-commit new branch this silently
+        # missed every commit but the tip, which could let an av/avctl/
+        # avd change reach GitHub with the test suite never having run.
+        # Diff against the merge-base with the default branch instead,
+        # so every commit on the new branch is actually inspected.
+        base="$(git merge-base "$local_sha" origin/HEAD 2>/dev/null)"
+        if [ -z "$base" ]; then
+            base="$(git merge-base "$local_sha" origin/master 2>/dev/null)"
+        fi
+        if [ -n "$base" ]; then
+            files="$(git diff --name-only "$base" "$local_sha")"
+        else
+            # No usable base found (e.g. pushing to a remote with no
+            # default/master branch yet) - fall back to the full tree
+            # rather than silently skipping the check.
+            files="$(git diff-tree --no-commit-id --name-only -r --root "$local_sha")"
+        fi
     else
         files="$(git diff --name-only "$remote_sha" "$local_sha")"
     fi
