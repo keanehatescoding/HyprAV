@@ -9,22 +9,22 @@
 # call at all).
 #
 # Technique: glibc has no execveat() wrapper, so this calls the raw
-# syscall directly via syscall(SYS_execveat, ...). Covers three cases
+# syscall directly via syscall(SYS_execveat, ...). Covers four cases
 # that mirror bugs already found and fixed elsewhere in this codebase
 # for other syscalls (execve's relative-path fix, openat's dfd-ignored
 # fix):
 #
-#   1. AT_FDCWD + absolute path   - the plain case
-#   2. AT_FDCWD + relative path   - cwd resolution
-#   3. real dfd + relative path   - dfd resolution (openat's bug, for exec)
-#
-# ...plus a fourth, DOCUMENTED-GAP case that is expected to NOT be
-# caught and does not count as a test failure:
-#
-#   4. memfd_create() + AT_EMPTY_PATH - fileless exec. pathname is
-#      empty and dfd has no resolvable filesystem path, so
-#      hash_file_multi()/open_exec_target() has nothing to open. See
-#      handler_pre_execveat()'s comment in av/main.c.
+#   1. AT_FDCWD + absolute path       - the plain case
+#   2. AT_FDCWD + relative path       - cwd resolution
+#   3. real dfd + relative path       - dfd resolution (openat's bug, for exec)
+#   4. memfd_create() + AT_EMPTY_PATH - fileless exec (fexecve()-style):
+#      pathname is empty and dfd names the target directly, no
+#      filesystem path to resolve at all. Previously a documented gap
+#      (open_exec_target() had nothing to open); handler_pre_execveat()
+#      now special-cases AT_EMPTY_PATH and resolves the target via
+#      dfd's own struct path directly - see main.c's comments on the
+#      empty-string sentinel in resolve_absolute_path()/
+#      open_exec_target(). All four are real pass/fail assertions now.
 #
 # NEEDS THE LIVE KERNEL MODULE - run this in your VM, not standalone.
 #
@@ -69,7 +69,7 @@ int main(int argc, char *argv[])
     int dfd;
     const char *path = argv[2];
     int flags = atoi(argv[3]);
-    char *const av_[2] = { NULL, NULL };
+    char *av_[2] = { NULL, NULL };
     char *const ev_[1] = { NULL };
 
     if (!strcmp(argv[1], "AT_FDCWD")) {
@@ -104,12 +104,23 @@ gcc -o /tmp/execveat_runner /tmp/execveat_runner.c
 
 # ---- shared EICAR fixture ----
 
-printf "X5O!P%%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*" >/tmp/eicar.com
+# Single quotes are intentional: this string has literal $ characters
+# that must NOT be shell-expanded (with set -u active, an unquoted/
+# double-quoted $EICAR here is an unbound-variable error, not just a
+# wrong-content bug) - same reasoning as tests/test_detection.sh's
+# identical EICAR fixture.
+# shellcheck disable=SC2016
+printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' >/tmp/eicar.com
 chmod +x /tmp/eicar.com
 
+# av_kill()'s log format is structured key=value (see main.c's
+# v1.0.0-merge comment): "event=detected action=kill type=...
+# path="...". Match on that instead of the old free-form
+# 'DETECTED "..."' sentence format, which this check predates and no
+# longer appears anywhere in the module.
 check_detected() {
 	local expect_path="$1"
-	if dmesg | tail -20 | grep -q "DETECTED \"$expect_path\""; then
+	if dmesg | tail -20 | grep -q "event=detected.*action=kill.*path=\"$expect_path\""; then
 		return 0
 	fi
 	return 1
@@ -166,22 +177,29 @@ else
 fi
 echo
 
-# ---- Test 4: memfd + AT_EMPTY_PATH (documented gap, informational only) ----
+# ---- Test 4: memfd + AT_EMPTY_PATH (fileless exec) ----
 
-echo "-- Test 4: memfd + AT_EMPTY_PATH (fileless exec - documented gap) --"
+echo "-- Test 4: memfd + AT_EMPTY_PATH (fileless exec) --"
 dmesg -C
 /tmp/execveat_runner memfd /tmp/eicar.com 0 || true
 sleep 1
-echo "--- dmesg from this run (informational - not a pass/fail check) ---"
-dmesg | tail -10
-echo
-echo "This case is NOT expected to be caught yet - pathname is empty and dfd"
-echo "has no resolvable filesystem path, so open_exec_target() has nothing to"
-echo "open. Documented as a known limitation in handler_pre_execveat()'s"
-echo "comment in av/main.c, same way the openat() open()-vs-open_at() gap and"
-echo "Has_RWX_Segment's unverified status are documented rather than silently"
-echo "left out. Worth including this dmesg output verbatim in the report as"
-echo "the boundary of what this patch covers."
+# An anonymous memfd has no real dentry in any mounted filesystem, so
+# d_path() reports it the same way the kernel always names memfds:
+# "/memfd:<name> (deleted)" (the name given to memfd_create(), plus
+# the same "(deleted)" suffix d_path() appends for any unlinked-but-
+# still-open file). That is not a bug or a loose match - it is the
+# correct, expected representation of a fileless exec target.
+if dmesg | tail -10 | grep -q 'event=detected.*action=kill.*path="/memfd:execveat_test'; then
+	echo "PASS: fileless exec (memfd + AT_EMPTY_PATH) detected and killed"
+	PASS=$((PASS + 1))
+else
+	echo "FAIL: memfd + AT_EMPTY_PATH exec was not detected - check the"
+	echo "      AT_EMPTY_PATH branch in handler_pre_execveat() and the"
+	echo "      empty-string sentinel handling in resolve_absolute_path()/"
+	echo "      open_exec_target() in main.c"
+	dmesg | tail -10
+	FAIL=$((FAIL + 1))
+fi
 echo
 
 # ---- summary ----
@@ -189,7 +207,7 @@ echo
 rm -f /tmp/execveat_runner /tmp/execveat_runner.c /tmp/eicar.com
 rm -rf "$TESTDIR"
 
-echo "=== Summary: $PASS passed, $FAIL failed (Test 4 excluded - informational) ==="
+echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then
 	exit 1
 fi

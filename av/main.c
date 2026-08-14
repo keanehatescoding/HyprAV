@@ -327,6 +327,32 @@ static void resolve_absolute_path(const char *path, const struct path *base,
   char *tmp;
   char *dirpath;
 
+  /* AT_EMPTY_PATH sentinel - see handler_pre_execveat() and
+   * open_exec_target() below. `path` is deliberately empty and `base`
+   * IS the exec target itself (resolve_dfd_path() resolved dfd
+   * directly to it, not to a directory `path` is relative to), so
+   * resolve base's own path directly rather than treating this as
+   * "empty relative component under base" (which would wrongly
+   * concatenate a trailing "/" onto base's own path below). Every
+   * OTHER caller's `path` is guaranteed non-empty (strncpy_from_user()
+   * rejects a zero-length copy everywhere else - see handler_pre() and
+   * friends), so an empty string is an unambiguous, safe sentinel for
+   * this one case. */
+  if (path[0] == '\0') {
+    tmp = kmalloc(PATH_MAX, GFP_KERNEL);
+    if (!tmp) {
+      out[0] = '\0';
+      return;
+    }
+    dirpath = d_path(base, tmp, PATH_MAX);
+    if (IS_ERR(dirpath))
+      out[0] = '\0';
+    else
+      strscpy(out, dirpath, out_len);
+    kfree(tmp);
+    return;
+  }
+
   if (path[0] == '/') {
     strscpy(out, path, out_len);
     normalize_abs_path(out, out_len);
@@ -419,7 +445,16 @@ static void bin_to_hex(const u8 *bin, size_t bin_len, char *hex_out) {
 static struct file *open_exec_target(const char *path, const struct path *pwd) {
   struct file *f;
 
-  if (path[0] == '/') {
+  if (path[0] == '\0') {
+    /* AT_EMPTY_PATH sentinel - see resolve_absolute_path()'s matching
+     * comment and handler_pre_execveat() below. `pwd` IS the target
+     * file itself here, already opened once by resolve_dfd_path()'s
+     * fget_raw() back in the kprobe handler - dentry_open() opens a
+     * fresh fd against that same dentry/mnt directly, no lookup at
+     * all (there is nothing to look up: dfd already named the exact
+     * file). */
+    f = dentry_open(pwd, O_RDONLY, current_cred());
+  } else if (path[0] == '/') {
     f = filp_open(path, O_RDONLY, 0);
   } else {
     struct path resolved;
@@ -817,20 +852,28 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * its exec_path key for anything launched this way too. This is the
  * syscall containers, some language runtimes, and memfd_create()+
  * execveat() fileless-exec loaders actually use, so it's not a
- * theoretical gap. Doesn't attempt to special-case the AT_EMPTY_PATH
- * fd-only-exec form (flags argument, real_regs->r8) - that path
- * fexecve()-style callers use still queues work with whatever
- * (possibly empty) pathname string glibc passed, and hash_file_multi()
- * further down already opens by resolved path rather than by fd, so
- * an AT_EMPTY_PATH caller currently just fails to hash cleanly rather
- * than silently bypassing detection - worth hardening as a follow-up
- * but not a bypass in the meantime. */
+ * theoretical gap.
+ *
+ * AT_EMPTY_PATH (flags argument, real_regs->r8) IS special-cased:
+ * fexecve()-style callers pass an empty pathname and rely on dfd
+ * naming the target file directly (typically an anonymous memfd) -
+ * exactly the fileless-exec shape this hook exists to close. `dfd`
+ * has already been resolved to the target's own struct path by
+ * resolve_dfd_path() above (there is no separate "directory" to look
+ * a name up under - dfd already names the whole target), so aw->path
+ * is set to the empty-string sentinel (see resolve_absolute_path()'s
+ * and open_exec_target()'s matching comments in this file) instead of
+ * whatever raw bytes userspace happened to pass as pathname - trusting
+ * the flag as the authoritative signal here, not the string, since a
+ * real AT_EMPTY_PATH execveat() only succeeds with an empty pathname
+ * to begin with. */
 static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
   const char __user *user_filename;
   struct av_work *aw;
   struct path base;
   int dfd;
+  bool empty_path;
 
   if (!real_regs)
     return 0;
@@ -840,6 +883,7 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
     return 0;
 
   dfd = (int)real_regs->di;
+  empty_path = ((unsigned int)real_regs->r8 & AT_EMPTY_PATH) != 0;
 
   /* Resolve dfd BEFORE allocating/copying anything else - same
    * ordering as handler_pre_openat() and for the same reason: a
@@ -861,7 +905,9 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   }
   aw->pwd = base;
 
-  {
+  if (empty_path) {
+    aw->path[0] = '\0';
+  } else {
     ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
 
     if (path_len <= 0 || path_len >= PATH_MAX) {
