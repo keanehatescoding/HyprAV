@@ -19,6 +19,8 @@
 #include <linux/completion.h>
 #include <linux/atomic.h>
 #include <linux/sched.h>
+#include <linux/netlink.h>
+#include <linux/notifier.h>
 #include <net/genetlink.h>
 
 #include "netlink_proto.h"
@@ -30,6 +32,49 @@ static u32 daemon_portid;
 static bool daemon_registered;
 static DEFINE_SPINLOCK(daemon_lock);
 
+/* Fires on NETLINK_URELEASE (any unicast netlink socket closing,
+ * system-wide) - the only way this module learns a registered daemon
+ * is gone if it dies (SIGKILL, crash) instead of exiting cleanly.
+ * Without this, daemon_registered stays stuck true after an unclean
+ * daemon death: every scan request keeps trying to unicast to a dead
+ * portid until genlmsg_unicast() itself starts failing (fast, since
+ * the kernel's own netlink core already knows that portid is gone -
+ * no hang, no wait for DAEMON_TIMEOUT_MS), but the registration state
+ * stays stale and misleading (e.g. to a future av_sigtable_count()-
+ * style status readout) until a new daemon happens to register and
+ * overwrite it. Checked against NETLINK_GENERIC specifically since
+ * this notifier fires for every protocol's netlink sockets releasing
+ * system-wide, not just this module's own family. */
+/* data cannot be const void * - notifier_call must match the kernel's
+ * fixed int (*)(struct notifier_block *, unsigned long, void *)
+ * signature exactly, same class of false positive as the other
+ * cppcheck-suppress comments in this codebase (see sigtable.c/
+ * behavior.c) - a real constraint cppcheck cannot see from this
+ * file alone, not a genuinely fixable style issue. */
+/* cppcheck-suppress constParameterCallback */
+static int av_netlink_notify(struct notifier_block *nb, unsigned long event, void *data)
+{
+    const struct netlink_notify *n = data;
+
+    if (event != NETLINK_URELEASE || n->protocol != NETLINK_GENERIC)
+        return NOTIFY_DONE;
+
+    spin_lock(&daemon_lock);
+    if (daemon_registered && n->portid == daemon_portid) {
+        daemon_registered = false;
+        spin_unlock(&daemon_lock);
+        pr_info("kernel-av: netlink daemon (portid=%u) disconnected - "
+                "fail-open on scans until it re-registers\n", n->portid);
+        return NOTIFY_DONE;
+    }
+    spin_unlock(&daemon_lock);
+
+    return NOTIFY_DONE;
+}
+
+static struct notifier_block av_netlink_notifier = {
+    .notifier_call = av_netlink_notify,
+};
 /* ---- pending scan requests, correlated by REQID ---- */
 
 struct av_pending_scan {
@@ -267,13 +312,26 @@ err_remove_pending:
 
 int av_netlink_init(void)
 {
-    return genl_register_family(&av_genl_family);
+    int ret;
+
+    ret = genl_register_family(&av_genl_family);
+    if (ret)
+        return ret;
+
+    ret = netlink_register_notifier(&av_netlink_notifier);
+    if (ret) {
+        genl_unregister_family(&av_genl_family);
+        return ret;
+    }
+
+    return 0;
 }
 
 void av_netlink_exit(void)
 {
     struct av_pending_scan *p, *tmp;
 
+    netlink_unregister_notifier(&av_netlink_notifier);
     genl_unregister_family(&av_genl_family);
 
     /* Wake up (with a "no verdict" result) anything still waiting - by

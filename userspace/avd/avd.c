@@ -830,11 +830,18 @@ static void *scan_worker_main(void *arg) {
   return NULL;
 }
 
+/* maxlen bounds are defense-in-depth, not the primary guard - msg_handler()
+ * below already rejects anything not from the kernel (nlmsg_get_src()
+ * check), and the kernel always sends AV_A_PATH/AV_A_SHA256 well within
+ * these sizes (PATH_MAX and a 64-hex-char digest + NUL respectively, see
+ * netlink_proto.h). Bounding them anyway means a future kernel-side bug
+ * or protocol change can't hand this process an unbounded string to deal
+ * with by accident. */
 static struct nla_policy av_policy[AV_A_MAX + 1] = {
     [AV_A_REQID] = {.type = NLA_U64},
     [AV_A_PID] = {.type = NLA_U32},
-    [AV_A_PATH] = {.type = NLA_STRING},
-    [AV_A_SHA256] = {.type = NLA_STRING},
+    [AV_A_PATH] = {.type = NLA_STRING, .maxlen = AV_PATH_ATTR_MAXLEN},
+    [AV_A_SHA256] = {.type = NLA_STRING, .maxlen = AV_SHA256_ATTR_MAXLEN + 1},
 };
 
 static int msg_handler(struct nl_msg *msg, void *arg) {
