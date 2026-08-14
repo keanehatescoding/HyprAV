@@ -15,6 +15,21 @@
  * pid_task(find_vpid(pid), PIDTYPE_TGID) gets the same end state
  * (stale entries eventually reclaimed) without that fragility, and
  * reuses the same delayed_work idiom as everything else here.
+ *
+ * Later fix: the rapid-write/rename counters were a FIXED (discrete)
+ * window despite being called "sliding" in comments/docs - the
+ * counter reset to 0/1 whenever more than WINDOW_MS had elapsed since
+ * the window started, with no memory of activity in the PREVIOUS
+ * window. A process could write up to THRESHOLD files, pause just
+ * past the window boundary, and repeat indefinitely without ever
+ * tripping either heuristic, regardless of total volume over time -
+ * documented as evasion finding #4 in docs/evasion-findings.md.
+ * sliding_window_note() (below) replaces the reset-on-boundary logic
+ * with a real trailing window: each ring slot now carries its own
+ * jiffies timestamp, and the count checked against each threshold is
+ * "how many distinct entries fall within the last WINDOW_MS as of
+ * right now", continuously, not "how many since the window last
+ * reset". There is no longer a boundary to pace around.
  */
 
 #include <linux/fcntl.h>
@@ -198,37 +213,47 @@ struct av_behavior_entry {
   struct hlist_node node;
   pid_t pid; /* tgid (process ID), not a thread id - see behavior.h */
   char exec_path[PATH_MAX]; /* recorded at execve time, empty if unknown */
-  unsigned int write_open_count;
-  unsigned long window_start_jiffies;
 
   /* Dedup ring buffer for the rapid-write-open heuristic - counts
-   * DISTINCT paths written in the window, not raw open() calls.
-   * Without this, a process rewriting a handful of its own files
-   * repeatedly (browser IndexedDB/storage metadata, sqlite WAL
+   * DISTINCT paths written in a TRUE trailing window (see
+   * sliding_window_note() below), not raw open() calls and not a
+   * fixed/discrete window that resets on an interval boundary (the
+   * v0.8.x behavior - see evasion finding #4 in
+   * docs/evasion-findings.md: pacing bursts just under the threshold,
+   * one per fixed window, evaded it indefinitely, since the window
+   * had no memory of the PREVIOUS window's activity). Without the
+   * dedup half of this, a process rewriting a handful of its own
+   * files repeatedly (browser IndexedDB/storage metadata, sqlite WAL
    * files, log rotation) trips the same counter as one touching 50
    * separate user documents - a real false positive seen in testing
-   * (Firefox/Zen's storage engine rewriting its own
-   * ".metadata-v2" file). Real mass-encryption ransomware still
-   * trips this because it touches many DISTINCT files; an app
-   * hammering its own small file set no longer does. Hashes only
-   * (not full paths) to keep this cheap and fixed-size - a 32-bit
-   * hash collision could theoretically under-count two different
-   * paths as one, which only makes the heuristic slightly less
-   * sensitive, never more trigger-happy. */
+   * (Firefox/Zen's storage engine rewriting its own ".metadata-v2"
+   * file). Real mass-encryption ransomware still trips this because
+   * it touches many DISTINCT files within any trailing window; an app
+   * hammering its own small file set no longer does. Hashes only (not
+   * full paths) to keep this cheap and fixed-size - a 32-bit hash
+   * collision could theoretically under-count two different paths as
+   * one, which only makes the heuristic slightly less sensitive,
+   * never more trigger-happy. recent_path_jiffies is co-indexed with
+   * recent_path_hashes (same slot = same event), NOT necessarily in
+   * oldest-to-newest order once the ring has wrapped - sliding_window_
+   * note() does a full scan every time rather than assuming order,
+   * since MAX_TRACKED_PATHS (50) is small enough that this costs
+   * nothing meaningful. */
   u32 recent_path_hashes[MAX_TRACKED_PATHS];
+  unsigned long recent_path_jiffies[MAX_TRACKED_PATHS];
   unsigned int recent_path_next; /* ring buffer write cursor */
   unsigned int
       recent_path_filled; /* valid entries, caps at MAX_TRACKED_PATHS */
 
-  /* Same dedup-ring-buffer idea as recent_path_hashes above, but for
-   * the rename heuristic: counts DISTINCT source files renamed with
-   * an extension-append shape in the window, keyed on the OLD path
-   * (the file's identity before the rename, mirroring "distinct
-   * paths written" for the write-open counter). See
-   * av_behavior_check_rename() and is_extension_append_rename(). */
-  unsigned int rename_count;
-  unsigned long rename_window_start_jiffies;
+  /* Same true-sliding-window dedup-ring-buffer idea as
+   * recent_path_hashes above, but for the rename heuristic: counts
+   * DISTINCT source files renamed with an extension-append shape
+   * within a trailing window, keyed on the OLD path (the file's
+   * identity before the rename, mirroring "distinct paths written"
+   * for the write-open counter). See av_behavior_check_rename() and
+   * is_extension_append_rename(). */
   u32 recent_rename_hashes[MAX_TRACKED_RENAMES];
+  unsigned long recent_rename_jiffies[MAX_TRACKED_RENAMES];
   unsigned int recent_rename_next;
   unsigned int recent_rename_filled;
 
@@ -236,6 +261,57 @@ struct av_behavior_entry {
                  * is on the trust list - exempts the rapid-write
                  * counter specifically, see behavior.h */
 };
+
+/* Shared true-sliding-window dedup check for both the write-open and
+ * rename counters (same pattern, different ring buffers - see the
+ * struct comment above for why a fixed/discrete window doesn't hold
+ * up against paced bursts). `hashes`/`jiffies_arr` are co-indexed ring
+ * buffers of capacity `cap`; `*filled` is how many of their first
+ * `cap` slots hold valid entries (not necessarily oldest-to-newest
+ * once the ring has wrapped) and `*next` is the write cursor.
+ *
+ * Scans every currently-valid slot, counting how many fall within the
+ * trailing `window_ms` (jiffies_to_msecs(now - timestamp) <=
+ * window_ms - entries older than that have "aged out" of the window
+ * without needing to be physically removed; they simply stop counting
+ * until the ring cursor eventually overwrites them) and whether `hash`
+ * is already among them. If `hash` is already present within the
+ * window, this is a repeat of something already counted - return 0
+ * (nothing new to add) without touching the ring. Otherwise records
+ * `hash` at the ring cursor (evicting whatever was there, which by
+ * construction can only still be within-window in the exact edge case
+ * where the returned count below already exceeds any real-world
+ * threshold - see the call sites) and returns the number of distinct
+ * entries within the window INCLUDING this new one, for the caller to
+ * compare against its own threshold. */
+static unsigned int sliding_window_note(u32 hash, unsigned long now,
+                                        unsigned int window_ms, u32 *hashes,
+                                        unsigned long *jiffies_arr,
+                                        unsigned int cap, unsigned int *next,
+                                        unsigned int *filled) {
+  unsigned int in_window = 0;
+  unsigned int i;
+  bool seen = false;
+
+  for (i = 0; i < *filled; i++) {
+    if (jiffies_to_msecs(now - jiffies_arr[i]) <= window_ms) {
+      in_window++;
+      if (hashes[i] == hash)
+        seen = true;
+    }
+  }
+
+  if (seen)
+    return 0;
+
+  hashes[*next] = hash;
+  jiffies_arr[*next] = now;
+  *next = (*next + 1) % cap;
+  if (*filled < cap)
+    (*filled)++;
+
+  return in_window + 1;
+}
 
 static DEFINE_HASHTABLE(behavior_table, BEHAVIOR_BITS);
 static DEFINE_MUTEX(behavior_lock);
@@ -676,44 +752,14 @@ void av_behavior_check_openat(pid_t pid, const char *path, int flags,
      * threshold. The sensitive-path check above still applies
      * regardless of trust; only the volume-based signal is
      * exempted. */
-    unsigned long window_ms =
-        jiffies_to_msecs(jiffies - e->window_start_jiffies);
-    bool new_window =
-        (e->window_start_jiffies == 0 || window_ms > WRITE_OPEN_WINDOW_MS);
     u32 path_hash = full_name_hash(NULL, path, strlen(path));
-    bool seen_before = false;
-    unsigned int i;
+    unsigned int in_window = sliding_window_note(
+        path_hash, jiffies, WRITE_OPEN_WINDOW_MS, e->recent_path_hashes,
+        e->recent_path_jiffies, MAX_TRACKED_PATHS, &e->recent_path_next,
+        &e->recent_path_filled);
 
-    if (new_window) {
-      /* Start (or restart) the window - also resets the dedup
-       * set, since "distinct paths written" only means anything
-       * within a single window. */
-      e->window_start_jiffies = jiffies;
-      e->write_open_count = 0;
-      e->recent_path_next = 0;
-      e->recent_path_filled = 0;
-    }
-
-    for (i = 0; i < e->recent_path_filled; i++) {
-      if (e->recent_path_hashes[i] == path_hash) {
-        seen_before = true;
-        break;
-      }
-    }
-
-    /* Only count (and only check the threshold on) a path we
-     * haven't already seen in this window - repeatedly rewriting
-     * the same file no longer inflates the counter. */
-    if (!seen_before) {
-      e->recent_path_hashes[e->recent_path_next] = path_hash;
-      e->recent_path_next = (e->recent_path_next + 1) % MAX_TRACKED_PATHS;
-      if (e->recent_path_filled < MAX_TRACKED_PATHS)
-        e->recent_path_filled++;
-
-      e->write_open_count++;
-      if (e->write_open_count > WRITE_OPEN_THRESHOLD)
-        rapid = true;
-    }
+    if (in_window > WRITE_OPEN_THRESHOLD)
+      rapid = true;
   }
   mutex_unlock(&behavior_lock);
 
@@ -772,45 +818,20 @@ void av_behavior_check_rename(pid_t pid, const char *oldpath,
     mutex_lock(&behavior_lock);
     e = get_or_create_entry(pid);
     if (e && !e->trusted) {
-      /* Same sliding-window + distinct-source-file dedup pattern
-       * as av_behavior_check_openat's write-open counter, just
-       * with its own independent window/counter/ring-buffer
-       * fields - see the struct comment. Trust exemption is
-       * identical too: skips ONLY this volume-based signal, the
-       * sensitive-path check above still applies regardless. */
-      unsigned long window_ms =
-          jiffies_to_msecs(jiffies - e->rename_window_start_jiffies);
-      bool new_window =
-          (e->rename_window_start_jiffies == 0 || window_ms > RENAME_WINDOW_MS);
+      /* Same true-sliding-window + distinct-source-file dedup pattern
+       * as av_behavior_check_openat's write-open counter, just with
+       * its own independent ring-buffer fields - see the struct
+       * comment. Trust exemption is identical too: skips ONLY this
+       * volume-based signal, the sensitive-path check above still
+       * applies regardless. */
       u32 path_hash = full_name_hash(NULL, oldpath, strlen(oldpath));
-      bool seen_before = false;
-      unsigned int i;
+      unsigned int in_window = sliding_window_note(
+          path_hash, jiffies, RENAME_WINDOW_MS, e->recent_rename_hashes,
+          e->recent_rename_jiffies, MAX_TRACKED_RENAMES,
+          &e->recent_rename_next, &e->recent_rename_filled);
 
-      if (new_window) {
-        e->rename_window_start_jiffies = jiffies;
-        e->rename_count = 0;
-        e->recent_rename_next = 0;
-        e->recent_rename_filled = 0;
-      }
-
-      for (i = 0; i < e->recent_rename_filled; i++) {
-        if (e->recent_rename_hashes[i] == path_hash) {
-          seen_before = true;
-          break;
-        }
-      }
-
-      if (!seen_before) {
-        e->recent_rename_hashes[e->recent_rename_next] = path_hash;
-        e->recent_rename_next =
-            (e->recent_rename_next + 1) % MAX_TRACKED_RENAMES;
-        if (e->recent_rename_filled < MAX_TRACKED_RENAMES)
-          e->recent_rename_filled++;
-
-        e->rename_count++;
-        if (e->rename_count > RENAME_THRESHOLD)
-          rapid = true;
-      }
+      if (in_window > RENAME_THRESHOLD)
+        rapid = true;
     }
     mutex_unlock(&behavior_lock);
   }
