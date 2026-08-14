@@ -44,13 +44,12 @@ fi
 echo "==> pre-push: changes detected in av/, userspace/avctl/, or userspace/avd/"
 echo "    running full test suite (build, insmod, EICAR detection, rmmod)"
 
-if ! sudo -v; then
-    echo
-    echo "pre-push: could not get sudo - aborting push. Run manually, then push again:"
-    echo "  sudo tests/run_all.sh"
-    exit 1
-fi
-
+# No separate 'sudo -v' preflight: it validates a general credential
+# refresh, which a command-scoped NOPASSWD sudoers rule (e.g. for
+# exactly 'tests/run_all.sh') does not satisfy even though the actual
+# command below would succeed non-interactively under that same rule.
+# 'sudo tests/run_all.sh' fails on its own, with its own clear error,
+# if sudo genuinely is not available - no need to duplicate that check.
 if sudo tests/run_all.sh; then
     echo "pre-push: all tests passed"
     exit 0
