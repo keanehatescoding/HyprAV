@@ -74,6 +74,7 @@ echo
 
 cat >"$TESTDIR/execveat_runner.c" <<'EOF'
 #define _GNU_SOURCE
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -115,8 +116,19 @@ int main(int argc, char *argv[])
 
     av_[0] = (char *)path;
     syscall(SYS_execveat, dfd, path, av_, ev_, flags);
-    perror("execveat"); /* only reached if execveat itself failed */
-    return 1;
+    /* Only reached if execveat itself failed. Save errno immediately -
+     * perror()/stdio can clobber it as a side effect before we get to
+     * use it, even on their own success paths - then exit with that
+     * saved value (not just a fixed 1) so callers that need to
+     * distinguish WHY it failed (e.g. confirming ENOENT rather than
+     * some other error, or the helper never reaching the syscall at
+     * all) can check $? for the specific errno value instead of just
+     * "nonzero". */
+    {
+        int saved_errno = errno;
+        perror("execveat");
+        return saved_errno;
+    }
 }
 EOF
 gcc -o "$TESTDIR/execveat_runner" "$TESTDIR/execveat_runner.c"
@@ -248,18 +260,30 @@ echo
 
 # Without AT_EMPTY_PATH, an empty pathname is invalid (ENOENT) - the
 # syscall fails before executing anything, so no kill event should
-# ever appear for it.
+# ever appear for it. Absence of a kill event alone doesn't prove
+# that, though - the helper could have died before ever reaching the
+# syscall, or (if handler_pre_execveat() regressed some other way) the
+# syscall could have unexpectedly succeeded without being detected.
+# execveat_runner exits with errno itself on failure (see the C source
+# above), so assert the specific failure this case requires: ENOENT
+# (value 2 on Linux - see errno-base.h), not just "something nonzero".
 echo "-- Test 6: real dfd + empty path, AT_EMPTY_PATH NOT set --"
 dmesg -C
-"$TESTDIR/execveat_runner" "$TESTDIR/subdir" "" 0 || true
+rc=0
+"$TESTDIR/execveat_runner" "$TESTDIR/subdir" "" 0 || rc=$?
 sleep 1
-if dmesg | tail -10 | grep -q 'event=detected.*action=kill'; then
+ENOENT=2
+if [ "$rc" -ne "$ENOENT" ]; then
+	echo "FAIL: execveat_runner exited $rc, expected ENOENT ($ENOENT) - either it never"
+	echo "      reached the syscall, or the syscall didn't fail the way this case requires"
+	FAIL=$((FAIL + 1))
+elif dmesg | tail -10 | grep -q 'event=detected.*action=kill'; then
 	echo "FAIL: a kill event fired for a syscall that should have failed with ENOENT -"
 	echo "      handler_pre_execveat() scanned dfd despite empty_path being false"
 	dmesg | tail -10
 	FAIL=$((FAIL + 1))
 else
-	echo "PASS: no kill event for the invalid empty-path-without-the-flag case"
+	echo "PASS: execveat() failed with ENOENT as expected, and no kill event fired"
 	PASS=$((PASS + 1))
 fi
 echo
