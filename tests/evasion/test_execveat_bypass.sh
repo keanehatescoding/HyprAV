@@ -42,8 +42,11 @@ if [ ! -d /sys/module/av ]; then
 	exit 1
 fi
 
-TESTDIR=/tmp/execveat_test
-mkdir -p "$TESTDIR"
+# mktemp -d gives an unpredictable name with mode 0700 already, so a
+# local attacker can't pre-create it or a symlink at this path ahead
+# of us the way a fixed /tmp/execveat_test name would allow.
+TESTDIR="$(mktemp -d /tmp/execveat_test.XXXXXXXX)"
+trap 'rm -rf "$TESTDIR"' EXIT
 
 PASS=0
 FAIL=0
@@ -53,7 +56,7 @@ echo
 
 # ---- build the raw-syscall runner ----
 
-cat >/tmp/execveat_runner.c <<'EOF'
+cat >"$TESTDIR/execveat_runner.c" <<'EOF'
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -100,7 +103,7 @@ int main(int argc, char *argv[])
     return 1;
 }
 EOF
-gcc -o /tmp/execveat_runner /tmp/execveat_runner.c
+gcc -o "$TESTDIR/execveat_runner" "$TESTDIR/execveat_runner.c"
 
 # ---- shared EICAR fixture ----
 
@@ -110,8 +113,8 @@ gcc -o /tmp/execveat_runner /tmp/execveat_runner.c
 # wrong-content bug) - same reasoning as tests/test_detection.sh's
 # identical EICAR fixture.
 # shellcheck disable=SC2016
-printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' >/tmp/eicar.com
-chmod +x /tmp/eicar.com
+printf 'X5O!P%%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' >"$TESTDIR/eicar.com"
+chmod +x "$TESTDIR/eicar.com"
 
 # av_kill()'s log format is structured key=value (see main.c's
 # v1.0.0-merge comment): "event=detected action=kill type=...
@@ -130,9 +133,9 @@ check_detected() {
 
 echo "-- Test 1: AT_FDCWD + absolute path --"
 dmesg -C
-/tmp/execveat_runner AT_FDCWD /tmp/eicar.com 0 || true
+"$TESTDIR/execveat_runner" AT_FDCWD "$TESTDIR/eicar.com" 0 || true
 sleep 1
-if check_detected "/tmp/eicar.com"; then
+if check_detected "$TESTDIR/eicar.com"; then
 	echo "PASS: detected via AT_FDCWD + absolute path"
 	PASS=$((PASS + 1))
 else
@@ -146,9 +149,9 @@ echo
 
 echo "-- Test 2: AT_FDCWD + relative path --"
 dmesg -C
-(cd /tmp && /tmp/execveat_runner AT_FDCWD eicar.com 0 || true)
+(cd "$TESTDIR" && "$TESTDIR/execveat_runner" AT_FDCWD eicar.com 0 || true)
 sleep 1
-if check_detected "/tmp/eicar.com"; then
+if check_detected "$TESTDIR/eicar.com"; then
 	echo "PASS: relative path resolved against cwd correctly"
 	PASS=$((PASS + 1))
 else
@@ -162,9 +165,9 @@ echo
 
 echo "-- Test 3: real dfd + relative path --"
 mkdir -p "$TESTDIR/subdir"
-cp /tmp/eicar.com "$TESTDIR/subdir/eicar.com"
+cp "$TESTDIR/eicar.com" "$TESTDIR/subdir/eicar.com"
 dmesg -C
-/tmp/execveat_runner "$TESTDIR/subdir" eicar.com 0 || true
+"$TESTDIR/execveat_runner" "$TESTDIR/subdir" eicar.com 0 || true
 sleep 1
 if check_detected "$TESTDIR/subdir/eicar.com"; then
 	echo "PASS: dfd-relative path resolved correctly"
@@ -181,7 +184,7 @@ echo
 
 echo "-- Test 4: memfd + AT_EMPTY_PATH (fileless exec) --"
 dmesg -C
-/tmp/execveat_runner memfd /tmp/eicar.com 0 || true
+"$TESTDIR/execveat_runner" memfd "$TESTDIR/eicar.com" 0 || true
 sleep 1
 # An anonymous memfd has no real dentry in any mounted filesystem, so
 # d_path() reports it the same way the kernel always names memfds:
@@ -203,9 +206,7 @@ fi
 echo
 
 # ---- summary ----
-
-rm -f /tmp/execveat_runner /tmp/execveat_runner.c /tmp/eicar.com
-rm -rf "$TESTDIR"
+# (cleanup of $TESTDIR happens via the EXIT trap set above)
 
 echo "=== Summary: $PASS passed, $FAIL failed ==="
 if [ "$FAIL" -gt 0 ]; then

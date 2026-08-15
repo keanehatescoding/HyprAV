@@ -862,11 +862,17 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * resolve_dfd_path() above (there is no separate "directory" to look
  * a name up under - dfd already names the whole target), so aw->path
  * is set to the empty-string sentinel (see resolve_absolute_path()'s
- * and open_exec_target()'s matching comments in this file) instead of
- * whatever raw bytes userspace happened to pass as pathname - trusting
- * the flag as the authoritative signal here, not the string, since a
- * real AT_EMPTY_PATH execveat() only succeeds with an empty pathname
- * to begin with. */
+ * and open_exec_target()'s matching comments in this file). This
+ * kprobe runs BEFORE the real execveat() validates its arguments,
+ * though, so empty_path is only a caller-supplied claim at this
+ * point, not yet a fact: a real AT_EMPTY_PATH execveat() only
+ * succeeds with an actually-empty pathname, but a caller could pass
+ * the flag with a non-empty user_filename and have the syscall itself
+ * fail afterward - if this hook trusted the flag alone, it would
+ * still have scanned `dfd` and could kill the caller over a syscall
+ * that never actually executed anything. The pathname is copied and
+ * checked against what the flag claims below instead of skipping the
+ * copy on the empty_path branch. */
 static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
   const char __user *user_filename;
@@ -905,12 +911,19 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   }
   aw->pwd = base;
 
-  if (empty_path) {
-    aw->path[0] = '\0';
-  } else {
+  {
+    /* Copy unconditionally, then validate against what empty_path
+     * claims: a real AT_EMPTY_PATH execveat() only ever succeeds with
+     * an empty pathname, and every other pathname-taking hook in this
+     * file already rejects a zero-length copy - so path_len == 0 must
+     * agree with empty_path exactly, in both directions, or the
+     * syscall this handler is racing ahead of is headed for failure
+     * and dfd must not be scanned/killed over it. */
     ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
 
-    if (path_len <= 0 || path_len >= PATH_MAX) {
+    if (path_len < 0 || path_len >= PATH_MAX ||
+        (empty_path && path_len != 0) ||
+        (!empty_path && path_len == 0)) {
       path_put(&aw->pwd);
       kfree(aw);
       av_work_release();
