@@ -854,25 +854,36 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * execveat() fileless-exec loaders actually use, so it's not a
  * theoretical gap.
  *
- * AT_EMPTY_PATH (flags argument, real_regs->r8) IS special-cased:
- * fexecve()-style callers pass an empty pathname and rely on dfd
- * naming the target file directly (typically an anonymous memfd) -
- * exactly the fileless-exec shape this hook exists to close. `dfd`
- * has already been resolved to the target's own struct path by
- * resolve_dfd_path() above (there is no separate "directory" to look
- * a name up under - dfd already names the whole target), so aw->path
- * is set to the empty-string sentinel (see resolve_absolute_path()'s
- * and open_exec_target()'s matching comments in this file). This
- * kprobe runs BEFORE the real execveat() validates its arguments,
- * though, so empty_path is only a caller-supplied claim at this
- * point, not yet a fact: a real AT_EMPTY_PATH execveat() only
- * succeeds with an actually-empty pathname, but a caller could pass
- * the flag with a non-empty user_filename and have the syscall itself
- * fail afterward - if this hook trusted the flag alone, it would
- * still have scanned `dfd` and could kill the caller over a syscall
- * that never actually executed anything. The pathname is copied and
- * checked against what the flag claims below instead of skipping the
- * copy on the empty_path branch. */
+ * AT_EMPTY_PATH (flags argument, real_regs->r8) IS special-cased, but
+ * only when the pathname is ALSO actually empty: per execveat(2), an
+ * empty pathname with AT_EMPTY_PATH set means dfd names the target
+ * file directly (typically an anonymous memfd) - exactly the
+ * fileless-exec shape this hook exists to close. `dfd` has already
+ * been resolved to the target's own struct path by resolve_dfd_path()
+ * above (there is no separate "directory" to look a name up under -
+ * dfd already names the whole target), so aw->path is set to the
+ * empty-string sentinel in that case (see resolve_absolute_path()'s
+ * and open_exec_target()'s matching comments in this file).
+ *
+ * AT_EMPTY_PATH set together with a NON-empty pathname is NOT that
+ * case, though, and must not be treated as one: per execveat(2), the
+ * flag only changes anything when the pathname is empty - a non-empty
+ * pathname is resolved exactly as it would be without the flag
+ * (relative to dfd, or absolute), and that resolution succeeds
+ * normally. Bailing out here on that combination (as an earlier
+ * version of this hook did, prompted by a review comment that assumed
+ * the syscall fails in that case) would have made AT_EMPTY_PATH a
+ * free detection bypass: set the flag on an otherwise-ordinary
+ * dfd-relative execveat() and this hook skips scanning entirely while
+ * the kernel executes the file anyway. So the only combination that's
+ * actually invalid - and skipped below - is an empty pathname WITHOUT
+ * AT_EMPTY_PATH (generic path resolution rejects a zero-length name
+ * unless LOOKUP_EMPTY is set, so that syscall fails with ENOENT and
+ * there is nothing to scan). Every other combination copies the real
+ * pathname into aw->path and proceeds - empty+flag through the
+ * sentinel branch above, non-empty (flag or not) through the normal
+ * relative/absolute resolution every other pathname-taking hook in
+ * this file already uses. */
 static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
   const char __user *user_filename;
@@ -912,18 +923,17 @@ static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   aw->pwd = base;
 
   {
-    /* Copy unconditionally, then validate against what empty_path
-     * claims: a real AT_EMPTY_PATH execveat() only ever succeeds with
-     * an empty pathname, and every other pathname-taking hook in this
-     * file already rejects a zero-length copy - so path_len == 0 must
-     * agree with empty_path exactly, in both directions, or the
-     * syscall this handler is racing ahead of is headed for failure
-     * and dfd must not be scanned/killed over it. */
+    /* Copy unconditionally - a non-empty pathname is scanned via the
+     * normal relative/absolute branch below regardless of empty_path
+     * (see the doc comment above: AT_EMPTY_PATH only changes anything
+     * when the pathname is actually empty). The only combination
+     * that's genuinely invalid is an empty pathname WITHOUT
+     * AT_EMPTY_PATH - that syscall fails with ENOENT before doing
+     * anything, so dfd must not be scanned/killed over it. */
     ssize_t path_len = strncpy_from_user(aw->path, user_filename, PATH_MAX);
 
     if (path_len < 0 || path_len >= PATH_MAX ||
-        (empty_path && path_len != 0) ||
-        (!empty_path && path_len == 0)) {
+        (path_len == 0 && !empty_path)) {
       path_put(&aw->pwd);
       kfree(aw);
       av_work_release();

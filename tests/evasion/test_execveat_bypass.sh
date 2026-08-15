@@ -9,7 +9,7 @@
 # call at all).
 #
 # Technique: glibc has no execveat() wrapper, so this calls the raw
-# syscall directly via syscall(SYS_execveat, ...). Covers four cases
+# syscall directly via syscall(SYS_execveat, ...). Covers six cases
 # that mirror bugs already found and fixed elsewhere in this codebase
 # for other syscalls (execve's relative-path fix, openat's dfd-ignored
 # fix):
@@ -24,7 +24,23 @@
 #      now special-cases AT_EMPTY_PATH and resolves the target via
 #      dfd's own struct path directly - see main.c's comments on the
 #      empty-string sentinel in resolve_absolute_path()/
-#      open_exec_target(). All four are real pass/fail assertions now.
+#      open_exec_target().
+#   5. real dfd + non-empty relative path + AT_EMPTY_PATH set anyway -
+#      per execveat(2), AT_EMPTY_PATH only changes anything when the
+#      pathname is actually empty; a non-empty pathname resolves
+#      exactly as it would without the flag, and that resolution
+#      succeeds. Regression case for a bug this hook briefly had:
+#      treating "AT_EMPTY_PATH is set" as "trust the flag, skip
+#      scanning" would have made the flag a free bypass for an
+#      otherwise-ordinary dfd-relative exec. Must be detected exactly
+#      like Test 3.
+#   6. real dfd + empty pathname, AT_EMPTY_PATH NOT set - the one
+#      combination that's genuinely invalid: generic path resolution
+#      rejects a zero-length pathname unless LOOKUP_EMPTY is set, so
+#      this execveat() fails with ENOENT before executing anything.
+#      Must NOT be detected/killed - there is nothing to scan.
+#
+# All six are real pass/fail assertions now.
 #
 # NEEDS THE LIVE KERNEL MODULE - run this in your VM, not standalone.
 #
@@ -202,6 +218,49 @@ else
 	echo "      open_exec_target() in main.c"
 	dmesg | tail -10
 	FAIL=$((FAIL + 1))
+fi
+echo
+
+# ---- Test 5: real dfd + non-empty relative path + AT_EMPTY_PATH set anyway ----
+
+# 0x1000 = AT_EMPTY_PATH. Setting it here does NOT make the pathname
+# argument optional/ignored - execveat(2) only special-cases an empty
+# pathname. With a non-empty pathname the flag is inert and resolution
+# proceeds exactly like Test 3 (relative to dfd), so this must still
+# be detected. A hook that trusts the flag alone and skips scanning
+# whenever it's set would silently miss this.
+echo "-- Test 5: real dfd + relative path + AT_EMPTY_PATH set anyway --"
+dmesg -C
+"$TESTDIR/execveat_runner" "$TESTDIR/subdir" eicar.com 4096 || true
+sleep 1
+if check_detected "$TESTDIR/subdir/eicar.com"; then
+	echo "PASS: AT_EMPTY_PATH + non-empty path still resolved/detected normally"
+	PASS=$((PASS + 1))
+else
+	echo "FAIL: AT_EMPTY_PATH + non-empty path was NOT detected - handler_pre_execveat()"
+	echo "      is treating the flag as authoritative and skipping the scan instead of"
+	echo "      only special-casing an actually-empty pathname"
+	FAIL=$((FAIL + 1))
+fi
+echo
+
+# ---- Test 6: real dfd + empty pathname, AT_EMPTY_PATH NOT set ----
+
+# Without AT_EMPTY_PATH, an empty pathname is invalid (ENOENT) - the
+# syscall fails before executing anything, so no kill event should
+# ever appear for it.
+echo "-- Test 6: real dfd + empty path, AT_EMPTY_PATH NOT set --"
+dmesg -C
+"$TESTDIR/execveat_runner" "$TESTDIR/subdir" "" 0 || true
+sleep 1
+if dmesg | tail -10 | grep -q 'event=detected.*action=kill'; then
+	echo "FAIL: a kill event fired for a syscall that should have failed with ENOENT -"
+	echo "      handler_pre_execveat() scanned dfd despite empty_path being false"
+	dmesg | tail -10
+	FAIL=$((FAIL + 1))
+else
+	echo "PASS: no kill event for the invalid empty-path-without-the-flag case"
+	PASS=$((PASS + 1))
 fi
 echo
 
