@@ -121,6 +121,8 @@ static int write_command_to(const char *path, const char *cmd)
     int fd = open(path, O_WRONLY);
     ssize_t written;
     int saved_errno;
+    size_t cmd_len;
+    char *buf;
 
     if (fd < 0) {
         saved_errno = errno;
@@ -130,8 +132,27 @@ static int write_command_to(const char *path, const char *cmd)
         return -saved_errno;
     }
 
-    written = write(fd, cmd, strlen(cmd));
-    saved_errno = errno; /* capture before close() can touch it */
+    /* Kernel-side proc write handlers require a trailing newline as an
+     * explicit "this is a complete, non-truncated command" marker (see
+     * protected_proc_write()'s comment in av/behavior.c) - build ONE
+     * buffer with it appended and issue a SINGLE write() for the
+     * whole thing, rather than a second write() call for just "\n"
+     * afterward, which would itself land at a nonzero file offset and
+     * get rejected as an unexpected continuation of the first. */
+    cmd_len = strlen(cmd);
+    buf = malloc(cmd_len + 2);
+    if (!buf) {
+        close(fd);
+        fprintf(stderr, "avctl: out of memory\n");
+        return -ENOMEM;
+    }
+    memcpy(buf, cmd, cmd_len);
+    buf[cmd_len] = '\n';
+    buf[cmd_len + 1] = '\0';
+
+    written = write(fd, buf, cmd_len + 1);
+    saved_errno = errno; /* capture before close()/free() can touch it */
+    free(buf);
     close(fd);
 
     if (written < 0) {

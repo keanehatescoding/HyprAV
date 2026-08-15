@@ -625,10 +625,14 @@ static int protected_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, protected_proc_show, NULL);
 }
 
-/* Content this write handler will accept in a single call - see the
- * comment on the *ppos check below for why this is well under
- * PATH_MAX rather than matching it. */
-#define PROTECTED_WRITE_MAXLEN 4000
+/* Content this write handler will accept in a single call: the "add "/
+ * "del " prefix, a full PATH_MAX-1 path, a mandatory trailing
+ * terminator (see the *ppos/terminator comments below), and slack for
+ * the NUL. Sized to the full path range avctl itself already accepts
+ * (userspace/avctl/avctl.c rejects a path at or above PATH_MAX before
+ * ever sending it) - a shorter cap here would silently reject
+ * otherwise-valid CLI input with no way for the caller to tell why. */
+#define PROTECTED_WRITE_MAXLEN (PATH_MAX + 16)
 
 /* ppos is only read here, but proc_write must match struct proc_ops's
  * fixed non-const loff_t * signature exactly - same class of false
@@ -646,26 +650,20 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, 
   int n;
   ssize_t ret;
 
-  /* Reject anything but the first write to a freshly-opened fd.
-   * PROTECTED_WRITE_MAXLEN is deliberately picked well under 4096:
-   * verified empirically that a single userspace write() near/above
-   * that size does NOT reliably arrive here as one call - common
-   * libc/shell stdio buffering (bash's own `>`/`printf` redirection
-   * included) flushes in ~4096-byte chunks, so a large enough write
-   * shows up as SEVERAL separate calls to this function, each with
-   * *ppos advanced past the previous chunk's byte count. Without this
-   * check, the FIRST such chunk (itself under whatever size limit is
-   * checked below, since it's capped at the flush size) would be
-   * parsed and acted on as if it were the complete command, silently
-   * protecting/unprotecting a TRUNCATED path with no error - exactly
-   * the truncation risk this handler exists to avoid, just moved up
-   * one level (across calls instead of within one). Keeping the
-   * accepted size safely under that empirical ~4096-byte chunk
-   * boundary means any write actually within the accepted range is
-   * small enough to always arrive as one real single call in
-   * practice, and anything larger gets its first (necessarily
-   * oversized relative to this smaller cap) chunk rejected outright
-   * by the size check below instead of silently accepted. */
+  /* Reject anything but the first write to a freshly-opened fd - a
+   * genuine continuation of an earlier call (its *ppos already
+   * advanced past 0) is never a complete, standalone command on its
+   * own and must not be parsed as one. This alone is not enough,
+   * though: verified empirically that a single userspace write() near
+   * PAGE_SIZE does NOT reliably arrive here as one call in the first
+   * place - common libc/shell stdio buffering (bash's own `>`/
+   * `printf` redirection included) flushes in ~4096-byte chunks, so a
+   * large enough write shows up as SEVERAL separate calls, each
+   * individually small enough to slip under a size check that doesn't
+   * also know whether the content it received is actually complete.
+   * The mandatory trailing terminator required below is what actually
+   * closes that gap (a truncated first chunk from mid-content
+   * splitting won't end in one), not the size cap alone. */
   if (*ppos != 0)
     return -EINVAL;
 
@@ -705,9 +703,41 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, 
 
   {
     char *rest = kbuf + strcspn(kbuf, " \t");
+    size_t rest_len;
 
     rest += strspn(rest, " \t");
-    if (*rest == '\0' || strlen(rest) >= PATH_MAX) {
+    rest_len = strlen(rest);
+
+    /* Require (and then strip) a trailing terminator rather than
+     * just taking whatever's left as the path:
+     *
+     * 1. It's the real fix for the multi-chunk truncation risk the
+     *    *ppos check above only partially covers - a write that got
+     *    cut mid-content by chunked delivery ends mid-path, not on a
+     *    newline, so requiring one here is what actually rejects a
+     *    truncated fragment instead of silently accepting it as a
+     *    complete path.
+     * 2. Without stripping it, a completely ordinary `echo "add
+     *    /path" > .../kernel_av_protected` (this proc file's own
+     *    documented usage pattern, same as sigtable.c's) would store
+     *    "/path\n" - trailing newline included - which then never
+     *    matches any real resolved executable path (d_path() output
+     *    never ends in a newline), silently making every entry added
+     *    this way permanently ineffective. avctl's own writes get the
+     *    same terminator via write_command_to() so this applies
+     *    uniformly regardless of caller.
+     *
+     * An optional preceding \r is stripped too, for a caller on the
+     * other side of a CRLF-translating pipe. */
+    if (rest_len == 0 || rest[rest_len - 1] != '\n') {
+      ret = -EINVAL;
+      goto out;
+    }
+    rest[--rest_len] = '\0';
+    if (rest_len > 0 && rest[rest_len - 1] == '\r')
+      rest[--rest_len] = '\0';
+
+    if (rest_len == 0 || rest_len >= PATH_MAX) {
       ret = -EINVAL;
       goto out;
     }
