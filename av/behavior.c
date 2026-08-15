@@ -488,6 +488,8 @@ static bool path_is_on_protected_list(const char *path) {
 }
 
 int av_behavior_protect_add(const char *path) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_protected_entry *existing = NULL;
   struct av_protected_entry *e;
 
   if (path[0] != '/' || strlen(path) >= PROTECTED_PATH_LEN)
@@ -500,6 +502,20 @@ int av_behavior_protect_add(const char *path) {
   strscpy(e->path, path, sizeof(e->path));
 
   mutex_lock(&protected_lock);
+  /* Reject a duplicate instead of silently adding a second entry
+   * alongside it - same reasoning as av_sigtable_add()'s duplicate
+   * check in sigtable.c. Without this, av_behavior_protect_del()
+   * would only ever remove ONE of the two entries (it stops at the
+   * first match), leaving the path still protected after what looks
+   * like a successful `protect del`. Checked under the same lock as
+   * the insert below - no separate pre-check, so no TOCTOU window. */
+  hash_for_each_possible(protected_table, existing, node, path_key(e->path)) {
+    if (!strcmp(existing->path, e->path)) {
+      mutex_unlock(&protected_lock);
+      kfree(e);
+      return -EEXIST;
+    }
+  }
   hash_add(protected_table, &e->node, path_key(e->path));
   mutex_unlock(&protected_lock);
 
@@ -609,8 +625,16 @@ static int protected_proc_open(struct inode *inode, struct file *file) {
   return single_open(file, protected_proc_show, NULL);
 }
 
-static ssize_t protected_proc_write(struct file *file, const char __user *ubuf,
-                                    size_t count, loff_t *ppos) {
+/* Content this write handler will accept in a single call - see the
+ * comment on the *ppos check below for why this is well under
+ * PATH_MAX rather than matching it. */
+#define PROTECTED_WRITE_MAXLEN 4000
+
+/* ppos is only read here, but proc_write must match struct proc_ops's
+ * fixed non-const loff_t * signature exactly - same class of false
+ * positive as av_netlink_notify()'s data parameter in netlink_chan.c. */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
   /* kbuf/path are PATH_MAX-scale buffers (unlike sig_proc_write()/
    * trust_proc_write(), which only ever handle a 64-hex-char digest) -
    * heap-allocate both rather than declare them on the kernel stack;
@@ -622,12 +646,35 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf,
   int n;
   ssize_t ret;
 
-  /* Reject oversized writes instead of silently truncating them - same
-   * reasoning as sig_proc_write()/trust_proc_write(). */
-  if (count >= PATH_MAX + 8)
+  /* Reject anything but the first write to a freshly-opened fd.
+   * PROTECTED_WRITE_MAXLEN is deliberately picked well under 4096:
+   * verified empirically that a single userspace write() near/above
+   * that size does NOT reliably arrive here as one call - common
+   * libc/shell stdio buffering (bash's own `>`/`printf` redirection
+   * included) flushes in ~4096-byte chunks, so a large enough write
+   * shows up as SEVERAL separate calls to this function, each with
+   * *ppos advanced past the previous chunk's byte count. Without this
+   * check, the FIRST such chunk (itself under whatever size limit is
+   * checked below, since it's capped at the flush size) would be
+   * parsed and acted on as if it were the complete command, silently
+   * protecting/unprotecting a TRUNCATED path with no error - exactly
+   * the truncation risk this handler exists to avoid, just moved up
+   * one level (across calls instead of within one). Keeping the
+   * accepted size safely under that empirical ~4096-byte chunk
+   * boundary means any write actually within the accepted range is
+   * small enough to always arrive as one real single call in
+   * practice, and anything larger gets its first (necessarily
+   * oversized relative to this smaller cap) chunk rejected outright
+   * by the size check below instead of silently accepted. */
+  if (*ppos != 0)
     return -EINVAL;
 
-  kbuf = kmalloc(PATH_MAX + 8, GFP_KERNEL);
+  /* Reject oversized writes instead of silently truncating them - same
+   * reasoning as sig_proc_write()/trust_proc_write(). */
+  if (count >= PROTECTED_WRITE_MAXLEN)
+    return -EINVAL;
+
+  kbuf = kmalloc(PROTECTED_WRITE_MAXLEN, GFP_KERNEL);
   path = kmalloc(PATH_MAX, GFP_KERNEL);
   if (!kbuf || !path) {
     ret = -ENOMEM;
@@ -640,17 +687,41 @@ static ssize_t protected_proc_write(struct file *file, const char __user *ubuf,
   }
   kbuf[count] = '\0';
 
-  n = sscanf(kbuf, "%7s %4095[^\n]", cmd, path);
-  if (n < 2) {
+  /* Not sscanf("%7s %4095[^\n]", ...) for the path half: a FIXED-width
+   * field silently truncates an oversized path to 4095 bytes rather
+   * than rejecting it, and the truncated result can still be short
+   * enough to pass av_behavior_protect_add()'s own length check -
+   * i.e. a >PATH_MAX write here would silently protect/unprotect a
+   * DIFFERENT (truncated) path than the one the caller actually sent,
+   * without any error. Parse cmd the same way, but take the path as
+   * "everything after cmd and its following whitespace" directly, so
+   * an oversized path is detected and rejected instead of quietly
+   * mutated. */
+  n = sscanf(kbuf, "%7s", cmd);
+  if (n < 1) {
     ret = -EINVAL;
     goto out;
   }
 
-  if (!strcasecmp(cmd, "add")) {
-    if (av_behavior_protect_add(path)) {
+  {
+    char *rest = kbuf + strcspn(kbuf, " \t");
+
+    rest += strspn(rest, " \t");
+    if (*rest == '\0' || strlen(rest) >= PATH_MAX) {
       ret = -EINVAL;
       goto out;
     }
+    strscpy(path, rest, PATH_MAX);
+  }
+
+  if (!strcasecmp(cmd, "add")) {
+    /* Propagate the real error - specifically -EEXIST for a
+     * duplicate add - rather than flattening every failure to
+     * -EINVAL, same reasoning as sig_proc_write()'s identical fix
+     * in sigtable.c. */
+    ret = av_behavior_protect_add(path);
+    if (ret)
+      goto out;
   } else if (!strcasecmp(cmd, "del")) {
     /* cppcheck-suppress knownConditionTrueFalse
      * Same false positive as av_behavior_trust_del()'s call site

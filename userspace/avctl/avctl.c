@@ -371,6 +371,7 @@ static int do_protect(int argc, char **argv)
         return do_protect_list();
     } else if (!strcmp(argv[2], "add")) {
         char cmd[PATH_MAX + 8];
+        int n;
 
         if (argc < 4) {
             usage(argv[0]);
@@ -380,18 +381,39 @@ static int do_protect(int argc, char **argv)
             fprintf(stderr, "avctl: protect add requires an absolute path\n");
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "add %s", argv[3]);
+        /* Reject up front rather than letting snprintf() silently
+         * truncate: a truncated write would ask the kernel side to
+         * protect/unprotect a DIFFERENT (shorter) path than the one
+         * printed back to the caller, with no error either side. */
+        if (strlen(argv[3]) >= PATH_MAX) {
+            fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+            return 1;
+        }
+        n = snprintf(cmd, sizeof(cmd), "add %s", argv[3]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: path too long to format\n");
+            return 1;
+        }
         if (write_command_to(PROTECTED_PROC_PATH, cmd))
             return 1;
         printf("protected: %s\n", argv[3]);
     } else if (!strcmp(argv[2], "del")) {
         char cmd[PATH_MAX + 8];
+        int n;
 
         if (argc < 4) {
             usage(argv[0]);
             return 1;
         }
-        snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
+        if (strlen(argv[3]) >= PATH_MAX) {
+            fprintf(stderr, "avctl: path too long (max %d bytes)\n", PATH_MAX - 1);
+            return 1;
+        }
+        n = snprintf(cmd, sizeof(cmd), "del %s", argv[3]);
+        if (n < 0 || (size_t)n >= sizeof(cmd)) {
+            fprintf(stderr, "avctl: path too long to format\n");
+            return 1;
+        }
         if (write_command_to(PROTECTED_PROC_PATH, cmd))
             return 1;
         printf("unprotected: %s\n", argv[3]);
