@@ -17,15 +17,19 @@
  * reuses the same delayed_work idiom as everything else here.
  */
 
+#include <linux/dcache.h>
 #include <linux/fcntl.h>
+#include <linux/file.h>
 #include <linux/hashtable.h>
 #include <linux/jiffies.h>
+#include <linux/mm.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/pid.h>
 #include <linux/proc_fs.h>
 #include <linux/rcupdate.h>
 #include <linux/sched.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/signal.h>
 #include <linux/seq_file.h>
 #include <linux/slab.h>
@@ -433,6 +437,375 @@ static void trust_table_destroy(void) {
   mutex_unlock(&trust_lock);
 }
 
+/* ---- protected-path allow-list ----
+ *
+ * The only hard-coded kill guard anywhere in this module is "never
+ * target PID 1" (see kill_with_reason() below and av_kill() in
+ * main.c) - deliberately minimal, since a loadable module has no
+ * portable, distro-independent way to know which OTHER binaries on a
+ * given system are "critical" (systemd's own path varies by distro,
+ * sshd might be OpenSSH or something else entirely, etc.). Baking in
+ * a hardcoded binary-name list would be exactly the kind of fragile,
+ * distro-specific guess this codebase avoids elsewhere.
+ *
+ * Instead: an operator-managed allow-list of exact absolute exe
+ * paths, mirroring the trusted-hash-list pattern above almost
+ * exactly. A match here suppresses the KILL action only (same
+ * log-then-skip shape as the PID-1 guard) - detection itself, and the
+ * log line explaining what would have happened, are unaffected.
+ * Exact-path match rather than prefix: protecting "/usr/bin/ssh"
+ * shouldn't silently also protect "/usr/bin/ssh-agent" or anything
+ * else an operator didn't explicitly list. */
+
+#define PROTECTED_PATH_LEN PATH_MAX
+
+struct av_protected_entry {
+  struct hlist_node node;
+  char path[PROTECTED_PATH_LEN];
+};
+
+static DEFINE_HASHTABLE(protected_table, TRUST_BITS);
+static DEFINE_MUTEX(protected_lock);
+
+static u32 path_key(const char *path) {
+  return full_name_hash(NULL, path, strlen(path));
+}
+
+static bool path_is_on_protected_list(const char *path) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_protected_entry *e = NULL;
+  bool found = false;
+
+  mutex_lock(&protected_lock);
+  hash_for_each_possible(protected_table, e, node, path_key(path)) {
+    if (!strcmp(e->path, path)) {
+      found = true;
+      break;
+    }
+  }
+  mutex_unlock(&protected_lock);
+  return found;
+}
+
+int av_behavior_protect_add(const char *path) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_protected_entry *existing = NULL;
+  struct av_protected_entry *e;
+
+  if (path[0] != '/' || strlen(path) >= PROTECTED_PATH_LEN)
+    return -EINVAL;
+
+  e = kmalloc(sizeof(*e), GFP_KERNEL);
+  if (!e)
+    return -ENOMEM;
+
+  strscpy(e->path, path, sizeof(e->path));
+
+  mutex_lock(&protected_lock);
+  /* Reject a duplicate instead of silently adding a second entry
+   * alongside it - same reasoning as av_sigtable_add()'s duplicate
+   * check in sigtable.c. Without this, av_behavior_protect_del()
+   * would only ever remove ONE of the two entries (it stops at the
+   * first match), leaving the path still protected after what looks
+   * like a successful `protect del`. Checked under the same lock as
+   * the insert below - no separate pre-check, so no TOCTOU window. */
+  hash_for_each_possible(protected_table, existing, node, path_key(e->path)) {
+    if (!strcmp(existing->path, e->path)) {
+      mutex_unlock(&protected_lock);
+      kfree(e);
+      return -EEXIST;
+    }
+  }
+  hash_add(protected_table, &e->node, path_key(e->path));
+  mutex_unlock(&protected_lock);
+
+  return 0;
+}
+
+int av_behavior_protect_del(const char *path) {
+  /* Same NULL-initializer workaround as hash_is_trusted() above. */
+  struct av_protected_entry *e = NULL;
+  int ret = -ENOENT;
+
+  mutex_lock(&protected_lock);
+  hash_for_each_possible(protected_table, e, node, path_key(path)) {
+    if (!strcmp(e->path, path)) {
+      hash_del(&e->node);
+      kfree(e);
+      ret = 0;
+      break;
+    }
+  }
+  mutex_unlock(&protected_lock);
+  return ret;
+}
+
+/* Resolves target_pid's own exe path (task->mm->exe_file, i.e. what
+ * ACTUALLY exec'd - not any path string a caller might be passing
+ * around for logging) and checks it against the protected list.
+ * get_task_mm() is the standard, safe kernel API for the mm; the exe
+ * file itself is pulled via get_file_rcu(&mm->exe_file) rather than
+ * the more convenient get_mm_exe_file() wrapper, which does exactly
+ * the same rcu_read_lock()+get_file_rcu() internally but is NOT
+ * EXPORT_SYMBOL'd - confirmed against this kernel's own Module.symvers
+ * (absent entirely, unlike get_task_mm/mmput/fput/d_path, all
+ * EXPORT_SYMBOL(_GPL)), so an out-of-tree module can't link against it
+ * even though it's declared in the public mm.h header. Handle a task
+ * with no mm (kernel thread, already past exit_mm() during exit) by
+ * simply returning false, same fail-open-on-inconclusive-info stance
+ * as the rest of this codebase. Sleepable (get_task_mm() itself does
+ * not sleep, but this is only ever called from workqueue/process
+ * context here, same as everything else that calls kill_with_reason()/
+ * av_kill()). `path_out` (optional) is filled with the resolved path
+ * on a match, for logging. */
+bool av_behavior_target_is_protected(struct pid *target_pid, char *path_out,
+                                     size_t path_out_len) {
+  struct task_struct *task;
+  struct mm_struct *mm;
+  struct file *exe_file;
+  char *buf;
+  bool protected = false;
+
+  rcu_read_lock();
+  task = pid_task(target_pid, PIDTYPE_PID);
+  if (task)
+    get_task_struct(task);
+  rcu_read_unlock();
+
+  if (!task)
+    return false;
+
+  mm = get_task_mm(task);
+  put_task_struct(task);
+  if (!mm)
+    return false;
+
+  rcu_read_lock();
+  exe_file = get_file_rcu(&mm->exe_file);
+  rcu_read_unlock();
+  mmput(mm);
+  if (!exe_file)
+    return false;
+
+  buf = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (buf) {
+    char *resolved = d_path(&exe_file->f_path, buf, PATH_MAX);
+
+    /* cppcheck-suppress knownConditionTrueFalse
+     * Same false positive as hash_is_trusted()'s call site above -
+     * path_is_on_protected_list() genuinely returns true at runtime
+     * for a path added via av_behavior_protect_add(); cppcheck just
+     * cannot trace hash_for_each_possible() without full kernel
+     * headers. */
+    if (!IS_ERR(resolved) && path_is_on_protected_list(resolved)) {
+      protected = true;
+      if (path_out)
+        strscpy(path_out, resolved, path_out_len);
+    }
+    kfree(buf);
+  }
+  fput(exe_file);
+
+  return protected;
+}
+
+static int protected_proc_show(struct seq_file *m, void *v) {
+  struct av_protected_entry *e;
+  int bkt;
+
+  mutex_lock(&protected_lock);
+  hash_for_each(protected_table, bkt, e, node) {
+    seq_printf(m, "%s\n", e->path);
+  }
+  mutex_unlock(&protected_lock);
+  return 0;
+}
+
+static int protected_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, protected_proc_show, NULL);
+}
+
+/* Content this write handler will accept in a single call: the "add "/
+ * "del " prefix, a full PATH_MAX-1 path, a mandatory trailing
+ * terminator (see the *ppos/terminator comments below), and slack for
+ * the NUL. Sized to the full path range avctl itself already accepts
+ * (userspace/avctl/avctl.c rejects a path at or above PATH_MAX before
+ * ever sending it) - a shorter cap here would silently reject
+ * otherwise-valid CLI input with no way for the caller to tell why. */
+#define PROTECTED_WRITE_MAXLEN (PATH_MAX + 16)
+
+/* ppos is only read here, but proc_write must match struct proc_ops's
+ * fixed non-const loff_t * signature exactly - same class of false
+ * positive as av_netlink_notify()'s data parameter in netlink_chan.c. */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t protected_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
+  /* kbuf/path are PATH_MAX-scale buffers (unlike sig_proc_write()/
+   * trust_proc_write(), which only ever handle a 64-hex-char digest) -
+   * heap-allocate both rather than declare them on the kernel stack;
+   * this write handler runs in ordinary process context (a user's
+   * write() syscall), so GFP_KERNEL is fine. */
+  char *kbuf;
+  char cmd[8];
+  char *path;
+  int n;
+  ssize_t ret;
+
+  /* Reject anything but the first write to a freshly-opened fd - a
+   * genuine continuation of an earlier call (its *ppos already
+   * advanced past 0) is never a complete, standalone command on its
+   * own and must not be parsed as one. This alone is not enough,
+   * though: verified empirically that a single userspace write() near
+   * PAGE_SIZE does NOT reliably arrive here as one call in the first
+   * place - common libc/shell stdio buffering (bash's own `>`/
+   * `printf` redirection included) flushes in ~4096-byte chunks, so a
+   * large enough write shows up as SEVERAL separate calls, each
+   * individually small enough to slip under a size check that doesn't
+   * also know whether the content it received is actually complete.
+   * The mandatory trailing terminator required below is what actually
+   * closes that gap (a truncated first chunk from mid-content
+   * splitting won't end in one), not the size cap alone. */
+  if (*ppos != 0)
+    return -EINVAL;
+
+  /* Reject oversized writes instead of silently truncating them - same
+   * reasoning as sig_proc_write()/trust_proc_write(). */
+  if (count >= PROTECTED_WRITE_MAXLEN)
+    return -EINVAL;
+
+  kbuf = kmalloc(PROTECTED_WRITE_MAXLEN, GFP_KERNEL);
+  path = kmalloc(PATH_MAX, GFP_KERNEL);
+  if (!kbuf || !path) {
+    ret = -ENOMEM;
+    goto out;
+  }
+
+  if (copy_from_user(kbuf, ubuf, count)) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kbuf[count] = '\0';
+
+  /* Not sscanf("%7s %4095[^\n]", ...) for the path half: a FIXED-width
+   * field silently truncates an oversized path to 4095 bytes rather
+   * than rejecting it, and the truncated result can still be short
+   * enough to pass av_behavior_protect_add()'s own length check -
+   * i.e. a >PATH_MAX write here would silently protect/unprotect a
+   * DIFFERENT (truncated) path than the one the caller actually sent,
+   * without any error. Parse cmd the same way, but take the path as
+   * "everything after cmd and its following whitespace" directly, so
+   * an oversized path is detected and rejected instead of quietly
+   * mutated. */
+  n = sscanf(kbuf, "%7s", cmd);
+  if (n < 1) {
+    ret = -EINVAL;
+    goto out;
+  }
+
+  {
+    char *rest = kbuf + strcspn(kbuf, " \t");
+    size_t rest_len;
+
+    rest += strspn(rest, " \t");
+    rest_len = strlen(rest);
+
+    /* Require (and then strip) a trailing terminator rather than
+     * just taking whatever's left as the path:
+     *
+     * 1. It's the real fix for the multi-chunk truncation risk the
+     *    *ppos check above only partially covers - a write that got
+     *    cut mid-content by chunked delivery ends mid-path, not on a
+     *    newline, so requiring one here is what actually rejects a
+     *    truncated fragment instead of silently accepting it as a
+     *    complete path.
+     * 2. Without stripping it, a completely ordinary `echo "add
+     *    /path" > .../kernel_av_protected` (this proc file's own
+     *    documented usage pattern, same as sigtable.c's) would store
+     *    "/path\n" - trailing newline included - which then never
+     *    matches any real resolved executable path (d_path() output
+     *    never ends in a newline), silently making every entry added
+     *    this way permanently ineffective. avctl's own writes get the
+     *    same terminator via write_command_to() so this applies
+     *    uniformly regardless of caller.
+     *
+     * An optional preceding \r is stripped too, for a caller on the
+     * other side of a CRLF-translating pipe. */
+    if (rest_len == 0 || rest[rest_len - 1] != '\n') {
+      ret = -EINVAL;
+      goto out;
+    }
+    rest[--rest_len] = '\0';
+    if (rest_len > 0 && rest[rest_len - 1] == '\r')
+      rest[--rest_len] = '\0';
+
+    if (rest_len == 0 || rest_len >= PATH_MAX) {
+      ret = -EINVAL;
+      goto out;
+    }
+    strscpy(path, rest, PATH_MAX);
+  }
+
+  if (!strcasecmp(cmd, "add")) {
+    /* Propagate the real error - specifically -EEXIST for a
+     * duplicate add - rather than flattening every failure to
+     * -EINVAL, same reasoning as sig_proc_write()'s identical fix
+     * in sigtable.c. */
+    ret = av_behavior_protect_add(path);
+    if (ret)
+      goto out;
+  } else if (!strcasecmp(cmd, "del")) {
+    /* cppcheck-suppress knownConditionTrueFalse
+     * Same false positive as av_behavior_trust_del()'s call site
+     * above - cppcheck cannot expand hash_for_each_possible() without
+     * full kernel headers. */
+    if (av_behavior_protect_del(path)) {
+      ret = -ENOENT;
+      goto out;
+    }
+  } else {
+    ret = -EINVAL;
+    goto out;
+  }
+
+  ret = count;
+out:
+  kfree(path);
+  kfree(kbuf);
+  return ret;
+}
+
+static const struct proc_ops protected_proc_ops = {
+    .proc_open = protected_proc_open,
+    .proc_read = seq_read,
+    .proc_write = protected_proc_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *protected_proc_entry;
+
+int av_behavior_protect_proc_init(void) {
+  protected_proc_entry =
+      proc_create("kernel_av_protected", 0644, NULL, &protected_proc_ops);
+  if (!protected_proc_entry)
+    return -ENOMEM;
+  return 0;
+}
+
+void av_behavior_protect_proc_exit(void) { proc_remove(protected_proc_entry); }
+
+static void protected_table_destroy(void) {
+  struct av_protected_entry *e;
+  struct hlist_node *tmp;
+  int bkt;
+
+  mutex_lock(&protected_lock);
+  hash_for_each_safe(protected_table, bkt, tmp, e, node) {
+    hash_del(&e->node);
+    kfree(e);
+  }
+  mutex_unlock(&protected_lock);
+}
+
 /* Returns the raw key for hash_add()/hash_for_each_possible() to hash
  * themselves via hash_min() - same convention as hex_key() above.
  * Previously pre-hashed with hash_32(pid, BEHAVIOR_BITS), which already
@@ -563,13 +936,32 @@ static bool is_extension_append_rename(const char *old_path,
 static void kill_with_reason(struct pid *target_pid, const char *path,
                              const char *reason) {
   struct task_struct *task;
+  /* PATH_MAX (4096) is far too large for the kernel stack (typically
+   * 8-16KB total, shared with everything else on this call path) -
+   * heap-allocate rather than declare a PATH_MAX array here. Sleepable
+   * context (workqueue), so GFP_KERNEL is fine. A kmalloc failure just
+   * means the protected-exe path is missing from the log line below,
+   * not that the protection check is skipped - av_behavior_target_
+   * is_protected() tolerates a NULL path_out for exactly this case. */
+  char *protected_path = kmalloc(PATH_MAX, GFP_KERNEL);
 
   if (pid_nr(target_pid) == 1) {
     pr_alert("kernel-av: event=suppressed action=none type=behavioral "
              "path=\"%s\" reason=\"%s\" pid=1\n",
              path, reason);
+    kfree(protected_path);
     return;
   }
+
+  if (av_behavior_target_is_protected(target_pid, protected_path, PATH_MAX)) {
+    pr_alert("kernel-av: event=suppressed action=none type=behavioral "
+             "path=\"%s\" reason=\"%s\" pid=%d protected_exe=\"%s\"\n",
+             path, reason, pid_nr(target_pid),
+             protected_path ? protected_path : "?");
+    kfree(protected_path);
+    return;
+  }
+  kfree(protected_path);
 
   rcu_read_lock();
   task = pid_task(target_pid, PIDTYPE_PID);
@@ -828,13 +1220,21 @@ int av_behavior_init(void) {
 
   hash_init(behavior_table);
   hash_init(trust_table);
+  hash_init(protected_table);
 
   ret = av_behavior_trust_proc_init();
   if (ret)
     return ret;
 
+  ret = av_behavior_protect_proc_init();
+  if (ret) {
+    av_behavior_trust_proc_exit();
+    return ret;
+  }
+
   behavior_gc_wq = alloc_workqueue("kernel_av_behavior_gc", WQ_UNBOUND, 0);
   if (!behavior_gc_wq) {
+    av_behavior_protect_proc_exit();
     av_behavior_trust_proc_exit();
     return -ENOMEM;
   }
@@ -865,6 +1265,8 @@ void av_behavior_exit(void) {
   }
   mutex_unlock(&behavior_lock);
 
+  av_behavior_protect_proc_exit();
+  protected_table_destroy();
   av_behavior_trust_proc_exit();
   trust_table_destroy();
 }
