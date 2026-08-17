@@ -1,0 +1,42 @@
+[Unit]
+Description=HyprAV userspace scanning daemon (YARA/fuzzy-hash/quarantine)
+Documentation=https://github.com/keanehatescoding/HyprAV
+After=network.target
+
+# The av kernel module (av.ko) is loaded manually via insmod - this
+# project doesn't ship a systemd unit for the module itself (see the
+# top-level README), so there's no unit to order After=/Requires=
+# against, and no way to guarantee av_genl's netlink family already
+# exists by the time this unit starts. avd itself already fails fast
+# with a clear error if genl_ctrl_resolve() can't find "av_genl" (see
+# avd.c's main()) - Restart=on-failure below, with no burst limit
+# (StartLimitIntervalSec=0), means systemd just keeps retrying on a
+# fixed backoff until the module happens to be loaded, rather than
+# requiring precise ordering against something systemd doesn't manage.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+
+# Deliberately root, deliberately unsandboxed (no ProtectSystem=,
+# ProtectHome=, DynamicUser=, etc.): avd's whole job is reading
+# arbitrary files anywhere on the system (whatever a process just
+# exec'd could be anywhere) and rename()/chmod()'ing malicious ones
+# into quarantine - a privileged, system-wide daemon by nature, not
+# something that can be usefully confined behind a restricted
+# filesystem view without breaking the thing it exists to do.
+User=root
+# The BINDIR and SYSCONFDIR tokens below (wrapped in "at" signs, own
+# comment to keep them out of any line the install target's sed
+# rewrites) are placeholders rendered by userspace/avd/Makefile's
+# install target - PREFIX/bin and SYSCONFDIR respectively - so this
+# file as checked in is a template, not something systemd can load
+# directly. Keep in sync with the paths that target actually installs
+# to.
+ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib/av-quarantine
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

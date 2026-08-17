@@ -28,6 +28,9 @@ scripts/
   setup-hooks.sh       - one-time: git config core.hooksPath .githooks
 docs/
   netlink-protocol.md  - kernel<->daemon protocol design (commands, attrs, flow)
+packaging/
+  avd.service          - systemd unit for running avd persistently -
+                        see "Running avd persistently" below
 av/                  - the actual antivirus module (single, evolving)
   main.c              - kprobe hooks (execve, openat, unlink, unlinkat,
                         rename, renameat, renameat2), workqueue,
@@ -201,6 +204,90 @@ make
 sudo insmod av.ko
 dmesg | tail -20
 sudo rmmod av
+```
+
+## Running `avd` persistently
+
+The testing sections further down (`Testing the kernel↔daemon YARA
+path` etc.) run `avd` by hand in a foreground terminal, which is the
+right way to develop against it but not to actually run it day to day
+— it doesn't survive a logout, a crash, or a reboot that way.
+`userspace/avd/Makefile` has an `install` target for that:
+
+```bash
+cd userspace/avd
+make
+sudo make install     # binary -> /usr/local/bin/avd
+                       # unit   -> /usr/lib/systemd/system/avd.service
+                       # rules/corpus -> /etc/hyprav/
+sudo systemctl daemon-reload
+sudo systemctl enable --now avd.service
+sudo journalctl -u avd -f  # avd's stdout/stderr, same output as running it by hand
+```
+
+`journalctl` needs `sudo` (or membership in the `systemd-journal` group)
+to read another user's unit logs on most distros' default journald
+config - plain `journalctl -u avd` run as your own user will typically
+just come back empty or permission-denied rather than showing avd's
+output, since the unit runs as `root`.
+
+`install` does **not** enable or start the service itself — reviewing
+`packaging/avd.service` before enabling anything that scans and
+quarantines files with root privileges is worth the extra step. The
+unit runs `avd` as root with no sandboxing (`ProtectSystem=`,
+`DynamicUser=`, etc. would break it — see the unit's own comments):
+`avd`'s whole job is reading arbitrary files anywhere on the system
+and moving malicious ones into quarantine, which is fundamentally
+privileged, system-wide work.
+
+The `av` kernel module itself still has no systemd unit — `insmod` is
+a manual, documented step (see Building above), so there's nothing to
+order `avd.service` against. `avd` fails fast with a clear error if
+the module isn't loaded yet (can't resolve the `av_genl` netlink
+family); the unit's `Restart=on-failure` with no burst limit means
+systemd just keeps retrying on a fixed backoff until the module shows
+up, rather than requiring precise unit ordering against something it
+doesn't manage.
+
+Override the install paths the usual GNU way if you're packaging this
+for a distro instead of installing directly:
+
+```bash
+sudo make install PREFIX=/usr DESTDIR=/tmp/pkgroot
+```
+
+`PREFIX` (default `/usr/local`) and `SYSCONFDIR` (default `/etc/hyprav`)
+control where files actually end up at runtime - `avd.service` is a
+template (`@BINDIR@`/`@SYSCONFDIR@` placeholders in
+`packaging/avd.service`) that `make install` renders against them, so
+`ExecStart` in the installed unit always matches wherever `avd` was
+actually installed:
+
+```
+ExecStart=<PREFIX>/bin/avd <SYSCONFDIR>/rules <SYSCONFDIR>/fuzzy_hashes.txt /var/lib/av-quarantine
+```
+
+e.g. `PREFIX=/usr` above renders `ExecStart=/usr/bin/avd ...`, not
+`/usr/local/bin/avd`. `DESTDIR` is different from both of these - it's
+only a *staging root* prepended to every installed path for this one
+`make install` invocation (so a packaging script can assemble a tree
+under `/tmp/pkgroot` before archiving it), not part of where `avd`
+actually runs once installed. It is deliberately **not** substituted
+into `ExecStart`: an `avd.service` built with `DESTDIR=/tmp/pkgroot`
+still points at `<PREFIX>/bin/avd`, the real path once the staged tree
+is deployed to `/`, not `/tmp/pkgroot/<PREFIX>/bin/avd`.
+
+There's also a fourth override, `UNITDIR` (default
+`/usr/lib/systemd/system`) - where the *rendered* `avd.service` file
+itself gets installed, i.e. where systemd will actually find it. It
+doesn't appear in `ExecStart` and doesn't need to match `PREFIX`; it
+exists because some distros expect systemd unit files under
+`/lib/systemd/system` instead (a packaging convention difference, not
+a `PREFIX`-derived path), so a packager can point it there without
+otherwise changing where `avd` itself installs to:
+
+```bash
+sudo make install PREFIX=/usr UNITDIR=/lib/systemd/system DESTDIR=/tmp/pkgroot
 ```
 
 ## A note on kernel version / architecture

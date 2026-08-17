@@ -2,6 +2,15 @@ CC ?= gcc
 CFLAGS ?= -Wall -Wextra -O2
 PKG_CONFIG ?= pkg-config
 
+# install target only - PREFIX/SYSCONFDIR/UNITDIR follow the usual
+# GNU/systemd conventions so a packager can override them
+# (DESTDIR=... for a staged build root, PREFIX=/usr for a distro
+# package instead of the /usr/local default, etc.).
+PREFIX      ?= /usr/local
+SYSCONFDIR  ?= /etc/hyprav
+UNITDIR     ?= /usr/lib/systemd/system
+DESTDIR     ?=
+
 LIBNL_CFLAGS := $(shell $(PKG_CONFIG) --cflags libnl-genl-3.0 2>/dev/null)
 LIBNL_LIBS   := $(shell $(PKG_CONFIG) --libs libnl-genl-3.0 2>/dev/null)
 YARA_CFLAGS  := $(shell $(PKG_CONFIG) --cflags yara 2>/dev/null)
@@ -34,4 +43,37 @@ avd: avd.c ../../av/netlink_proto.h
 clean:
 	rm -f avd
 
-.PHONY: clean
+# Installs the binary, the systemd unit, and a default rules/corpus
+# location under SYSCONFDIR - NOT enabled or started automatically
+# (that's a deliberate, separate step: starting a daemon that scans
+# and quarantines files system-wide shouldn't be a silent side effect
+# of `make install`). packaging/avd.service is a template (@BINDIR@/
+# @SYSCONFDIR@ placeholders) rendered here against PREFIX/SYSCONFDIR -
+# DESTDIR is deliberately NOT part of the substitution: it's only a
+# staging root for this install invocation (e.g. packaging into
+# /tmp/pkgroot before building a distro package), not part of where
+# avd actually runs once installed, so it must never end up baked
+# into ExecStart.
+install: avd
+	install -D -m 0755 avd "$(DESTDIR)$(PREFIX)/bin/avd"
+	mkdir -p "$(DESTDIR)$(UNITDIR)"
+	sed -e 's|@BINDIR@|$(PREFIX)/bin|g' \
+		-e 's|@SYSCONFDIR@|$(SYSCONFDIR)|g' \
+		../../packaging/avd.service > "$(DESTDIR)$(UNITDIR)/avd.service"
+	chmod 0644 "$(DESTDIR)$(UNITDIR)/avd.service"
+	mkdir -p "$(DESTDIR)$(SYSCONFDIR)/rules"
+	install -m 0644 ../../rules/*.yar "$(DESTDIR)$(SYSCONFDIR)/rules/"
+	install -m 0644 ../../corpus/fuzzy_hashes.txt \
+		"$(DESTDIR)$(SYSCONFDIR)/fuzzy_hashes.txt"
+	@echo
+	@echo "Installed:"
+	@echo "  $(DESTDIR)$(PREFIX)/bin/avd"
+	@echo "  $(DESTDIR)$(UNITDIR)/avd.service"
+	@echo "  $(DESTDIR)$(SYSCONFDIR)/rules/*.yar"
+	@echo "  $(DESTDIR)$(SYSCONFDIR)/fuzzy_hashes.txt"
+	@echo
+	@echo "Not started - review the unit, then:"
+	@echo "  sudo systemctl daemon-reload"
+	@echo "  sudo systemctl enable --now avd.service"
+
+.PHONY: clean install
