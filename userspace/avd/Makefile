@@ -47,12 +47,20 @@ clean:
 # location under SYSCONFDIR - NOT enabled or started automatically
 # (that's a deliberate, separate step: starting a daemon that scans
 # and quarantines files system-wide shouldn't be a silent side effect
-# of `make install`). ExecStart in packaging/avd.service points at
-# these exact paths - keep them in sync if either changes.
+# of `make install`). packaging/avd.service is a template (@BINDIR@/
+# @SYSCONFDIR@ placeholders) rendered here against PREFIX/SYSCONFDIR -
+# DESTDIR is deliberately NOT part of the substitution: it's only a
+# staging root for this install invocation (e.g. packaging into
+# /tmp/pkgroot before building a distro package), not part of where
+# avd actually runs once installed, so it must never end up baked
+# into ExecStart.
 install: avd
 	install -D -m 0755 avd "$(DESTDIR)$(PREFIX)/bin/avd"
-	install -D -m 0644 ../../packaging/avd.service \
-		"$(DESTDIR)$(UNITDIR)/avd.service"
+	mkdir -p "$(DESTDIR)$(UNITDIR)"
+	sed -e 's|@BINDIR@|$(PREFIX)/bin|g' \
+		-e 's|@SYSCONFDIR@|$(SYSCONFDIR)|g' \
+		../../packaging/avd.service > "$(DESTDIR)$(UNITDIR)/avd.service"
+	chmod 0644 "$(DESTDIR)$(UNITDIR)/avd.service"
 	mkdir -p "$(DESTDIR)$(SYSCONFDIR)/rules"
 	install -m 0644 ../../rules/*.yar "$(DESTDIR)$(SYSCONFDIR)/rules/"
 	install -m 0644 ../../corpus/fuzzy_hashes.txt \

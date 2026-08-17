@@ -250,6 +250,27 @@ for a distro instead of installing directly:
 sudo make install PREFIX=/usr DESTDIR=/tmp/pkgroot
 ```
 
+`PREFIX` (default `/usr/local`) and `SYSCONFDIR` (default `/etc/hyprav`)
+control where files actually end up at runtime - `avd.service` is a
+template (`@BINDIR@`/`@SYSCONFDIR@` placeholders in
+`packaging/avd.service`) that `make install` renders against them, so
+`ExecStart` in the installed unit always matches wherever `avd` was
+actually installed:
+
+```
+ExecStart=<PREFIX>/bin/avd <SYSCONFDIR>/rules <SYSCONFDIR>/fuzzy_hashes.txt /var/lib/av-quarantine
+```
+
+e.g. `PREFIX=/usr` above renders `ExecStart=/usr/bin/avd ...`, not
+`/usr/local/bin/avd`. `DESTDIR` is different from both of these - it's
+only a *staging root* prepended to every installed path for this one
+`make install` invocation (so a packaging script can assemble a tree
+under `/tmp/pkgroot` before archiving it), not part of where `avd`
+actually runs once installed. It is deliberately **not** substituted
+into `ExecStart`: an `avd.service` built with `DESTDIR=/tmp/pkgroot`
+still points at `<PREFIX>/bin/avd`, the real path once the staged tree
+is deployed to `/`, not `/tmp/pkgroot/<PREFIX>/bin/avd`.
+
 ## A note on kernel version / architecture
 
 The kprobe-based modules (`experiments/kprobe_log`, `av/`) hook the syscall

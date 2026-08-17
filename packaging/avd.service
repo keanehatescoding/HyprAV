@@ -26,7 +26,14 @@ Type=simple
 # something that can be usefully confined behind a restricted
 # filesystem view without breaking the thing it exists to do.
 User=root
-ExecStart=/usr/local/bin/avd /etc/hyprav/rules /etc/hyprav/fuzzy_hashes.txt /var/lib/av-quarantine
+# The BINDIR and SYSCONFDIR tokens below (wrapped in "at" signs, own
+# comment to keep them out of any line the install target's sed
+# rewrites) are placeholders rendered by userspace/avd/Makefile's
+# install target - PREFIX/bin and SYSCONFDIR respectively - so this
+# file as checked in is a template, not something systemd can load
+# directly. Keep in sync with the paths that target actually installs
+# to.
+ExecStart=@BINDIR@/avd @SYSCONFDIR@/rules @SYSCONFDIR@/fuzzy_hashes.txt /var/lib/av-quarantine
 
 Restart=on-failure
 RestartSec=5
