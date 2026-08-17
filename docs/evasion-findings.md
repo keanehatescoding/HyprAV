@@ -15,7 +15,7 @@ of what it originally found.
 | 1 | Dynamic symbol resolution (`dlopen`/`dlsym`) | API heuristics (`heuristics.yar`) | **Evaded** the specific `Imports_Ptrace` rule; the evasion technique itself tripped a separate low-confidence rule (`Imports_Dlopen`) |
 | 2 | Substantial file modification (+50KB random data) | Fuzzy hashing (`avd`'s corpus check) | **Fully evaded** — similarity score 0/100, vs. 100/100 for a minor (few-byte) variant |
 | 3 | Entropy dilution (padding a packed binary with zero bytes) | Entropy analysis (`entropy.yar`) | **Evaded** the entropy check specifically, but the same file was still caught by structural analysis (`elf_analysis.yar`) — defense-in-depth held |
-| 4 | Slow-drip file modification (bursts under threshold, paced past the window) | Behavioral heuristics (`behavior.c`) | **Re-verified live, updated**: the discrete-reset bug this originally exploited is fixed (`sliding_window_note()`); deliberate pacing with gaps ≥ the window still evades, but that's now the inherent limit of any windowed rate counter, not an implementation flaw |
+| 4 | Slow-drip file modification (bursts under threshold, paced past the window) | Behavioral heuristics (`behavior.c`) | **Re-verified live, updated**: the discrete-reset bug this originally exploited is fixed (`sliding_window_note()`); deliberate pacing with gaps *beyond* the window still evades in the tested configuration, but that's now the inherent limit of any finite windowed rate counter, not an implementation flaw |
 
 ## 1. Dynamic symbol resolution vs. API import heuristics
 
@@ -120,9 +120,10 @@ changes, and this finding is the concrete proof of why.
 **Update (post-`v0.8.1`/`sliding_window_note()`): re-verified live
 against the current module. The specific discrete-reset bug described
 below is fixed. A related but distinct evasion — deliberately pacing
-bursts with gaps at or above the window size — still succeeds, and,
-unlike the bug, is not fixable by any windowed counter. Both results
-below are from real `dmesg` captures, not code-path inference.**
+bursts with gaps beyond the window size — still succeeds in the tested
+configuration, and, unlike the bug, is not fixable by any finite
+windowed counter. Both results below are from real `dmesg` captures,
+not code-path inference.**
 
 `behavior.c`'s rapid-write counter originally used a **fixed window**,
 not a true sliding window:
@@ -157,22 +158,31 @@ events after the reset within the little time remaining.
 
 **What's still not fixed — and can't be, by a windowed counter alone**:
 re-running `tests/evasion/test_slow_drip_evasion.sh` (40-file bursts,
-5 bursts, paced 2.1s apart — just over the 2-second window) against
-the current sliding-window implementation still produces **no** `rapid
-file modification` kill in `dmesg`, despite 200 files modified in
-total. This is not the discrete-reset bug reappearing: a *true*
-sliding window correctly and legitimately forgets any write older than
-`WRITE_OPEN_WINDOW_MS`, by design — that's what makes it a rate
-counter instead of a lifetime counter. An adversary who paces bursts
-with gaps ≥ the window size is staying under the rate limit, not
-exploiting an implementation flaw in it. This is the same fundamental
-property every threshold/window-based rate limiter has, sliding or
-fixed, and no amount of window-size or threshold tuning closes it —
-doing so would require a different class of mechanism entirely (e.g.
-tracking total volume over a much longer horizon, or a behavioral
-signal beyond simple event counting). Worth stating precisely: the
-implementation bug is gone; the inherent limitation of counting-based
-rate limiting is not, and isn't something this design can fully close.
+5 bursts, paced 2.1s apart — 100ms *beyond* the 2-second window, not
+merely at it) against the current sliding-window implementation still
+produces **no** `rapid file modification` kill in `dmesg`, despite 200
+files modified in total. This is not the discrete-reset bug
+reappearing: `sliding_window_note()` retains an entry while
+`age <= window_ms` (inclusive - see its comment/implementation in
+`behavior.c`), so it legitimately forgets a write only once that
+write's age strictly exceeds `WRITE_OPEN_WINDOW_MS`. That's what makes
+it a rate counter instead of a lifetime counter, and it means this
+specific finding is narrower than "pacing at or above the window
+evades" - it's specifically pacing *beyond* the window that does, in
+this tested configuration (this 2.1s gap, `WRITE_OPEN_THRESHOLD`'s
+current value); an adversary pacing exactly at the boundary would
+still land inside the inclusive `<=` and get counted. The generalizable
+point isn't about this exact configuration, though: it's that *any*
+positive, finite window/threshold pair - sliding or fixed, whatever
+their specific values - remains evadable by pacing slowly enough
+relative to *that* configuration. No amount of window-size or
+threshold tuning closes this off entirely, only shifts where the
+evasion threshold sits; doing so would require a different class of
+mechanism (e.g. tracking total volume over a much longer horizon, or a
+behavioral signal beyond simple event counting). Worth stating
+precisely: the implementation bug is gone; the inherent limitation of
+finite counting-based rate limiting is not, and isn't something this
+design can fully close.
 
 ## Overall takeaways for the report
 
