@@ -3,8 +3,10 @@
 Four evasion techniques, one targeting each major detection layer,
 tested against the actual engine (not hypothetical). Three were
 verified standalone in a sandbox; the fourth needs the live kernel
-module and is documented from the code logic plus a VM-runnable test
-script (`tests/evasion/test_slow_drip_evasion.sh`).
+module and was verified live against it
+(`tests/evasion/test_slow_drip_evasion.sh`) - see finding #4 below,
+which was re-verified again after `sliding_window_note()` fixed part
+of what it originally found.
 
 ## Summary table
 
@@ -13,7 +15,7 @@ script (`tests/evasion/test_slow_drip_evasion.sh`).
 | 1 | Dynamic symbol resolution (`dlopen`/`dlsym`) | API heuristics (`heuristics.yar`) | **Evaded** the specific `Imports_Ptrace` rule; the evasion technique itself tripped a separate low-confidence rule (`Imports_Dlopen`) |
 | 2 | Substantial file modification (+50KB random data) | Fuzzy hashing (`avd`'s corpus check) | **Fully evaded** — similarity score 0/100, vs. 100/100 for a minor (few-byte) variant |
 | 3 | Entropy dilution (padding a packed binary with zero bytes) | Entropy analysis (`entropy.yar`) | **Evaded** the entropy check specifically, but the same file was still caught by structural analysis (`elf_analysis.yar`) — defense-in-depth held |
-| 4 | Slow-drip file modification (bursts under threshold, paced past the window) | Behavioral heuristics (`behavior.c`) | **Evaded** by design of the fixed-window counter — not yet re-verified live in this writeup, see script and reasoning below |
+| 4 | Slow-drip file modification (bursts under threshold, paced past the window) | Behavioral heuristics (`behavior.c`) | **Re-verified live, updated**: the discrete-reset bug this originally exploited is fixed (`sliding_window_note()`); deliberate pacing with gaps ≥ the window still evades, but that's now the inherent limit of any windowed rate counter, not an implementation flaw |
 
 ## 1. Dynamic symbol resolution vs. API import heuristics
 
@@ -115,8 +117,15 @@ changes, and this finding is the concrete proof of why.
 
 ## 4. Slow-drip modification vs. rapid-write behavioral heuristic
 
-`behavior.c`'s rapid-write counter uses a **fixed window**, not a true
-sliding window:
+**Update (post-`v0.8.1`/`sliding_window_note()`): re-verified live
+against the current module. The specific discrete-reset bug described
+below is fixed. A related but distinct evasion — deliberately pacing
+bursts with gaps at or above the window size — still succeeds, and,
+unlike the bug, is not fixable by any windowed counter. Both results
+below are from real `dmesg` captures, not code-path inference.**
+
+`behavior.c`'s rapid-write counter originally used a **fixed window**,
+not a true sliding window:
 
 ```c
 if (e->window_start_jiffies == 0 || window_ms > WRITE_OPEN_WINDOW_MS) {
@@ -128,28 +137,42 @@ if (e->window_start_jiffies == 0 || window_ms > WRITE_OPEN_WINDOW_MS) {
 }
 ```
 
-Once more than 2 seconds have passed since the window started, the
-counter resets to 1 regardless of how many writes happened — there's
-no memory of activity in the *previous* window. A process that writes
-49 files, waits just over 2 seconds, writes another 49, waits, and
-repeats indefinitely will never cross the threshold in any single
-window, no matter how many files it modifies in total over time.
+Once more than 2 seconds had passed since the window started, the
+counter reset to 1 regardless of how many writes happened, discarding
+even genuinely recent activity the instant a reset landed. This wasn't
+only an adversarial-pacing problem: a steady, non-adversarial write
+stream that happened to straddle a reset boundary could lose its own
+accumulated progress with no deliberate evasion involved.
 
-**This is a structural limitation, not a threshold-tuning problem** —
-raising or lowering `WRITE_OPEN_THRESHOLD` doesn't fix it, since the
-evasion works by pacing around whatever the window boundary is. A true
-sliding window (tracking a rolling count over the last N milliseconds,
-recomputed continuously rather than reset in discrete blocks) would
-close this gap; it's meaningfully more complex to implement correctly
-in kernel space (needs either a timestamp per event or a decaying
-counter, not just two integers) and was out of scope here — a good
-`v0.8.1`/future-work item to name explicitly rather than leave
-implicit.
+**This part is now fixed.** `sliding_window_note()` replaced the
+discrete reset with a real trailing window — each tracked write now
+carries its own timestamp and individually ages out after
+`WRITE_OPEN_WINDOW_MS`, rather than the whole window being wiped in
+bulk on a boundary crossing. Verified live (see the fix's own PR): a
+steady ~66 files/sec stream (150 distinct files, ~15ms apart, spanning
+past the old 2000ms reset point with no pauses) now correctly trips at
+exactly the 51st distinct file — the old implementation could not have
+caught this, since it would have reset mid-stream and needed 50 fresh
+events after the reset within the little time remaining.
 
-`tests/evasion/test_slow_drip_evasion.sh` is ready to run against the
-live module in a VM to confirm this empirically; the reasoning above
-is derived directly from the code path, not yet re-confirmed with a
-fresh dmesg capture at time of writing.
+**What's still not fixed — and can't be, by a windowed counter alone**:
+re-running `tests/evasion/test_slow_drip_evasion.sh` (40-file bursts,
+5 bursts, paced 2.1s apart — just over the 2-second window) against
+the current sliding-window implementation still produces **no** `rapid
+file modification` kill in `dmesg`, despite 200 files modified in
+total. This is not the discrete-reset bug reappearing: a *true*
+sliding window correctly and legitimately forgets any write older than
+`WRITE_OPEN_WINDOW_MS`, by design — that's what makes it a rate
+counter instead of a lifetime counter. An adversary who paces bursts
+with gaps ≥ the window size is staying under the rate limit, not
+exploiting an implementation flaw in it. This is the same fundamental
+property every threshold/window-based rate limiter has, sliding or
+fixed, and no amount of window-size or threshold tuning closes it —
+doing so would require a different class of mechanism entirely (e.g.
+tracking total volume over a much longer horizon, or a behavioral
+signal beyond simple event counting). Worth stating precisely: the
+implementation bug is gone; the inherent limitation of counting-based
+rate limiting is not, and isn't something this design can fully close.
 
 ## Overall takeaways for the report
 
@@ -160,8 +183,15 @@ fresh dmesg capture at time of writing.
 - The one deliberately-designed defense (layering independent checks)
   held up under direct testing (finding #3) — evading entropy analysis
   did not evade the structural analysis running alongside it.
-- The behavioral heuristic's evasion (#4) is the one with a *known,
-  named* structural fix (true sliding window) rather than being an
-  inherent limit of the underlying technique (as #1 and #2 arguably
-  are) — worth distinguishing "we ran out of scope" from "this is as
-  good as this approach gets" when discussing each finding.
+- Finding #4 is the one case where re-testing after a fix actually
+  changed the picture, and it changed it in an instructive way: the
+  *implementation* half (discrete-reset window) had a known, named
+  structural fix (true sliding window) and re-verification confirmed
+  it closed - but doing so exposed the *inherent* half underneath
+  (deliberate pacing at or under the rate limit) as the same category
+  of unfixable-by-this-technique-alone limitation as #1 and #2, not
+  something the sliding-window fix was ever going to reach. Worth
+  distinguishing "we ran out of scope" from "this is as good as this
+  approach gets" when discussing each finding - and, per #4, worth
+  re-checking that distinction after a fix lands rather than assuming
+  it once and leaving it stated.
