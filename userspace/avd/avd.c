@@ -71,6 +71,16 @@
 
 #include "../../av/netlink_proto.h"
 
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000 /* glibc's plain <fcntl.h> doesn't define this
+                              * (only <linux/fcntl.h> does, which risks
+                              * conflicting struct/macro redefinitions if
+                              * included alongside <fcntl.h> on some glibc
+                              * versions) - the value itself is kernel UAPI,
+                              * ABI-stable, safe to hardcode. Used by
+                              * quarantine_file()'s linkat() call below. */
+#endif
+
 #define DEFAULT_RULES_DIR "rules"
 #define DEFAULT_CORPUS_FILE "corpus/fuzzy_hashes.txt"
 #define DEFAULT_QUARANTINE_DIR "/var/lib/av-quarantine"
@@ -130,9 +140,9 @@ static YR_RULES *compiled_rules;
  * itself, so contention is negligible. compiled_rules and
  * fuzzy_corpus need no such lock: both are populated once at startup
  * (load_rules()/load_fuzzy_corpus()) before any worker thread exists
- * and are read-only from then on - yr_rules_scan_file() against a
- * shared, unmodified YR_RULES is documented as safe for concurrent
- * callers on that basis. */
+ * and are read-only from then on - yr_rules_scan_fd() (or
+ * yr_rules_scan_file()) against a shared, unmodified YR_RULES is
+ * documented as safe for concurrent callers on that basis. */
 static pthread_mutex_t send_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Bounded producer/consumer queue between msg_handler() (the single
@@ -382,23 +392,47 @@ static int load_fuzzy_corpus(const char *path) {
 }
 
 /*
- * Compares the file at `path` against every entry in the fuzzy corpus.
- * On the best match at or above FUZZY_MATCH_THRESHOLD, copies the
- * corpus entry's name into name_out and the score into score_out,
- * returning 1. Returns 0 if nothing met the threshold (or no corpus
- * loaded), -1 on a hashing error (file vanished, unreadable, etc.).
+ * Compares the already-open file `fd` against every entry in the
+ * fuzzy corpus. On the best match at or above FUZZY_MATCH_THRESHOLD,
+ * copies the corpus entry's name into name_out and the score into
+ * score_out, returning 1. Returns 0 if nothing met the threshold (or
+ * no corpus loaded), -1 on a hashing error.
+ *
+ * Takes `fd` rather than a path - see handle_scan_request()'s comment
+ * on why the whole scan/quarantine sequence now reads through one fd
+ * opened once at the top, instead of re-resolving a path string at
+ * each step. Hashes via a dup()'d handle so this doesn't disturb
+ * `fd`'s own read offset for whatever the caller does with it next;
+ * fuzzy_hash_file() seeks its handle to the start itself and restores
+ * position when done, so no manual lseek is needed here either way.
  */
-static int check_fuzzy_corpus(const char *path, char *name_out,
-                              size_t name_out_len, int *score_out) {
+static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
+                              int *score_out) {
   char file_hash[FUZZY_MAX_RESULT];
   int best_score = -1;
   size_t best_idx = 0;
   size_t i;
+  int dup_fd;
+  FILE *fp;
+  int hash_ret;
 
   if (fuzzy_corpus_count == 0)
     return 0;
 
-  if (fuzzy_hash_filename(path, file_hash) != 0)
+  dup_fd = dup(fd);
+  if (dup_fd < 0)
+    return -1;
+
+  fp = fdopen(dup_fd, "rb");
+  if (!fp) {
+    close(dup_fd);
+    return -1;
+  }
+
+  hash_ret = fuzzy_hash_file(fp, file_hash);
+  fclose(fp); /* also closes dup_fd */
+
+  if (hash_ret != 0)
     return -1;
 
   for (i = 0; i < fuzzy_corpus_count; i++) {
@@ -488,26 +522,35 @@ static int ensure_quarantine_dir(void) {
   return -1;
 }
 
-/* Fallback for rename() failing with EXDEV (source and quarantine dir
- * on different filesystems/mounts) - plain copy, then unlink the
- * original. Not atomic like rename(), but correct. */
-static int copy_and_unlink(const char *src, const char *dst) {
-  int in_fd, out_fd;
+/* Fallback for quarantine_file()'s linkat() failing - see that
+ * function's comment for the two real cases this covers (EXDEV:
+ * quarantine dir on a different filesystem; ENOENT: the source's
+ * link count already hit zero, e.g. an unlink()-then-replace race
+ * rather than a rename()-away one - linkat(fd, "", ..., AT_EMPTY_PATH)
+ * cannot resurrect a fully unlinked inode even though the fd itself
+ * is still perfectly valid). Copies the already-open `fd`'s content
+ * into `dst`, reading through `fd` rather than re-opening a path, so
+ * this copy step itself reads the exact file that was scanned,
+ * regardless of anything that may have happened to its original path
+ * since - and regardless of which of the two cases above triggered
+ * it. Does NOT unlink the original; the caller does that separately
+ * once, since removing-by-path is the one operation here that still
+ * has to re-resolve a path name and can't be done purely through `fd`
+ * (see quarantine_file()'s identity re-check that guards it). */
+static int copy_fd_to(int fd, const char *dst) {
+  int out_fd;
   char buf[65536];
   ssize_t n;
   int ret = 0;
 
-  in_fd = open(src, O_RDONLY);
-  if (in_fd < 0)
+  if (lseek(fd, 0, SEEK_SET) < 0)
     return -1;
 
   out_fd = open(dst, O_WRONLY | O_CREAT | O_EXCL, 0600);
-  if (out_fd < 0) {
-    close(in_fd);
+  if (out_fd < 0)
     return -1;
-  }
 
-  while ((n = read(in_fd, buf, sizeof(buf))) > 0) {
+  while ((n = read(fd, buf, sizeof(buf))) > 0) {
     if (write(out_fd, buf, (size_t)n) != n) {
       ret = -1;
       break;
@@ -516,11 +559,8 @@ static int copy_and_unlink(const char *src, const char *dst) {
   if (n < 0)
     ret = -1;
 
-  close(in_fd);
   close(out_fd);
 
-  if (ret == 0 && unlink(src) != 0)
-    ret = -1;
   if (ret != 0)
     unlink(dst); /* best-effort cleanup of the partial copy */
 
@@ -528,72 +568,71 @@ static int copy_and_unlink(const char *src, const char *dst) {
 }
 
 /*
- * Moves `path` into the quarantine directory and chmod's it to 0000
- * (unreadable/unwritable/unexecutable by anyone, including root
- * without an explicit chmod back - a deliberate speed bump against
- * accidental re-execution, not real access control). Logs the outcome
- * either way; a quarantine failure does NOT block the verdict already
- * being sent back to the kernel for the kill.
+ * Moves the already-open file `fd` into the quarantine directory and
+ * chmod's it to 0000 (unreadable/unwritable/unexecutable by anyone,
+ * including root without an explicit chmod back - a deliberate speed
+ * bump against accidental re-execution, not real access control).
+ * `path` is used for the destination's basename and log messages, and
+ * for one narrow unlink described below - it does NOT drive identity
+ * for the quarantine copy itself. Logs the outcome either way; a
+ * quarantine failure does NOT block the verdict already being sent
+ * back to the kernel for the kill.
  *
- * `baseline`/`have_baseline`: identity of the file as captured by the
- * caller *before* the YARA/fuzzy scan ran (see handle_scan_request()).
- * `path` here is just a string, re-resolved by the kernel/libc at
- * rename() time - if something with write access to a directory in
- * that path swaps in a symlink between initial detection and this
- * call, a path-only rename() would happily quarantine (or in the
- * EXDEV fallback case, unlink()) whatever the attacker pointed it at
- * instead of the file that was actually scanned. Re-checking st_dev/
- * st_ino right before the rename can't close that window entirely
- * (there's still a much narrower gap between this check and the
- * rename() call itself, and a double-swap - back to the original
- * inode - would slip past an identity check alone), but it converts
- * an easy single-swap attack into a much harder timing race, which is
- * the same kind of risk-reduction-not-elimination tradeoff already
- * documented elsewhere in this codebase (see Has_RWX_Segment's scope
- * note). A more complete fix would scan and quarantine via an fd
- * opened once at the top of handle_scan_request() (rename() accepts
- * /proc/self/fd/N as a source, which resolves to the fd's dentry
- * directly rather than re-walking the path) - noted as a follow-up,
- * not done here since it also touches how YARA/fuzzy scanning read
- * the file, a larger change than this function alone.
+ * `fd` was opened once at the very top of handle_scan_request(),
+ * before scanning even began, and has been read from (never
+ * re-opened by path) for every step since - see that function's
+ * comment. The quarantine copy is created via linkat(fd, "", ...,
+ * AT_EMPTY_PATH) - this creates a new directory entry pointing at
+ * fd's underlying inode DIRECTLY, without re-walking `path`, so it's
+ * immune to the swap-the-path race the previous, path-only version of
+ * this function could only narrow (lstat/rename gap, double-swap)
+ * rather than close: there's nothing left here to swap out from under
+ * an fd-identified link. This is the "more complete fix" that
+ * function's comment used to point at as a follow-up.
+ *
+ * NOTE: a plain rename() through /proc/self/fd/N looks like it should
+ * do the same thing and was tried first - it doesn't. Verified
+ * empirically: it always fails with EXDEV, because the kernel treats
+ * the source as living on procfs itself for the cross-device check
+ * rather than transparently resolving to the real file's actual
+ * filesystem. linkat()+AT_EMPTY_PATH is the primitive that actually
+ * targets the fd's real inode.
+ *
+ * linkat() can fail for reasons that have nothing to do with a swap -
+ * same-filesystem-only like any hardlink (EXDEV if the quarantine dir
+ * is elsewhere), and it cannot resurrect a fully unlinked inode
+ * (ENOENT once `fd`'s link count hits zero - a real, not just
+ * theoretical, case: an unlink()-then-replace race hits this, a
+ * rename()-away-then-replace race doesn't, and an attacker doesn't
+ * owe us a choice between the two). copy_fd_to() below is the
+ * fallback for any such failure, still reading through `fd` rather
+ * than `path` either way. Once the quarantine copy exists (by
+ * whichever route), removing the ORIGINAL by `path` is the one step left
+ * that still has to re-walk it - unlink() has no fd-based equivalent
+ * - so it gets a re-check-and-refuse immediately before it, comparing
+ * the fd's true identity against a fresh lstat(). This is
+ * risk-reduction, not elimination, for this one narrowed step - same
+ * kind of tradeoff documented elsewhere in this codebase (see
+ * Has_RWX_Segment's scope note) - but unlike the old design, a
+ * mismatch here only means the original wasn't also cleaned up from
+ * its old location, never that the wrong content got quarantined.
  */
-static void quarantine_file(const char *path, const struct stat *baseline,
-                            bool have_baseline) {
+static void quarantine_file(int fd, const char *path) {
   char dest[PATH_MAX];
   const char *base;
   struct timespec ts;
+  struct stat fd_st;
+  bool linked;
 
   if (ensure_quarantine_dir() != 0)
     return;
-
-  if (have_baseline) {
-    struct stat now_st;
-
-    if (lstat(path, &now_st) != 0) {
-      fprintf(stderr,
-              "avd: refusing to quarantine \"%s\": lstat "
-              "failed at quarantine time: %s\n",
-              path, strerror(errno));
-      return;
-    }
-    if (now_st.st_dev != baseline->st_dev ||
-        now_st.st_ino != baseline->st_ino) {
-      fprintf(stderr,
-              "avd: refusing to quarantine \"%s\": path now "
-              "resolves to a different file than the one "
-              "scanned (dev/ino changed) - possible symlink "
-              "swap\n",
-              path);
-      return;
-    }
-  }
 
   base = strrchr(path, '/');
   base = base ? base + 1 : path;
 
   /* <pid>_<nanotime>_<base> rather than <epoch>_<base>: two files
    * with the same basename quarantined within the same wall-clock
-   * second used to collide on this name, and the second rename()
+   * second used to collide on this name, and the second link/copy
    * silently clobbered the first (avd is single-threaded today, but
    * this shouldn't quietly break if that ever changes). PID plus a
    * monotonic-clock nanosecond reading is unique per call even if
@@ -602,29 +641,101 @@ static void quarantine_file(const char *path, const struct stat *baseline,
   snprintf(dest, sizeof(dest), "%s/%d_%ld%09ld_%s.quarantined", quarantine_dir,
            (int)getpid(), (long)ts.tv_sec, ts.tv_nsec, base);
 
-  if (rename(path, dest) != 0) {
-    if (errno == EXDEV) {
-      if (copy_and_unlink(path, dest) != 0) {
-        fprintf(stderr,
-                "avd: quarantine copy fallback failed for "
-                "\"%s\": %s\n",
-                path, strerror(errno));
-        return;
-      }
-    } else {
-      fprintf(stderr, "avd: quarantine rename failed for \"%s\": %s\n", path,
-              strerror(errno));
+  linked = (linkat(fd, "", AT_FDCWD, dest, AT_EMPTY_PATH) == 0);
+  if (!linked) {
+    /* Fall back to the fd-based copy on ANY linkat failure, not just
+     * EXDEV - see copy_fd_to()'s comment for why ENOENT (source fully
+     * unlinked, not just renamed away) is an equally real case here,
+     * and the copy is correct regardless of which one triggered it. */
+    int linkat_errno = errno;
+
+    if (copy_fd_to(fd, dest) != 0) {
+      fprintf(stderr,
+              "avd: quarantine failed for \"%s\": linkat: %s; copy "
+              "fallback: %s\n",
+              path, strerror(linkat_errno), strerror(errno));
       return;
     }
   }
 
-  if (chmod(dest, 0000) != 0)
-    fprintf(stderr,
-            "avd: quarantined \"%s\" to \"%s\" but chmod failed: "
-            "%s\n",
+  /* Lock down the quarantine copy before touching the original at
+   * all - this is what matters for "can this be re-executed". A
+   * failed chmod means the copy is sitting there with whatever mode
+   * the original had (potentially world-readable/executable), so
+   * stop here rather than also removing the original: that would
+   * trade a file we know the location and permissions of for one at
+   * an unpredictable quarantine path that's LESS locked down, not
+   * more. Best-effort remove the half-secured copy and leave the
+   * original in place - a worse but at least contained outcome for
+   * this specific (essentially unreachable in practice: this is a
+   * freshly-created file we just opened successfully) failure. */
+  if (chmod(dest, 0000) != 0) {
+    fprintf(stderr, "avd: quarantined \"%s\" to \"%s\" but chmod failed: %s "
+            "- leaving the original in place rather than removing it "
+            "without a locked-down copy to show for it\n",
             path, dest, strerror(errno));
+    unlink(dest);
+    return;
+  }
+
+  /* Unlike the initial fd open at the top of handle_scan_request()
+   * (which fails open on an inconclusive lstat - see that function's
+   * comment), this fstat() is the immediate-pre-unlink recheck, and
+   * gets the strict treatment: refuse rather than proceed if it
+   * fails, matching this function's own stance everywhere else in
+   * this recheck (a mismatch below also refuses). fstat() on our own
+   * valid, already-successfully-read fd failing here would be
+   * essentially unreachable in practice, but "essentially
+   * unreachable" is exactly when failing closed instead of open costs
+   * nothing and buys real margin. */
+  if (fstat(fd, &fd_st) != 0) {
+    fprintf(stderr,
+            "avd: quarantined \"%s\" to \"%s\", but refusing to remove the "
+            "original - fstat on our own fd failed unexpectedly: %s\n",
+            path, dest, strerror(errno));
+    return;
+  }
+
+  {
+    struct stat now_st;
+
+    /* This lstat()-then-unlink() pair is not, and cannot be made,
+     * atomic through standard POSIX path-based syscalls - a swap
+     * landing in the gap between this check and unlink() below (as
+     * opposed to before it, which this check does catch) would still
+     * remove whatever now occupies `path` instead of the original.
+     * There is no portable "unlink iff this path still names inode X"
+     * primitive to close that with. The alternative - doing this
+     * removal from kernel space, where the already-resolved dentry
+     * from detection could be unlinked directly - is deliberately out
+     * of scope: see this file's top comment on why kernel-side
+     * rename()/unlink() is the riskier direction, not the safer one,
+     * for this codebase specifically. What's left is the same
+     * risk-reduction-not-elimination tradeoff as every other
+     * TOCTOU note in this codebase (see Has_RWX_Segment's scope
+     * note): this check narrows the race to the syscall gap right
+     * here instead of the whole scan-to-quarantine sequence, which is
+     * what it was worth fixing for - it was never going to make
+     * path-based removal provably atomic, and claiming otherwise
+     * would be the actual bug. */
+    if (lstat(path, &now_st) != 0 || now_st.st_dev != fd_st.st_dev ||
+        now_st.st_ino != fd_st.st_ino) {
+      fprintf(stderr,
+              "avd: quarantined \"%s\" to \"%s\", but refusing to remove "
+              "the original - path now resolves to a different file "
+              "(possible symlink swap); remove it manually if "
+              "appropriate\n",
+              path, dest);
+      return;
+    }
+  }
+
+  if (unlink(path) != 0)
+    fprintf(stderr, "avd: unlink of original \"%s\" failed: %s\n", path,
+            strerror(errno));
   else
-    printf("avd: QUARANTINED \"%s\" -> \"%s\"\n", path, dest);
+    printf("avd: QUARANTINED \"%s\" -> \"%s\"%s\n", path, dest,
+           linked ? "" : " (copy fallback)");
 }
 
 static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
@@ -634,37 +745,49 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
                                .score = 0,
                                .override_matched = 0,
                                .rule_name = ""};
-  struct stat baseline_st;
-  bool have_baseline;
+  int fd;
   int ret;
 
   printf("avd: scan request reqid=%llu pid=%u path=\"%s\" sha256=%s\n",
          (unsigned long long)reqid, pid, path, sha256_hex);
 
-  /* Captured before the scan runs (which can itself take up to
-   * SCAN_TIMEOUT_SECS) so the quarantine-time check below covers as
-   * much of the window as possible - see quarantine_file()'s comment
-   * for what this can and can't protect against. A failed lstat here
-   * just means quarantine_file() skips the identity check later
-   * (fail-open on the check itself, matching this codebase's existing
-   * stance on inconclusive information elsewhere) rather than
-   * blocking the scan. */
-  have_baseline = (lstat(path, &baseline_st) == 0);
-
-  if (!compiled_rules) {
+  /* Opened exactly once, here, before anything else touches the file.
+   * The YARA scan, the fuzzy-hash check, and quarantine on a
+   * MALICIOUS verdict all read/act through THIS fd from now on rather
+   * than re-resolving `path` at each step - see quarantine_file()'s
+   * comment for how the quarantine step itself uses it. An open fd keeps
+   * referring to the exact same file for its entire lifetime
+   * regardless of what happens to `path` afterward (deleted, renamed,
+   * replaced with a symlink to something else - even during the scan
+   * itself, which can take up to SCAN_TIMEOUT_SECS), so there's
+   * nothing left for an attacker to swap out from under it. This
+   * replaces the previous design's lstat-baseline-then-re-check-at-
+   * rename-time approach, which could only narrow that window, not
+   * close it. */
+  fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    fprintf(stderr, "avd: could not open \"%s\" for scanning: %s\n", path,
+            strerror(errno));
     send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
     return;
   }
 
-  ret = yr_rules_scan_file(compiled_rules, path, 0, yara_callback, &ctx,
-                           SCAN_TIMEOUT_SECS);
+  if (!compiled_rules) {
+    send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    close(fd);
+    return;
+  }
+
+  ret = yr_rules_scan_fd(compiled_rules, fd, 0, yara_callback, &ctx,
+                         SCAN_TIMEOUT_SECS);
   if (ret != ERROR_SUCCESS) {
     /* File vanished, permission denied, scan timeout, etc. - fail
      * open here too, matching the kernel side's own fail-open
      * stance on inconclusive information (see docs/netlink-protocol.md). */
-    fprintf(stderr, "avd: yr_rules_scan_file(\"%s\") failed: error %d\n", path,
+    fprintf(stderr, "avd: yr_rules_scan_fd(\"%s\") failed: error %d\n", path,
             ret);
     send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+    close(fd);
     return;
   }
 
@@ -689,13 +812,14 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
       printf("avd: MATCH \"%s\" -> %d rule(s), score=%d, override=%d: \"%s\"\n",
              path, ctx.match_count, ctx.score, ctx.override_matched,
              ctx.rule_name);
-      quarantine_file(path, &baseline_st, have_baseline);
+      quarantine_file(fd, path);
       if (send_verdict(reqid, AV_VERDICT_MALICIOUS, ctx.rule_name) < 0)
         fprintf(stderr,
                 "avd: failed to send MALICIOUS verdict for "
                 "reqid=%llu \"%s\" - kernel side will fail "
                 "open on timeout\n",
                 (unsigned long long)reqid, path);
+      close(fd);
       return;
     }
 
@@ -719,7 +843,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
     char fuzzy_name[128];
     int fuzzy_score = 0;
     int fret =
-        check_fuzzy_corpus(path, fuzzy_name, sizeof(fuzzy_name), &fuzzy_score);
+        check_fuzzy_corpus(fd, fuzzy_name, sizeof(fuzzy_name), &fuzzy_score);
 
     if (fret == 1) {
       char verdict_name[AV_RULE_NAME_MAXLEN + 1];
@@ -737,8 +861,9 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
                fuzzy_name, fuzzy_score);
       printf("avd: FUZZY MATCH \"%s\" -> \"%s\" score=%d\n", path, fuzzy_name,
              fuzzy_score);
-      quarantine_file(path, &baseline_st, have_baseline);
+      quarantine_file(fd, path);
       send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
+      close(fd);
       return;
     }
     if (fret < 0)
@@ -746,6 +871,7 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
   }
 
   send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
+  close(fd);
 }
 
 /* Producer side (called only from msg_handler(), the netlink recv

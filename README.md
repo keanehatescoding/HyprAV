@@ -1026,22 +1026,64 @@ the quarantined copy genuinely can't be read/executed even as root
 without an explicit `chmod` back first.
 
 **TOCTOU protection**: between `avd` scanning a file and actually
-quarantining it (`rename()`), there's a window where something with
-write access to a parent directory could swap the path for a symlink
-pointing elsewhere — `quarantine_file()` would then act on the wrong
-file. `avd` captures an `lstat()` (device+inode) baseline before the
-scan runs and re-checks it immediately before `rename()`, refusing to
-quarantine on a mismatch and logging `possible symlink swap`. This is
-risk-reduction, not elimination — a narrower timing race remains
-between the re-check and the `rename()` call itself, and a same-inode
-double-swap could theoretically slip past an identity check alone; a
-more complete fix (using an fd captured once and quarantining via
-`/proc/self/fd/N`) is a documented follow-up, not implemented here.
-Worth demonstrating deliberately for your report: swap
-`/tmp/eicar.com` for a symlink to something else immediately after
-triggering detection but before `avd` would normally quarantine it,
-and confirm you see the `possible symlink swap` refusal in `avd`'s
-output rather than the wrong file being moved.
+quarantining it, there's a window where something with write access to
+a parent directory could swap the path for a symlink pointing
+elsewhere — `quarantine_file()` would then act on the wrong file.
+`handle_scan_request()` now opens the file **once**, at the very
+start, before scanning even begins, and every step after that
+(YARA scan, fuzzy-hash check, and the eventual quarantine) reads
+through that same fd rather than re-resolving the path string — an
+open fd keeps referring to the exact file it was opened against for
+its entire lifetime, regardless of anything that happens to the path
+afterward.
+
+That closes the window for *what content ends up quarantined*
+specifically: `quarantine_file()` creates the quarantine copy via
+`linkat(fd, "", AT_FDCWD, dest, AT_EMPTY_PATH)`, which links a new
+directory entry to `fd`'s underlying inode directly rather than
+walking `path` again, so it's immune to a same-directory swap
+regardless of what the swap points at. (A plain `rename()` through
+`/proc/self/fd/N` looks like it should do the same thing and was tried
+first - it doesn't: verified empirically, it always fails with `EXDEV`
+on this kernel, since the source is treated as living on procfs itself
+for the cross-device check rather than transparently resolving to the
+real filesystem. `linkat()` + `AT_EMPTY_PATH` is the primitive that
+actually targets the fd's real inode.) `linkat()` can still fail for
+reasons that have nothing to do with a swap - `EXDEV` if the
+quarantine directory is on a different filesystem (hardlinks can't
+cross filesystems), or `ENOENT` if the file's link count already hit
+zero (an `unlink()`-then-replace race, as opposed to a
+`rename()`-away one - `linkat()` can't resurrect a fully unlinked
+inode even though the fd remains perfectly valid). Either failure
+falls back to copying the fd's content directly, which is just as
+immune to the swap.
+
+What `linkat()`/the copy fallback do NOT cover is removing the
+*original* from its old location afterward - `unlink()` has no
+fd-based equivalent, so that one step still has to re-walk `path`,
+regardless of which of the two methods above created the quarantine
+copy. It gets an identity re-check (`fstat()` on the fd vs. a fresh
+`lstat()` on the path) immediately before it fires, and refuses on a
+mismatch, logging `possible symlink swap` - this is
+risk-reduction, not elimination, for this one narrowed step, the same
+kind of tradeoff as before, but a failure here now only means the
+original wasn't also cleaned up from its old location, never that the
+wrong content got quarantined (which the earlier, wholly path-based
+design could still get wrong even with its own re-check, via the
+lstat/rename gap or a same-inode double-swap).
+
+Worth demonstrating deliberately for your report: swap `/tmp/eicar.com`
+for a symlink to something else immediately after triggering detection
+but before `avd` would normally quarantine it, and confirm the
+*original* scanned content still ends up quarantined (compare its
+contents/hash against what `/tmp/eicar.com` originally held) rather
+than whatever the symlink now points at - regardless of whether the
+swap used `rename()` (leaves the original's link count > 0, `linkat()`
+succeeds) or `unlink()`+`symlink()` (drops it to 0, `linkat()` falls
+back to the copy) the quarantined content should be correct either
+way. You should also see the `possible symlink swap` refusal in
+`avd`'s output either way, since the final unlink of the now-swapped
+path always re-checks first.
 
 **Structured logs** — every detection/clean/suppressed event is now a
 single grep/awk-parseable line:
