@@ -622,7 +622,6 @@ static void quarantine_file(int fd, const char *path) {
   const char *base;
   struct timespec ts;
   struct stat fd_st;
-  bool have_fd_st;
   bool linked;
 
   if (ensure_quarantine_dir() != 0)
@@ -660,20 +659,65 @@ static void quarantine_file(int fd, const char *path) {
   }
 
   /* Lock down the quarantine copy before touching the original at
-   * all - this is what matters for "can this be re-executed",
-   * independent of whether the original can also be removed below. */
-  if (chmod(dest, 0000) != 0)
-    fprintf(stderr, "avd: quarantined \"%s\" to \"%s\" but chmod failed: %s\n",
+   * all - this is what matters for "can this be re-executed". A
+   * failed chmod means the copy is sitting there with whatever mode
+   * the original had (potentially world-readable/executable), so
+   * stop here rather than also removing the original: that would
+   * trade a file we know the location and permissions of for one at
+   * an unpredictable quarantine path that's LESS locked down, not
+   * more. Best-effort remove the half-secured copy and leave the
+   * original in place - a worse but at least contained outcome for
+   * this specific (essentially unreachable in practice: this is a
+   * freshly-created file we just opened successfully) failure. */
+  if (chmod(dest, 0000) != 0) {
+    fprintf(stderr, "avd: quarantined \"%s\" to \"%s\" but chmod failed: %s "
+            "- leaving the original in place rather than removing it "
+            "without a locked-down copy to show for it\n",
             path, dest, strerror(errno));
+    unlink(dest);
+    return;
+  }
 
-  have_fd_st = (fstat(fd, &fd_st) == 0);
-  /* have_fd_st false (fstat on our own already-open fd failing) is
-   * effectively unreachable in practice - if it somehow happens, fail
-   * open on the check itself rather than skip the unlink, matching
-   * this codebase's existing stance on inconclusive information. */
-  if (have_fd_st) {
+  /* Unlike the initial fd open at the top of handle_scan_request()
+   * (which fails open on an inconclusive lstat - see that function's
+   * comment), this fstat() is the immediate-pre-unlink recheck, and
+   * gets the strict treatment: refuse rather than proceed if it
+   * fails, matching this function's own stance everywhere else in
+   * this recheck (a mismatch below also refuses). fstat() on our own
+   * valid, already-successfully-read fd failing here would be
+   * essentially unreachable in practice, but "essentially
+   * unreachable" is exactly when failing closed instead of open costs
+   * nothing and buys real margin. */
+  if (fstat(fd, &fd_st) != 0) {
+    fprintf(stderr,
+            "avd: quarantined \"%s\" to \"%s\", but refusing to remove the "
+            "original - fstat on our own fd failed unexpectedly: %s\n",
+            path, dest, strerror(errno));
+    return;
+  }
+
+  {
     struct stat now_st;
 
+    /* This lstat()-then-unlink() pair is not, and cannot be made,
+     * atomic through standard POSIX path-based syscalls - a swap
+     * landing in the gap between this check and unlink() below (as
+     * opposed to before it, which this check does catch) would still
+     * remove whatever now occupies `path` instead of the original.
+     * There is no portable "unlink iff this path still names inode X"
+     * primitive to close that with. The alternative - doing this
+     * removal from kernel space, where the already-resolved dentry
+     * from detection could be unlinked directly - is deliberately out
+     * of scope: see this file's top comment on why kernel-side
+     * rename()/unlink() is the riskier direction, not the safer one,
+     * for this codebase specifically. What's left is the same
+     * risk-reduction-not-elimination tradeoff as every other
+     * TOCTOU note in this codebase (see Has_RWX_Segment's scope
+     * note): this check narrows the race to the syscall gap right
+     * here instead of the whole scan-to-quarantine sequence, which is
+     * what it was worth fixing for - it was never going to make
+     * path-based removal provably atomic, and claiming otherwise
+     * would be the actual bug. */
     if (lstat(path, &now_st) != 0 || now_st.st_dev != fd_st.st_dev ||
         now_st.st_ino != fd_st.st_ino) {
       fprintf(stderr,
