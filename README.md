@@ -222,8 +222,14 @@ sudo make install     # binary -> /usr/local/bin/avd
                        # rules/corpus -> /etc/hyprav/
 sudo systemctl daemon-reload
 sudo systemctl enable --now avd.service
-journalctl -u avd -f  # avd's stdout/stderr, same output as running it by hand
+sudo journalctl -u avd -f  # avd's stdout/stderr, same output as running it by hand
 ```
+
+`journalctl` needs `sudo` (or membership in the `systemd-journal` group)
+to read another user's unit logs on most distros' default journald
+config - plain `journalctl -u avd` run as your own user will typically
+just come back empty or permission-denied rather than showing avd's
+output, since the unit runs as `root`.
 
 `install` does **not** enable or start the service itself — reviewing
 `packaging/avd.service` before enabling anything that scans and
@@ -270,6 +276,19 @@ actually runs once installed. It is deliberately **not** substituted
 into `ExecStart`: an `avd.service` built with `DESTDIR=/tmp/pkgroot`
 still points at `<PREFIX>/bin/avd`, the real path once the staged tree
 is deployed to `/`, not `/tmp/pkgroot/<PREFIX>/bin/avd`.
+
+There's also a fourth override, `UNITDIR` (default
+`/usr/lib/systemd/system`) - where the *rendered* `avd.service` file
+itself gets installed, i.e. where systemd will actually find it. It
+doesn't appear in `ExecStart` and doesn't need to match `PREFIX`; it
+exists because some distros expect systemd unit files under
+`/lib/systemd/system` instead (a packaging convention difference, not
+a `PREFIX`-derived path), so a packager can point it there without
+otherwise changing where `avd` itself installs to:
+
+```bash
+sudo make install PREFIX=/usr UNITDIR=/lib/systemd/system DESTDIR=/tmp/pkgroot
+```
 
 ## A note on kernel version / architecture
 
