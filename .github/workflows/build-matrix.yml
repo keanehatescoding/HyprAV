@@ -53,7 +53,11 @@ jobs:
         uses: actions/cache@v6
         with:
           path: linux-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
-          key: kernel-tree-v5-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
+          # v6: bumped from v5 because caches built under v5 are the
+          # broken 32-bit (CONFIG_X86_32) trees this commit fixes -
+          # without a key bump, cache hits would keep serving them and
+          # silently skip the corrected build step below forever.
+          key: kernel-tree-v6-${{ matrix.kernel_version }}-${{ matrix.toolchain }}
 
       - name: Download and build a minimal kernel
         if: steps.cache-kernel.outputs.cache-hit != 'true'
@@ -76,6 +80,17 @@ jobs:
           # subsystems our modules touch gets a real, complete symbol
           # table in a few minutes instead.
           make $LLVM_ARG tinyconfig
+          # tinyconfig is allnoconfig-based, and CONFIG_64BIT's Kconfig
+          # default doesn't survive that on x86 - it silently comes out
+          # as a 32-bit (CONFIG_X86_32) build otherwise. On 32-bit,
+          # struct pt_regs has no r8-r15 fields at all, so every module
+          # here that reads real_regs->r8/r10/etc (execveat/openat/
+          # rename's raw-syscall-register hooks) fails to compile with
+          # "no member named 'rN' in 'struct pt_regs'" - not a real
+          # compatibility break, just this matrix quietly building the
+          # wrong word size. Force it explicitly rather than relying on
+          # tinyconfig's default.
+          ./scripts/config --enable CONFIG_64BIT
           ./scripts/config --enable CONFIG_MODULES
           ./scripts/config --enable CONFIG_KPROBES
           ./scripts/config --enable CONFIG_CRYPTO
