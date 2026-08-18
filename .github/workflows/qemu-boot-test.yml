@@ -94,10 +94,15 @@ jobs:
           # and exec things, on top of just compiling: a console to
           # see anything at all, initramfs support, ELF exec (without
           # this, execve() of ANYTHING - including init itself - fails
-          # outright), and /dev + /tmp for init/eicar.com to live in.
-          # CONFIG_KALLSYMS is pulled in automatically by
-          # CONFIG_KPROBES (kprobes register by symbol name), so it
-          # doesn't need to be listed explicitly.
+          # outright), /dev + /tmp for init/eicar.com to live in, and
+          # the syslog(2) syscall init.c uses to read dmesg (observed
+          # directly in CI: without this explicit enable, init.c's
+          # syslog(SYSLOG_ACTION_READ_ALL) call fails ENOSYS - not
+          # reliably on by default under tinyconfig the way it looked
+          # in earlier local testing, so it's listed explicitly here
+          # rather than assumed). CONFIG_KALLSYMS is pulled in
+          # automatically by CONFIG_KPROBES (kprobes register by
+          # symbol name), so it doesn't need to be listed explicitly.
           ./scripts/config --enable CONFIG_BINFMT_ELF
           ./scripts/config --enable CONFIG_BLK_DEV_INITRD
           ./scripts/config --enable CONFIG_DEVTMPFS
@@ -107,6 +112,7 @@ jobs:
           ./scripts/config --enable CONFIG_TTY
           ./scripts/config --enable CONFIG_SERIAL_8250
           ./scripts/config --enable CONFIG_SERIAL_8250_CONSOLE
+          ./scripts/config --enable CONFIG_PRINTK
           make olddefconfig
           make -j"$(nproc)"
 
