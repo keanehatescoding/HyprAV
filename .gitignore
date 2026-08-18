@@ -12,3 +12,7 @@ modules.order
 userspace/avctl/avctl
 userspace/avd/avd
 av/compile_commands.json
+tests/qemu-boot/init
+tests/qemu-boot/root/
+tests/qemu-boot/initramfs.cpio.gz
+tests/qemu-boot/serial.log

@@ -115,6 +115,10 @@ tests/
     test_fuzzy_evasion.sh              - standalone
     test_entropy_dilution_evasion.sh   - standalone
     test_slow_drip_evasion.sh          - needs the live kernel module (VM only)
+  qemu-boot/             - the QEMU-boot CI job's actual runtime test
+    init.c                 - static PID 1: insmod av.ko, exec a clean
+                            file and an EICAR file, check dmesg - see
+                            .github/workflows/qemu-boot-test.yml
 ```
 
 See `docs/evasion-findings.md` for the full writeup of what each test
@@ -1137,17 +1141,41 @@ matrix legs total) — see the `toolchain` matrix dimension in
 
 ## CI
 
-`.github/workflows/build-matrix.yml` compile-tests `av/` (and the
-`experiments/` modules) against three kernel versions (currently 6.12.96
-LTS, 6.18.21 LTS, 7.1.4 stable — bump these as kernel.org publishes new
-point releases) on every push.
+Two tiers, both on every push, both across the same three kernel
+versions (currently 6.12.96 LTS, 6.18.21 LTS, 7.1.4 stable — bump
+these as kernel.org publishes new point releases):
 
-**This is compile-only, not runtime testing.** GitHub-hosted runners can't
-boot a different host kernel, and free-tier runners have inconsistent
-`/dev/kvm` access, so a true "insmod this on kernel X and confirm it
-detects EICAR" test needs a QEMU-boot job (or a self-hosted runner with
-guaranteed KVM) — not implemented yet, but a good later addition once
-detection logic is stable enough to be worth testing end-to-end. What this
-CI *does* catch: API breakage across kernel versions (e.g. the
-`proc_ops`/`file_operations` split, syscall wrapper argument layout
-changes) — exactly the version-fragility risk called out above.
+**Tier 1 - `.github/workflows/build-matrix.yml`**: compile-tests
+`av/` (and the `experiments/` modules) against gcc and clang. Catches
+API breakage across kernel versions (e.g. the `proc_ops`/
+`file_operations` split, syscall wrapper argument layout changes) -
+exactly the version-fragility risk called out above. Compile-only,
+not runtime testing - GitHub-hosted runners can't boot a different
+host kernel, so this can't confirm the module actually *works* on
+each version, only that it builds.
+
+**Tier 2 - `.github/workflows/qemu-boot-test.yml`**: actually boots
+each kernel version in QEMU and confirms real runtime detection -
+`insmod av.ko`, exec a clean file (must NOT be killed), exec an EICAR
+file (must be killed, with the structured `event=detected` line
+present in `dmesg`). No busybox, no shell: `tests/qemu-boot/init.c`
+is a small statically-linked C program that runs as PID 1, loads the
+module directly via `init_module(2)`, and drives both checks itself.
+Falls back to TCG (software emulation) when `/dev/kvm` isn't usable,
+since free-tier runners have inconsistent KVM access - both paths are
+exercised and confirmed to work identically.
+
+This tier found a real, narrow gap during development: `av.ko`'s
+kprobe hook copies the exec target's pathname via
+`strncpy_from_user()` in atomic (kprobe) context, which can't sleep to
+fault in a userspace page that isn't resident yet - unlike the
+kernel's own later, in-process copy of the same pointer during
+`execve()`'s normal handling, which can. A freshly-booted static init
+exec'ing a page-cold literal within milliseconds of process start hits
+this consistently; a real shell essentially never does, since by the
+time anything calls `execve()` its own memory has had far too much
+prior activity for a relevant page to still be cold. See
+`handler_pre()`'s comment in `av/main.c` and `tests/qemu-boot/init.c`
+for the full account - documented as a known, narrow limitation (same
+risk-reduction-not-elimination category as this file's other TOCTOU
+notes), not fixed as part of adding this test.

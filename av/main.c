@@ -801,7 +801,30 @@ out:
 }
 
 /* Atomic context - the ONLY things allowed here: copying small amounts
- * of data with GFP_ATOMIC, reading regs, and scheduling work. */
+ * of data with GFP_ATOMIC, reading regs, and scheduling work.
+ *
+ * KNOWN NARROW GAP (found via tests/qemu-boot/, not previously
+ * documented): strncpy_from_user() below runs in this atomic/kprobe
+ * context, so it can't sleep to fault in a userspace page that isn't
+ * resident yet - it fails fast with -EFAULT instead, and this handler
+ * then returns 0 without hashing/killing (silent skip, same as any
+ * other early-bail path here). The real execve() syscall's own later,
+ * in-process getname_flags() call on the exact same pointer runs in
+ * normal sleepable context and CAN fault the page in, which is why
+ * the syscall itself still proceeds normally either way - only this
+ * kprobe's earlier copy can lose that race. In practice this needs a
+ * pathname argument whose backing page has never been touched by the
+ * calling process before this exact execve() call - a real shell (or
+ * any process with meaningful prior memory activity) essentially
+ * never has a cold page at that exact moment, which is why this was
+ * never observed until testing against a minimal, just-booted static
+ * init exec'ing a page-cold literal within milliseconds of process
+ * start (see tests/qemu-boot/init.c's matching comment). Not fixed
+ * here - same class of tradeoff as this file's other risk-reduction-
+ * not-elimination notes (e.g. Has_RWX_Segment's scope note), and
+ * closing it for real would mean pre-faulting untrusted userspace
+ * pointers from atomic context, which needs more thought than a
+ * one-line fix. */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
   const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
   const char __user *user_filename;

@@ -1,0 +1,205 @@
+name: QEMU boot test (runtime detection)
+
+# Tier 2 CI: actually BOOTS a kernel in QEMU, insmod's av.ko via a
+# minimal statically-linked init (tests/qemu-boot/init.c - no
+# busybox/shell), and confirms EICAR execution is genuinely detected
+# and killed - not just that everything compiles (that's
+# build-matrix.yml's job). See README.md's "CI" section for why this
+# is a separate job/workflow from the compile-only one: GitHub-hosted
+# runners can't switch their host kernel, so this needs its own
+# from-scratch kernel build + QEMU, and free-tier runners have
+# unreliable /dev/kvm access, so this falls back to TCG (software
+# emulation) when KVM isn't usable rather than requiring it.
+#
+# gcc only, not the full gcc+clang matrix build-matrix.yml runs -
+# detection logic doesn't depend on which compiler built the kernel/
+# module, only on runtime behavior, so doubling this job's (much
+# heavier: full boot, not just compile) cost for that axis isn't
+# worth it. Cross-compiler compile compatibility is already covered
+# there.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  qemu-boot:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same versions as build-matrix.yml (see that file for the
+        # auto-update mechanism) - kept as a separate list here rather
+        # than a shared source since this config diverges from that
+        # job's (this one needs a bootable kernel, not just a
+        # compilable one - see the config step below).
+        kernel_version:
+          - "6.12.96"  # LTS
+          - "6.18.21"  # LTS
+          - "7.1.4"  # current stable
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install build and QEMU dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev \
+            libelf-dev qemu-system-x86 cpio
+
+      - name: Cache built kernel tree
+        id: cache-kernel
+        uses: actions/cache@v6
+        with:
+          path: linux-${{ matrix.kernel_version }}-qemu-boot
+          # Separate cache namespace from build-matrix.yml's - this
+          # job's config is a superset (adds everything needed to
+          # actually boot: console, initramfs, ELF exec, devtmpfs,
+          # tmpfs - see below), not the same tree.
+          key: qemu-boot-kernel-tree-v1-${{ matrix.kernel_version }}
+
+      - name: Download and build a bootable kernel
+        if: steps.cache-kernel.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
+          SRCDIR="linux-${{ matrix.kernel_version }}-qemu-boot"
+          # --retry/--retry-all-errors: kernel.org's CDN occasionally
+          # resets the connection mid-transfer (curl exit 92, "HTTP/2
+          # stream ... PROTOCOL_ERROR") - observed directly on this
+          # exact download in CI, not a hypothetical. --http1.1 avoids
+          # the HTTP/2-specific reset entirely on retry rather than
+          # just hoping a same-protocol retry doesn't hit it again.
+          curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 20 -o linux.tar.xz \
+            "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
+          mkdir -p "$SRCDIR"
+          tar -xf linux.tar.xz -C "$SRCDIR" --strip-components=1
+          rm linux.tar.xz
+          cd "$SRCDIR"
+          make tinyconfig
+          # Same base set build-matrix.yml uses (see that file's
+          # comment on CONFIG_64BIT specifically - tinyconfig defaults
+          # to a 32-bit build otherwise) ...
+          ./scripts/config --enable CONFIG_64BIT
+          ./scripts/config --enable CONFIG_MODULES
+          ./scripts/config --enable CONFIG_KPROBES
+          ./scripts/config --enable CONFIG_CRYPTO
+          ./scripts/config --enable CONFIG_CRYPTO_HASH
+          ./scripts/config --enable CONFIG_CRYPTO_MD5
+          ./scripts/config --enable CONFIG_CRYPTO_SHA1
+          ./scripts/config --enable CONFIG_CRYPTO_SHA256
+          ./scripts/config --enable CONFIG_PROC_FS
+          ./scripts/config --enable CONFIG_NET
+          # ... plus what's needed to actually BOOT to a working init
+          # and exec things, on top of just compiling: a console to
+          # see anything at all, initramfs support, ELF exec (without
+          # this, execve() of ANYTHING - including init itself - fails
+          # outright), /dev + /tmp for init/eicar.com to live in, and
+          # the syslog(2) syscall init.c uses to read dmesg (observed
+          # directly in CI: without this explicit enable, init.c's
+          # syslog(SYSLOG_ACTION_READ_ALL) call fails ENOSYS - not
+          # reliably on by default under tinyconfig the way it looked
+          # in earlier local testing, so it's listed explicitly here
+          # rather than assumed). CONFIG_KALLSYMS is pulled in
+          # automatically by CONFIG_KPROBES (kprobes register by
+          # symbol name), so it doesn't need to be listed explicitly.
+          ./scripts/config --enable CONFIG_BINFMT_ELF
+          ./scripts/config --enable CONFIG_BLK_DEV_INITRD
+          ./scripts/config --enable CONFIG_DEVTMPFS
+          ./scripts/config --enable CONFIG_DEVTMPFS_MOUNT
+          ./scripts/config --enable CONFIG_SHMEM
+          ./scripts/config --enable CONFIG_TMPFS
+          ./scripts/config --enable CONFIG_TTY
+          ./scripts/config --enable CONFIG_SERIAL_8250
+          ./scripts/config --enable CONFIG_SERIAL_8250_CONSOLE
+          ./scripts/config --enable CONFIG_PRINTK
+          make olddefconfig
+          make -j"$(nproc)"
+
+      - name: Build av.ko against this kernel tree
+        run: |
+          set -euxo pipefail
+          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-qemu-boot"
+          make -C av KDIR="$KDIR" clean
+          make -C av KDIR="$KDIR"
+
+      - name: Build the static test init and assemble the initramfs
+        run: |
+          set -euxo pipefail
+          cd tests/qemu-boot
+          # -march=x86-64 (the universal baseline, not -march=native):
+          # QEMU's default CPU model doesn't expose AVX, and glibc's
+          # own static-binary startup code (_dl_aux_init) unconditionally
+          # uses an AVX instruction on this build system's toolchain -
+          # a mismatch here crashes init before it prints anything.
+          # -cpu host/-cpu max below (matched to whichever accel is
+          # used) supplies AVX at the QEMU side; this flag is the
+          # other half of that - neither alone is sufficient.
+          gcc -Wall -Wextra -static -O2 -march=x86-64 -o init init.c
+          rm -rf root
+          mkdir -p root/{proc,dev,tmp,sys}
+          cp init root/init
+          chmod 755 root/init
+          cp "$GITHUB_WORKSPACE/av/av.ko" root/av.ko
+          ( cd root && find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 ) > initramfs.cpio.gz
+          ls -la initramfs.cpio.gz
+
+      - name: Boot in QEMU and check for detection
+        run: |
+          set -euxo pipefail
+          cd tests/qemu-boot
+          KDIR="$GITHUB_WORKSPACE/linux-${{ matrix.kernel_version }}-qemu-boot"
+
+          # KVM access on GitHub-hosted runners is not guaranteed (see
+          # this workflow's header comment) - use it when available for
+          # speed, fall back to TCG (software emulation, slower but
+          # always available) otherwise. Both are exercised and known
+          # to work identically for this test.
+          if [ -e /dev/kvm ]; then
+            sudo chmod 666 /dev/kvm || true
+          fi
+          # Array, not a plain string, so this doesn't depend on word
+          # splitting an unquoted variable expansion later.
+          if [ -w /dev/kvm ] 2>/dev/null; then
+            ACCEL_ARGS=(-enable-kvm -cpu host)
+            echo "Using KVM acceleration"
+          else
+            ACCEL_ARGS=(-accel tcg -cpu max)
+            echo "KVM unavailable - falling back to TCG (software emulation)"
+          fi
+
+          timeout 90 qemu-system-x86_64 \
+            -kernel "$KDIR/arch/x86/boot/bzImage" \
+            -initrd initramfs.cpio.gz \
+            -append "console=ttyS0 panic=-1" \
+            -display none \
+            -serial file:serial.log \
+            -no-reboot \
+            -m 512M \
+            "${ACCEL_ARGS[@]}" \
+          || true # timeout/halt-instead-of-poweroff exit is expected - see below
+
+          echo "::group::Full serial console log"
+          cat serial.log || true
+          echo "::endgroup::"
+
+          # init prints its final PASS/FAIL line and syncs BEFORE calling
+          # reboot(RB_POWER_OFF) - on a kernel without ACPI poweroff
+          # support that just halts the CPU rather than actually
+          # terminating QEMU, which is why the command above is allowed
+          # to end via the `timeout` wrapper instead of a clean exit;
+          # the log has already captured everything that matters by
+          # then. What actually gates pass/fail is the marker text
+          # below, not QEMU's own exit code.
+          if ! grep -q "QEMU_TEST: PASS" serial.log; then
+            echo "::error::QEMU_TEST: PASS marker not found - see log above"
+            exit 1
+          fi
+
+      - name: Upload serial console log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: qemu-serial-log-${{ matrix.kernel_version }}
+          path: tests/qemu-boot/serial.log
+          if-no-files-found: warn
