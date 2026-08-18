@@ -63,7 +63,14 @@ jobs:
           set -euxo pipefail
           MAJOR="$(echo "${{ matrix.kernel_version }}" | cut -d. -f1)"
           SRCDIR="linux-${{ matrix.kernel_version }}-qemu-boot"
-          curl -fL -o linux.tar.xz \
+          # --retry/--retry-all-errors: kernel.org's CDN occasionally
+          # resets the connection mid-transfer (curl exit 92, "HTTP/2
+          # stream ... PROTOCOL_ERROR") - observed directly on this
+          # exact download in CI, not a hypothetical. --http1.1 avoids
+          # the HTTP/2-specific reset entirely on retry rather than
+          # just hoping a same-protocol retry doesn't hit it again.
+          curl -fL --http1.1 --retry 5 --retry-all-errors --retry-delay 5 \
+            --connect-timeout 20 -o linux.tar.xz \
             "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${{ matrix.kernel_version }}.tar.xz"
           mkdir -p "$SRCDIR"
           tar -xf linux.tar.xz -C "$SRCDIR" --strip-components=1
