@@ -803,28 +803,54 @@ out:
 /* Atomic context - the ONLY things allowed here: copying small amounts
  * of data with GFP_ATOMIC, reading regs, and scheduling work.
  *
- * KNOWN NARROW GAP (found via tests/qemu-boot/, not previously
- * documented): strncpy_from_user() below runs in this atomic/kprobe
- * context, so it can't sleep to fault in a userspace page that isn't
- * resident yet - it fails fast with -EFAULT instead, and this handler
- * then returns 0 without hashing/killing (silent skip, same as any
- * other early-bail path here). The real execve() syscall's own later,
- * in-process getname_flags() call on the exact same pointer runs in
- * normal sleepable context and CAN fault the page in, which is why
- * the syscall itself still proceeds normally either way - only this
- * kprobe's earlier copy can lose that race. In practice this needs a
- * pathname argument whose backing page has never been touched by the
- * calling process before this exact execve() call - a real shell (or
- * any process with meaningful prior memory activity) essentially
- * never has a cold page at that exact moment, which is why this was
- * never observed until testing against a minimal, just-booted static
- * init exec'ing a page-cold literal within milliseconds of process
- * start (see tests/qemu-boot/init.c's matching comment). Not fixed
- * here - same class of tradeoff as this file's other risk-reduction-
- * not-elimination notes (e.g. Has_RWX_Segment's scope note), and
- * closing it for real would mean pre-faulting untrusted userspace
- * pointers from atomic context, which needs more thought than a
- * one-line fix. */
+ * KNOWN GAP - COLD-PATHNAME BYPASS (found via tests/qemu-boot/,
+ * tracked by tests/qemu-boot/cold_launcher.c's dedicated regression
+ * case, not previously documented): strncpy_from_user() below runs in
+ * this atomic/kprobe context, so it can't sleep to fault in a
+ * userspace page that isn't resident yet - it fails fast with -EFAULT
+ * instead, and this handler then returns 0 without hashing/killing
+ * (silent skip, same as any other early-bail path here). The real
+ * execve() syscall's own later, in-process getname_flags() call on
+ * the exact same pointer runs in normal sleepable context and CAN
+ * fault the page in, which is why the syscall itself still proceeds
+ * normally either way - only this kprobe's earlier copy can lose that
+ * race.
+ *
+ * Unlike this file's other risk-reduction-not-elimination notes (e.g.
+ * Has_RWX_Segment's scope note, or the quarantine TOCTOU note in
+ * avd.c), this one is NOT a narrow timing race that needs a
+ * well-positioned attacker to exploit - it's deterministically
+ * reproducible by any process whose exec's pathname argument has
+ * simply never been touched before, e.g. a freshly execve()'d static
+ * binary whose entire body is "exec this literal path, nothing else
+ * first" (exactly what cold_launcher.c is, and 100% reliable in
+ * testing). A real shell essentially never hits this by accident -
+ * too much prior memory activity for anything to still be a cold page
+ * by the time it calls execve() - but a deliberately minimal launcher
+ * doesn't need to work hard to trigger it on purpose.
+ *
+ * Considered and NOT done here:
+ *   - Deferring the copy entirely to av_work_fn() (sleepable
+ *     workqueue context) doesn't work: by the time that runs, a
+ *     successful exec has already replaced this process's address
+ *     space, so there's nothing left to copy from.
+ *   - Failing closed (kill on -EFAULT) trades this for a new,
+ *     meaningful false-positive class: -EFAULT alone can't
+ *     distinguish "genuinely cold but valid page" from "actually bad
+ *     pointer" (the latter would fail the real exec too, so killing
+ *     there is harmless; the former would have execve()'d
+ *     successfully and harmlessly, so killing it is a real false
+ *     positive) - and "cold pathname page" is not exotic for
+ *     legitimate minimal/embedded/statically-linked launchers, not
+ *     just malicious ones.
+ *   - A different hook mechanism entirely (e.g. an LSM
+ *     security_bprm_check hook, which runs in normal sleepable
+ *     context) would close this properly, but is a much larger
+ *     architectural change than fits alongside adding a CI job.
+ * Closing this for real needs one of those (or something better),
+ * with more thought than fits here - tracked, not silently left
+ * unverified: see the regression case's comment for how it stays
+ * visible in every CI run instead. */
 static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
   const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
   const char __user *user_filename;
@@ -927,7 +953,15 @@ static int handler_pre(struct kprobe *p, struct pt_regs *regs) {
  * pathname into aw->path and proceeds - empty+flag through the
  * sentinel branch above, non-empty (flag or not) through the normal
  * relative/absolute resolution every other pathname-taking hook in
- * this file already uses. */
+ * this file already uses.
+ *
+ * Shares handler_pre()'s cold-pathname bypass (see that function's
+ * comment): the strncpy_from_user() call(s) below run in this same
+ * atomic/kprobe context and can silently skip a pathname argument
+ * whose page isn't resident yet, for the same reasons and with the
+ * same considered-and-rejected fix directions. Not independently
+ * tracked by a separate cold_launcher.c case - it's the same
+ * underlying mechanism, one write-up covers both call sites. */
 static int handler_pre_execveat(struct kprobe *p, struct pt_regs *regs) {
   const struct pt_regs *real_regs = (struct pt_regs *)regs->di;
   const char __user *user_filename;

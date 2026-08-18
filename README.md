@@ -119,6 +119,9 @@ tests/
     init.c                 - static PID 1: insmod av.ko, exec a clean
                             file and an EICAR file, check dmesg - see
                             .github/workflows/qemu-boot-test.yml
+    cold_launcher.c         - dedicated regression case for the
+                            cold-pathname bypass documented below and
+                            in av/main.c's handler_pre() comment
 ```
 
 See `docs/evasion-findings.md` for the full writeup of what each test
@@ -1165,17 +1168,30 @@ Falls back to TCG (software emulation) when `/dev/kvm` isn't usable,
 since free-tier runners have inconsistent KVM access - both paths are
 exercised and confirmed to work identically.
 
-This tier found a real, narrow gap during development: `av.ko`'s
-kprobe hook copies the exec target's pathname via
-`strncpy_from_user()` in atomic (kprobe) context, which can't sleep to
-fault in a userspace page that isn't resident yet - unlike the
-kernel's own later, in-process copy of the same pointer during
-`execve()`'s normal handling, which can. A freshly-booted static init
-exec'ing a page-cold literal within milliseconds of process start hits
-this consistently; a real shell essentially never does, since by the
-time anything calls `execve()` its own memory has had far too much
-prior activity for a relevant page to still be cold. See
-`handler_pre()`'s comment in `av/main.c` and `tests/qemu-boot/init.c`
-for the full account - documented as a known, narrow limitation (same
-risk-reduction-not-elimination category as this file's other TOCTOU
-notes), not fixed as part of adding this test.
+This tier found a real gap during development: `av.ko`'s kprobe hook
+copies the exec target's pathname via `strncpy_from_user()` in atomic
+(kprobe) context, which can't sleep to fault in a userspace page that
+isn't resident yet - unlike the kernel's own later, in-process copy of
+the same pointer during `execve()`'s normal handling, which can. This
+is not a narrow timing race that needs a well-positioned attacker: any
+process whose exec pathname argument has never been touched before -
+e.g. a freshly execve()'d static binary that does nothing but exec a
+literal path - hits it deterministically. A real shell essentially
+never does, since by the time anything calls `execve()` its own memory
+has had far too much prior activity for a relevant page to still be
+cold, but a minimal launcher doesn't need to work hard to trigger it on
+purpose.
+
+`tests/qemu-boot/init.c` exercises the common case (it touches the
+pathname before exec'ing, so detection works as intended there), while
+`tests/qemu-boot/cold_launcher.c` is a separate, minimal binary kept
+deliberately untouched-on-exec, specifically to reproduce this gap on
+every CI run instead of letting it go unverified. Its result doesn't
+gate the job's PASS/FAIL - either outcome is informative - but it's
+printed to the serial log every run. See `handler_pre()`'s comment in
+`av/main.c` for the full account, including three fix directions
+considered and rejected (deferring the copy to workqueue context,
+failing closed on `-EFAULT`, and switching to an LSM hook) - documented
+as a known, tracked limitation (same risk-reduction-not-elimination
+category as this file's other TOCTOU notes), not fixed as part of
+adding this test.
