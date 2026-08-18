@@ -289,10 +289,25 @@ int main(int argc, char *const argv[]) {
              "(process was killed) - either genuinely fixed upstream, or "
              "environment-dependent; check av/main.c's handler_pre() "
              "comment before assuming this gap is closed for good\n");
-    } else {
+    } else if (exited && code == 1) {
+      /* code == 1 is specifically cold_launcher.c's own `return 1`
+       * after its inner execve() fails ENOEXEC (the expected path -
+       * see its header comment). Any other non-killed outcome (e.g.
+       * code == 127, which is run_and_wait's OWN outer execv()
+       * failing - /cold_launcher missing or broken in the initramfs,
+       * not the bypass) is a real problem with this test, not the
+       * documented gap, so it must not be reported as "as
+       * documented". */
       outmsg("QEMU_TEST: cold-pathname bypass reproduced as documented "
              "(exited=%d code=%d, not killed) - known limitation, "
              "tracked here, not a failure of this test\n",
+             exited, code);
+    } else {
+      outmsg("QEMU_TEST: cold-pathname bypass check INCONCLUSIVE - "
+             "/cold_launcher exited unexpectedly (exited=%d code=%d, not "
+             "killed) - this looks like a problem with the test itself "
+             "(e.g. /cold_launcher missing/broken), not the documented "
+             "av/main.c gap\n",
              exited, code);
     }
   }

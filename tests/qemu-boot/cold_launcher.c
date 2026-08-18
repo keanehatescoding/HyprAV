@@ -29,5 +29,16 @@ int main(void) {
   char *const argv[] = {"/tmp/eicar_cold.com", NULL};
 
   execve("/tmp/eicar_cold.com", argv, NULL);
-  return 1; /* only reached if execve itself failed */
+  /* Only reached if execve itself failed (expected: eicar_cold.com is
+   * plain text, not a valid ELF, so this fails ENOEXEC). If the
+   * kprobe hook DID hash and flag this exec before the syscall's own
+   * failure - i.e. the cold-pathname bug above is ever fixed - the
+   * kill is workqueue-deferred (async) and can race against this
+   * process's own exit. Same race, same fix as init.c's identical
+   * usleep(1000000) after its own failed execv(): without this delay,
+   * a fixed bypass could still get misreported as reproduced just
+   * because this process exited before the (now-successful) kill
+   * arrived. */
+  usleep(1000000);
+  return 1;
 }
