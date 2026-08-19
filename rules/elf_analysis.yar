@@ -20,8 +20,11 @@
  * it previously only evaded the entropy layer specifically - see
  * docs/evasion-findings.md for the full writeup. Entry_Point_Outside_
  * Text and Has_RWX_Segment deliberately do NOT get override: the
- * former has a confirmed real false positive (uwsm), the latter has
- * never been verified against a real sample at all.
+ * former has a confirmed real false positive (uwsm); the latter is
+ * now verified against a real RWX sample (see its own confidence
+ * meta below) but wasn't re-evaluated for override status as part of
+ * that verification pass - it stays purely additive at weight 40
+ * until that's deliberately reconsidered, not by default.
  *
  * Every rule here was verified against a REAL packed binary (UPX 4.2.2,
  * packing a small test executable) as well as normal system binaries
@@ -73,7 +76,7 @@ rule Has_RWX_Segment
 {
     meta:
         description = "A loadable (PT_LOAD) segment is both writable and executable - violates W^X; legitimate binaries essentially never need this, self-modifying/decrypting code does"
-        confidence = "medium - logically sound, not yet verified against a real RWX-segment sample (harder to produce than the other two checks here)"
+        confidence = "medium-high - verified against a real RWX PT_LOAD segment (a -nostdlib freestanding binary linked with `ld -N`/--omagic, which GNU ld itself warns produces an RWX LOAD segment); no false positives across /bin/ls, /bin/bash, /usr/bin/gcc, /usr/bin/python3, or a build without -Wl,-N/--omagic of the same test program - see the README's ELF structural analysis testing section for the exact repro"
         weight = 40
     condition:
         for any i in (0..elf.number_of_segments - 1) : (

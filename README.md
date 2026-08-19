@@ -553,12 +553,47 @@ yara rules/elf_analysis.yar /tmp/execstack_test
 # expect: Executable_Stack
 ```
 
-`Has_RWX_Segment` is logically sound (checks `PT_LOAD` segments for both
-`PF_W` and `PF_X`) but wasn't verified against a real sample — producing
-a genuine RWX `PT_LOAD` segment needs a deliberately crafted binary or
-linker script, which is a reasonable thing to build as a follow-up test
-case for your report (framed as "how would I verify a detector I can't
-easily produce a positive sample for").
+For `Has_RWX_Segment` (checks `PT_LOAD` segments for both `PF_W` and
+`PF_X`) — producing a genuine RWX `PT_LOAD` segment isn't as simple as
+a compiler flag, but GNU `ld`'s old `-N`/`--omagic` option (merge
+text+data into one segment, historically used for a.out-style
+binaries) still does it on a modern ELF freestanding binary, and `ld`
+itself warns when it does. The inline assembly below is x86-64 Linux
+syscall convention specifically (`%rax`/`%rdi`, syscall 60 = `exit`) -
+reproduce on an x86-64 Linux box, same as the rest of this project:
+
+```bash
+cat > /tmp/rwx_start.c <<'EOF'
+void _start(void) {
+    __asm__ volatile ("mov $60, %rax\n xor %rdi, %rdi\n syscall\n");
+}
+EOF
+gcc -nostdlib -static -no-pie -Wl,-N -o /tmp/rwx_test /tmp/rwx_start.c
+# expect a linker warning: "... has a LOAD segment with RWX permissions"
+
+# confirms it end-to-end, not just trusting the warning - checks the
+# LOAD row specifically (a plain `grep RWE` could match a different
+# program header, e.g. PT_GNU_STACK, that happens to also be RWE):
+readelf -W -l /tmp/rwx_test |
+    awk '$1 == "LOAD" && $7 ~ /W/ && $7 ~ /E/ { found = 1 } END { exit !found }' \
+    && echo "confirmed: a LOAD segment is RWX"
+
+# -i isolates Has_RWX_Segment specifically, so these checks assert on
+# that one rule rather than "some rule in the file matched or didn't":
+yara -i Has_RWX_Segment rules/elf_analysis.yar /tmp/rwx_test
+# expect: Has_RWX_Segment
+
+# negative controls - same rule, real binaries, no match expected
+# (yara only takes one target per invocation):
+for b in /bin/ls /bin/bash /usr/bin/gcc /usr/bin/python3; do
+    yara -i Has_RWX_Segment rules/elf_analysis.yar "$b"
+done
+
+# and the same test program WITHOUT -Wl,-N, to isolate that the
+# RWX match really is about omagic specifically:
+gcc -nostdlib -static -no-pie -o /tmp/rwx_control /tmp/rwx_start.c
+yara -i Has_RWX_Segment rules/elf_analysis.yar /tmp/rwx_control   # no output
+```
 
 Full round trip: same as before — `avd` loads all `*.yar` files in
 `rules/` automatically, so restart `avd` after adding this file and the
@@ -970,9 +1005,9 @@ tests/evasion/test_dynamic_symbol_evasion.sh
 tests/evasion/test_fuzzy_evasion.sh
 tests/evasion/test_entropy_dilution_evasion.sh
 
-# this one needs the live module and root, and is the one most worth
-# re-running fresh (the writeup's conclusion is derived from the code
-# path, not yet re-confirmed against a live dmesg capture):
+# this one needs the live module and root - re-verified live against
+# a real dmesg capture as of v0.9.0's follow-up (see
+# docs/evasion-findings.md's finding #4 for the confirmed result):
 sudo insmod av/av.ko
 sudo tests/evasion/test_slow_drip_evasion.sh
 ```
