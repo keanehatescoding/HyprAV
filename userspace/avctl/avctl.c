@@ -1,6 +1,7 @@
 /*
  * avctl - userspace CLI for /proc/kernel_av_signatures,
- * /proc/kernel_av_trusted, and /proc/kernel_av_protected.
+ * /proc/kernel_av_trusted, /proc/kernel_av_protected, and
+ * /proc/kernel_av_daemon_policy.
  *
  * Usage:
  *   avctl add <md5|sha1|sha256> <hex> <name>
@@ -12,6 +13,8 @@
  *   avctl protect add <absolute-path>
  *   avctl protect del <absolute-path>
  *   avctl protect list
+ *   avctl policy get
+ *   avctl policy set <fail-open|fail-closed>
  *   avctl save <file>
  *   avctl load <file>
  *
@@ -30,6 +33,7 @@
 #define PROC_PATH "/proc/kernel_av_signatures"
 #define TRUST_PROC_PATH "/proc/kernel_av_trusted"
 #define PROTECTED_PROC_PATH "/proc/kernel_av_protected"
+#define POLICY_PROC_PATH "/proc/kernel_av_daemon_policy"
 
 static void usage(const char *prog)
 {
@@ -44,9 +48,12 @@ static void usage(const char *prog)
         "  %s protect add <absolute-path>\n"
         "  %s protect del <absolute-path>\n"
         "  %s protect list\n"
+        "  %s policy get\n"
+        "  %s policy set <fail-open|fail-closed>\n"
         "  %s save <file>\n"
         "  %s load <file>\n",
-        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog);
+        prog, prog, prog, prog, prog, prog, prog, prog, prog, prog, prog,
+        prog, prog);
 }
 
 static int do_list_generic(const char *path, const char *header_algo)
@@ -169,18 +176,22 @@ static int write_command(const char *cmd)
     return write_command_to(PROC_PATH, cmd);
 }
 
-/* save/load: /proc/kernel_av_signatures and /proc/kernel_av_trusted are
- * both in-memory kernel hashtables with no persistence of their own -
- * everything vanishes on `rmmod`. save dumps all three into one file as
- * replayable write-commands (not the pretty-printed list() format);
- * load replays them. A "sig ", "trust ", or "protect " line prefix says
- * which /proc file each line targets; the rest of the line is passed
- * through VERBATIM as the write() payload, so names/paths containing
- * spaces round-trip correctly (the underlying /proc write handlers
- * already treat everything after the hash/command as the rest-of-line
- * value - see sig_proc_write()/trust_proc_write()/protected_proc_write()
- * in the kernel module). Line buffer sized for PATH_MAX (protected-path
- * entries can be much longer than a sha256 signature/name line). */
+/* save/load: /proc/kernel_av_signatures, /proc/kernel_av_trusted, and
+ * /proc/kernel_av_daemon_policy are all in-memory kernel state with no
+ * persistence of their own - everything resets to its default on
+ * `rmmod` (the policy specifically always comes back up as fail-open,
+ * regardless of what it was set to before unload). save dumps all
+ * four into one file as replayable write-commands (not the
+ * pretty-printed list() format); load replays them. A "sig ",
+ * "trust ", "protect ", or "policy " line prefix says which /proc
+ * file each line targets; the rest of the line is passed through
+ * VERBATIM as the write() payload, so names/paths containing spaces
+ * round-trip correctly (the underlying /proc write handlers already
+ * treat everything after the hash/command as the rest-of-line value -
+ * see sig_proc_write()/trust_proc_write()/protected_proc_write()/
+ * daemon_policy_proc_write() in the kernel module). Line buffer sized
+ * for PATH_MAX (protected-path entries can be much longer than a
+ * sha256 signature/name line). */
 static int do_save(const char *path)
 {
     FILE *out;
@@ -253,8 +264,27 @@ static int do_save(const char *path)
     }
     fclose(in);
 
+    in = fopen(POLICY_PROC_PATH, "r");
+    if (!in) {
+        fprintf(stderr, "avctl: could not open %s: %s\n"
+                         "(is the av module loaded? try: sudo insmod av.ko)\n",
+                POLICY_PROC_PATH, strerror(errno));
+        fclose(out);
+        return 1;
+    }
+    if (fgets(line, sizeof(line), in)) {
+        size_t len = strlen(line);
+
+        if (len > 0 && line[len - 1] == '\n')
+            line[len - 1] = '\0';
+        if (line[0])
+            fprintf(out, "policy %s\n", line);
+    }
+    fclose(in);
+
     fclose(out);
-    printf("saved %d signature(s), %d trusted entr%s, %d protected path%s to %s\n",
+    printf("saved %d signature(s), %d trusted entr%s, %d protected path%s, "
+           "and the daemon-unavailable policy to %s\n",
            sig_count, trust_count, trust_count == 1 ? "y" : "ies",
            protect_count, protect_count == 1 ? "" : "s", path);
     return 0;
@@ -290,9 +320,13 @@ static int do_load(const char *path)
         } else if (!strncmp(line, "protect ", 8)) {
             rest = line + 8;
             ret = write_command_to(PROTECTED_PROC_PATH, rest);
+        } else if (!strncmp(line, "policy ", 7)) {
+            rest = line + 7;
+            ret = write_command_to(POLICY_PROC_PATH, rest);
         } else {
             fprintf(stderr, "avctl: load: malformed line (expected "
-                             "'sig ', 'trust ', or 'protect ' prefix): %s\n",
+                             "'sig ', 'trust ', 'protect ', or 'policy ' "
+                             "prefix): %s\n",
                     line);
             errors++;
             continue;
@@ -446,6 +480,52 @@ static int do_protect(int argc, char **argv)
     return 0;
 }
 
+/* Unlike sig/trust/protect's "add"/"del" verbs, the kernel side here
+ * (daemon_policy_proc_write() in av/main.c) expects the raw value
+ * ("fail-open" or "fail-closed") with no leading verb - so `set`
+ * passes argv[3] straight through to write_command_to() rather than
+ * building a "<verb> <value>" command string. */
+static int do_policy(int argc, char **argv)
+{
+    if (argc < 3) {
+        usage(argv[0]);
+        return 1;
+    }
+
+    if (!strcmp(argv[2], "get")) {
+        FILE *f = fopen(POLICY_PROC_PATH, "r");
+        char line[32];
+
+        if (!f) {
+            fprintf(stderr, "avctl: could not open %s: %s\n"
+                             "(is the av module loaded? try: sudo insmod av.ko)\n",
+                    POLICY_PROC_PATH, strerror(errno));
+            return 1;
+        }
+        if (fgets(line, sizeof(line), f))
+            fputs(line, stdout);
+        fclose(f);
+    } else if (!strcmp(argv[2], "set")) {
+        if (argc < 4) {
+            usage(argv[0]);
+            return 1;
+        }
+        if (strcmp(argv[3], "fail-open") && strcmp(argv[3], "fail-closed")) {
+            fprintf(stderr, "avctl: policy set requires fail-open or "
+                             "fail-closed, got: %s\n", argv[3]);
+            return 1;
+        }
+        if (write_command_to(POLICY_PROC_PATH, argv[3]))
+            return 1;
+        printf("daemon-unavailable policy: %s\n", argv[3]);
+    } else {
+        usage(argv[0]);
+        return 1;
+    }
+
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -459,6 +539,8 @@ int main(int argc, char **argv)
         return do_trust(argc, argv);
     } else if (!strcmp(argv[1], "protect")) {
         return do_protect(argc, argv);
+    } else if (!strcmp(argv[1], "policy")) {
+        return do_policy(argc, argv);
     } else if (!strcmp(argv[1], "save")) {
         if (argc < 3) {
             usage(argv[0]);
