@@ -77,6 +77,10 @@ corpus/
                         (format: hash,name) - the seed entry is a test
                         fixture, not real malware; add real sample hashes
                         here once testing against actual threats
+  tlsh_hashes.txt        - second fuzzy-hash algorithm alongside ssdeep,
+                        same format/seed-fixture convention - see the
+                        TLSH testing section for why this is a
+                        separate corpus, not a shared one
 userspace/
   avctl/              - CLI for managing the signature DB (/proc/
                         kernel_av_signatures) and the trusted-process
@@ -94,10 +98,18 @@ userspace/
                         rules/*.yar and corpus/fuzzy_hashes.txt at startup;
                         replies with a verdict based on weighted YARA
                         scoring (or an override-tier rule alone), then
-                        (on a miss) fuzzy-hash similarity. v1.0.0:
+                        (on a miss) fuzzy-hash similarity - ssdeep, then
+                        TLSH if ssdeep didn't match either. v1.0.0:
                         quarantines the file on any MALICIOUS verdict
                         (moves to /var/lib/av-quarantine/, chmod 0000)
     avd.c
+    tlsh_shim.h/.cpp     - libtlsh's only public API is a C++ class
+                        with no extern "C" surface at all (confirmed
+                        against the real upstream header, not
+                        assumed) - this is the one C++ translation
+                        unit in this otherwise-C project, bridging
+                        avd.c to it. See the Makefile for how the
+                        mixed C/C++ build works.
     Makefile
 experiments/          - throwaway learning modules, not tagged/released
   hello/              - minimal LKM: module_init/module_exit, dmesg logging
@@ -174,14 +186,22 @@ carries none of that risk, so quarantine lives in `avd` instead of
 `docs/netlink-protocol.md` for the full protocol design, including a
 documented fail-open-on-timeout decision worth discussing in your report.
 
-**Scope note on v0.7.0**: only ssdeep (via libfuzzy) was implemented,
-not TLSH. Both are valid fuzzy-hashing approaches with different
-tradeoffs (ssdeep is simpler and widely supported; TLSH is generally
-considered more robust for larger files) — worth mentioning as a
-deliberate scope decision in your report, and a reasonable stretch
-goal if you have time later (`libtlsh-dev` is available and would sit
-alongside the ssdeep check with essentially the same corpus-comparison
-structure).
+**Update on the v0.7.0 scope note**: TLSH has since been added
+alongside ssdeep (`check_tlsh_corpus()` in `avd.c`, `corpus/tlsh_hashes.txt`)
+— complementary, not redundant, since the two algorithms fingerprint
+files differently; a scan falls through to TLSH only if ssdeep didn't
+match either. One correction worth keeping visible: this was
+originally expected to "sit alongside the ssdeep check with
+essentially the same corpus-comparison structure" - that assumption
+turned out to be wrong. libtlsh's only public API is a C++ class with
+no `extern "C"` surface at all (confirmed against the actual upstream
+header, not assumed), so it couldn't be linked into `avd.c` directly
+the way `fuzzy.h` was. See `tlsh_shim.h`/`tlsh_shim.cpp` — the one C++
+translation unit in this otherwise-C project — and the TLSH testing
+section below for the full story, including why a small C++ shim was
+chosen over shelling out to the `tlsh` CLI per scan (in-process,
+same performance profile as ssdeep, at the cost of a real - but
+narrowly contained - build-system change).
 
 Tagging a milestone once it's working and tested:
 
@@ -271,7 +291,7 @@ template (`@BINDIR@`/`@SYSCONFDIR@` placeholders in
 actually installed:
 
 ```
-ExecStart=<PREFIX>/bin/avd <SYSCONFDIR>/rules <SYSCONFDIR>/fuzzy_hashes.txt /var/lib/av-quarantine
+ExecStart=<PREFIX>/bin/avd <SYSCONFDIR>/rules <SYSCONFDIR>/fuzzy_hashes.txt /var/lib/av-quarantine <SYSCONFDIR>/tlsh_hashes.txt
 ```
 
 e.g. `PREFIX=/usr` above renders `ExecStart=/usr/bin/avd ...`, not
@@ -708,6 +728,93 @@ was picked because it sits well above the "unrelated files" baseline
 but real-world tuning needs an actual malware corpus with known
 variant families, which is out of scope here. Worth discussing this
 gap explicitly in your report rather than presenting 60 as validated.
+
+## Testing TLSH fuzzy hashing
+
+A second fuzzy-hash algorithm, checked after ssdeep on a miss (see
+`check_tlsh_corpus()` in `avd.c`) — same near-identical-variant
+scenario as v0.7.0's ssdeep testing above, demonstrated the same way,
+but note TLSH's `totalDiff()` is a **distance**, the opposite
+direction from ssdeep's similarity score: **lower means more
+similar**, `0` is identical.
+
+```bash
+sudo apt-get install -y tlsh-tools   # or: sudo pacman -S tlsh
+
+# the corpus already contains the TLSH hash of /tmp/ptrace_test - verify
+# the seed hash still matches your build:
+tlsh -f /tmp/ptrace_test
+
+# reuse the same variant from the ssdeep section above (or recreate it -
+# same idea: a few bytes appended, same file otherwise)
+cp /tmp/ptrace_test /tmp/ptrace_test_variant
+echo "extra padding" >> /tmp/ptrace_test_variant
+
+tlsh -c /tmp/ptrace_test -f /tmp/ptrace_test_variant
+# expect: a low diff (measured 5-10 in testing against a real
+# compiled binary - see TLSH_MATCH_MAX_DIFF's comment in avd.c)
+
+tlsh -c /tmp/ptrace_test -f /bin/ls
+# expect: a high diff (measured 40+ against an unrelated binary)
+```
+
+Full round trip through `avd` (same setup as the ssdeep section - one
+`avd` process, one corpus each, tries ssdeep first and only reaches
+TLSH on a miss there too):
+
+```bash
+sudo insmod av/av.ko
+cd userspace/avd && make && cd ../..
+sudo userspace/avd/avd rules corpus/fuzzy_hashes.txt /var/lib/av-quarantine corpus/tlsh_hashes.txt
+
+# in another terminal
+/tmp/ptrace_test_variant
+```
+
+Expect in `avd`'s output:
+```
+avd: TLSH MATCH "/tmp/ptrace_test_variant" -> "test-ptrace-sample" diff=<N>
+```
+
+And in `dmesg`:
+```
+kernel-av: event=detected action=kill type=daemon path="/tmp/ptrace_test_variant" reason="TLSH:test-ptrace-sample(<N>)" pid=... dev=... ino=... size=...
+```
+
+**`TLSH_MATCH_MAX_DIFF` (30) is a starting point, not a tuned value**
+— same caveat as ssdeep's threshold, calibrated the same way (a real
+compiled test binary vs. that binary with a few bytes appended
+measured diff=10; an unrelated binary measured diff=43 - 30 sits with
+real margin on both sides), not against an actual malware corpus with
+known variant families.
+
+**Why a C++ shim instead of linking libtlsh directly, like ssdeep:**
+libtlsh's only public API is a C++ class (`Tlsh`, in `<tlsh/tlsh.h>`)
+with no `extern "C"` interface at all — confirmed by reading the
+actual upstream header, not assumed from the library's reputation.
+`avd.c` is plain C, so it can't call that API directly the way it
+calls `fuzzy_hash_file()`/`fuzzy_compare()` from `fuzzy.h`. Two real
+alternatives were considered and not taken:
+
+- **Shell out to the `tlsh` CLI per scan.** Keeps `avd.c` pure C, no
+  build-system change at all — but adds a fork/exec per file scanned
+  (real overhead under `AVD_SCAN_THREADS`-way concurrent load) and
+  CLI-output-parsing fragility, a different integration shape than
+  every other detection layer here.
+- **Do nothing, document the constraint.** Legitimate if the C++
+  toolchain dependency were unacceptable, but it isn't here — `avd`
+  is already the one place in this project explicitly designed to
+  carry heavy/complex dependencies (see "Architecture" above), and a
+  C++ shim confined to one small, clearly-marked translation unit is
+  a modest, contained addition to that, not a departure from it.
+
+`tlsh_shim.cpp` is the one C++ file in this project — the *only*
+translation unit that includes `<tlsh/tlsh.h>` — exposing a small,
+plain-C-callable interface (`tlsh_shim.h`) that `avd.c` calls exactly
+like any other function. `userspace/avd/Makefile` compiles it with
+`$(CXX)` and links the final binary with `$(CXX)` too (g++ auto-links
+`libstdc++`, which plain `gcc` doesn't - see the Makefile's own
+comment on why the link step specifically needs this).
 
 ## Testing behavioral heuristics (v0.8.0)
 
@@ -1152,10 +1259,10 @@ measure different things:
   this measures just the kernel-side hashing + signature lookup cost.
 - **`avd` running** (`sudo userspace/avd/avd rules corpus/fuzzy_hashes.txt`
   in another terminal first): this additionally measures the netlink
-  round trip and `avd`'s own scan time (YARA + fuzzy hash) for every
-  execve that misses the kernel-side signature check — the more
-  realistic end-to-end number, and the one worth reporting as the
-  "real" overhead.
+  round trip and `avd`'s own scan time (YARA + fuzzy hash, ssdeep then
+  TLSH) for every execve that misses the kernel-side signature check —
+  the more realistic end-to-end number, and the one worth reporting as
+  the "real" overhead.
 
 ## Toolchain support (GCC / Clang)
 

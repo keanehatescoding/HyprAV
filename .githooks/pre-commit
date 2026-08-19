@@ -73,6 +73,27 @@ for f in $STAGED; do
                 fi
             fi
             ;;
+        userspace/avd/*.cpp|userspace/avd/*.h)
+            # tlsh_shim.cpp/.h - the one C++ translation unit in this
+            # project (see tlsh_shim.h's own comment for why). Always
+            # syntax-check tlsh_shim.cpp itself, even when only the
+            # header changed (a header-only edit can still break the
+            # one file that actually includes it) - $f is only used
+            # for the "skip" message when libtlsh isn't available, not
+            # as the compile target, since a .h alone isn't a
+            # self-contained C++ translation unit the way a .c file is
+            # elsewhere in this hook.
+            if ! g++ -x c++ - -o /tmp/.avd_tlsh_check <<< 'int main(){return 0;}' -ltlsh 2>/dev/null; then
+                echo "  ! libtlsh not found - skipping syntax check for $f"
+                echo "    (sudo pacman -S tlsh  /  apt install libtlsh-dev)"
+            else
+                rm -f /tmp/.avd_tlsh_check
+                echo "  - g++ -fsyntax-only: userspace/avd/tlsh_shim.cpp"
+                if ! g++ -fsyntax-only -Wall -Wextra userspace/avd/tlsh_shim.cpp; then
+                    FAIL=1
+                fi
+            fi
+            ;;
         corpus/*.txt)
             echo "  - corpus format check: $f (non-comment, non-blank lines must contain a comma)"
             if grep -vE '^(#.*)?$' "$f" | grep -v ',' | grep -q .; then
