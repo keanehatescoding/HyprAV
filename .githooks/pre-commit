@@ -89,7 +89,13 @@ for f in $STAGED; do
             else
                 rm -f /tmp/.avd_tlsh_check
                 echo "  - g++ -fsyntax-only: userspace/avd/tlsh_shim.cpp"
-                if ! g++ -fsyntax-only -Wall -Wextra userspace/avd/tlsh_shim.cpp; then
+                # -I/usr/include/tlsh: same reasoning as TLSH_CFLAGS in
+                # userspace/avd/Makefile - Arch/CachyOS's tlsh package
+                # installs the header under a tlsh/ subdirectory,
+                # Debian/Ubuntu's libtlsh-dev installs it flat. A
+                # nonexistent -I path is silently ignored, not an
+                # error, so this is safe on both.
+                if ! g++ -fsyntax-only -Wall -Wextra -I/usr/include/tlsh userspace/avd/tlsh_shim.cpp; then
                     FAIL=1
                 fi
             fi

@@ -1,13 +1,22 @@
 /*
  * tlsh_shim.cpp - the only translation unit in this project that
- * includes <tlsh/tlsh.h> directly. See tlsh_shim.h for why this
- * exists at all (libtlsh has no C API). Kept deliberately tiny: this
- * is a bridge, not a place for any actual scanning logic - that all
- * still lives in avd.c, same as the ssdeep integration.
- */
+ * includes <tlsh.h> directly. See tlsh_shim.h for why this exists at
+ * all (libtlsh has no C API). Kept deliberately tiny: this is a
+ * bridge, not a place for any actual scanning logic - that all still
+ * lives in avd.c, same as the ssdeep integration.
+ *
+ * Plain <tlsh.h>, not <tlsh/tlsh.h>: confirmed the hard way (a CI
+ * failure, not assumed) that the header install path genuinely
+ * differs by distro - Arch/CachyOS's `tlsh` package puts it at
+ * /usr/include/tlsh/tlsh.h, but Debian/Ubuntu's libtlsh-dev puts it
+ * flat at /usr/include/tlsh.h, no subdirectory. Using the flat name
+ * here and adding -I/usr/include/tlsh in the Makefile (a no-op -I on
+ * Debian/Ubuntu, where that directory doesn't exist) is what makes
+ * this one #include line correct on both, rather than needing
+ * #ifdef/__has_include distro-detection logic. */
 #include "tlsh_shim.h"
 
-#include <tlsh/tlsh.h>
+#include <tlsh.h>
 
 #include <cstring>
 #include <unistd.h>

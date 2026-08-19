@@ -25,6 +25,16 @@ FUZZY_LIBS   := -lfuzzy
 # C++ class (see tlsh_shim.h) - the link-test below is a C++ compile,
 # not C, since that's genuinely what's needed to use it at all.
 TLSH_LIBS    := -ltlsh
+# The header install PATH differs by distro too, confirmed the hard
+# way (a real CI failure, not assumed): Arch/CachyOS's `tlsh` package
+# puts tlsh.h under /usr/include/tlsh/, but Debian/Ubuntu's
+# libtlsh-dev installs it flat at /usr/include/tlsh.h. tlsh_shim.cpp
+# includes the flat name (<tlsh.h>) to match Ubuntu directly; this
+# extra -I is what makes that same flat include ALSO resolve on
+# Arch/CachyOS - harmless no-op there if this exact directory ever
+# stopped existing, since an -I for a nonexistent directory is
+# silently ignored by both gcc and clang, not an error.
+TLSH_CFLAGS  := -I/usr/include/tlsh
 
 avd: avd.o tlsh_shim.o
 	@if [ -z "$(LIBNL_LIBS)" ]; then \
@@ -66,7 +76,7 @@ avd.o: avd.c ../../av/netlink_proto.h tlsh_shim.h
 	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
 
 tlsh_shim.o: tlsh_shim.cpp tlsh_shim.h
-	$(CXX) $(CXXFLAGS) -c tlsh_shim.cpp -o tlsh_shim.o
+	$(CXX) $(CXXFLAGS) $(TLSH_CFLAGS) -c tlsh_shim.cpp -o tlsh_shim.o
 
 clean:
 	rm -f avd avd.o tlsh_shim.o
