@@ -76,7 +76,7 @@ rule Has_RWX_Segment
 {
     meta:
         description = "A loadable (PT_LOAD) segment is both writable and executable - violates W^X; legitimate binaries essentially never need this, self-modifying/decrypting code does"
-        confidence = "medium-high - verified against a real RWX PT_LOAD segment (a -nostdlib freestanding binary linked with `ld -N`/--omagic, which GNU ld itself warns produces an RWX LOAD segment); no false positives across /bin/ls, /bin/bash, /usr/bin/gcc, /usr/bin/python3, or a non--omagic build of the same test program - see the README's ELF structural analysis testing section for the exact repro"
+        confidence = "medium-high - verified against a real RWX PT_LOAD segment (a -nostdlib freestanding binary linked with `ld -N`/--omagic, which GNU ld itself warns produces an RWX LOAD segment); no false positives across /bin/ls, /bin/bash, /usr/bin/gcc, /usr/bin/python3, or a build without -Wl,-N/--omagic of the same test program - see the README's ELF structural analysis testing section for the exact repro"
         weight = 40
     condition:
         for any i in (0..elf.number_of_segments - 1) : (
