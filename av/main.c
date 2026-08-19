@@ -661,7 +661,6 @@ static int daemon_policy_proc_open(struct inode *inode, struct file *file) {
 /* cppcheck-suppress constParameterCallback */
 static ssize_t daemon_policy_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
   char kbuf[32];
-  char word[16];
   size_t len;
 
   if (*ppos != 0)
@@ -679,18 +678,21 @@ static ssize_t daemon_policy_proc_write(struct file *file, const char __user *ub
   if (len > 0 && kbuf[len - 1] == '\r')
     kbuf[--len] = '\0';
 
-  if (sscanf(kbuf, "%15s", word) != 1)
-    return -EINVAL;
-
-  if (!strcasecmp(word, "fail-open")) {
+  /* Compare the fully trimmed buffer directly, not just its first
+   * whitespace-delimited token (an earlier sscanf(kbuf, "%15s", ...)
+   * version parsed only the first token, so a write like
+   * "fail-closed unexpected\n" silently enabled fail-closed instead
+   * of being rejected - this keeps the proc interface's documented
+   * fixed-vocabulary contract actually enforced). */
+  if (!strcasecmp(kbuf, "fail-open")) {
     atomic_set(&av_daemon_fail_closed, 0);
-  } else if (!strcasecmp(word, "fail-closed")) {
+  } else if (!strcasecmp(kbuf, "fail-closed")) {
     atomic_set(&av_daemon_fail_closed, 1);
   } else {
     return -EINVAL;
   }
 
-  pr_info("kernel-av: daemon-unavailable policy set to %s\n", word);
+  pr_info("kernel-av: daemon-unavailable policy set to %s\n", kbuf);
   return count;
 }
 
