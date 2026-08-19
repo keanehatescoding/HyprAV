@@ -13,7 +13,24 @@
  * here and adding -I/usr/include/tlsh in the Makefile (a no-op -I on
  * Debian/Ubuntu, where that directory doesn't exist) is what makes
  * this one #include line correct on both, rather than needing
- * #ifdef/__has_include distro-detection logic. */
+ * #ifdef/__has_include distro-detection logic.
+ *
+ * VERSION SKEW, also confirmed the hard way (a second CI failure,
+ * different error): Ubuntu noble's libtlsh-dev ships TLSH 3.4.4
+ * (2015); Arch/CachyOS's ships 4.12.0 (current). That's a decade of
+ * API drift on the one library this project can't fully control the
+ * version of. Concretely: Tlsh::isValid() and the copy constructor
+ * don't exist in 3.4.4 at all, and MIN_DATA_LENGTH differs (256 in
+ * 3.4.4 vs ~50 in 4.12.0 non-conservative mode) - so a file between
+ * roughly 50 and 256 bytes hashes successfully on Arch but not on
+ * Ubuntu, a real behavioral difference this project doesn't try to
+ * paper over. What both versions DO agree on, verified empirically
+ * against real .deb/.pkg.tar.zst packages for each rather than
+ * assumed from either header alone: getHash() itself returns a
+ * non-NULL but EMPTY string when the hash never became valid (too
+ * short/insufficiently diverse input), on both 3.4.4 and 4.12.0
+ * alike. That's the one check below - no isValid() call, so no
+ * version-specific code path is needed to support both. */
 #include "tlsh_shim.h"
 
 #include <tlsh.h>
@@ -21,16 +38,17 @@
 #include <cstring>
 #include <unistd.h>
 
-/* TLSH_STRING_LEN_REQ/TLSH_STRING_BUFFER_LEN in <tlsh/tlsh.h> are only
+/* TLSH_STRING_LEN(_REQ)/TLSH_STRING_BUFFER_LEN in <tlsh.h> are only
  * defined when BUCKETS_256/BUCKETS_128/BUCKETS_48 is set at compile
  * time (a CMake-level build option of libtlsh itself, not something a
  * consumer defines) - since this project doesn't rebuild libtlsh from
  * source, those macros are never defined here, and Tlsh's own PIMPL
  * layout (a single opaque pointer member) doesn't depend on them for
  * ABI compatibility either way. 128 comfortably covers every observed
- * getHash() output (measured 70-72 hex chars against the distro
- * package actually used in development) with headroom for other
- * bucket configurations, without depending on an unavailable macro. */
+ * getHash() output (measured 70 hex chars against both the Arch and
+ * Ubuntu packages actually used in development) with headroom for
+ * other bucket configurations, without depending on an unavailable
+ * macro. */
 #define AV_TLSH_HASH_BUFLEN 128
 
 size_t av_tlsh_hash_maxlen(void) {
@@ -56,9 +74,11 @@ int av_tlsh_hash_fd(int fd, char *out, size_t outlen) {
     return -2;
 
   t.final();
-  if (!t.isValid())
-    return -2;
 
+  /* No isValid() call - see this file's header comment on why an
+   * empty (not NULL) getHash() result is the portable signal for
+   * "never became valid" across both API versions this project
+   * builds against. */
   const char *hash = t.getHash();
   if (!hash || !hash[0])
     return -2;
