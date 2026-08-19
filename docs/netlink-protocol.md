@@ -57,14 +57,50 @@ avd's own `SCAN_TIMEOUT_SECS` of 10s, which meant any scan taking
 longer than 2s had its verdict dropped here regardless of what avd
 decided) — this is safe because it's
 process context, not the atomic kprobe path. If the daemon isn't
-running, isn't registered, or takes too long, the request fails
-gracefully and the file is treated as clean-by-default (fail-open) for
-now. **Fail-open vs fail-closed is a real design decision worth
-discussing in your report** — a security tool that fails open on
-timeout has a different threat model than one that fails closed
-(blocks execution until it gets an answer). Fail-open was chosen here
-to avoid the daemon crashing becoming a denial-of-service against the
-whole system; document this tradeoff explicitly.
+running, isn't registered, or takes too long, the request fails, and
+what happens next is now an **operator-configurable policy**, not a
+fixed choice: fail-open (the default — treat the file as clean and let
+the exec proceed) or fail-closed (kill it, same as a confirmed
+malicious verdict). Fail-open vs fail-closed is a real design decision
+— a security tool that fails open on timeout has a different threat
+model than one that fails closed (blocks execution until it gets an
+answer). Fail-open remains the default to avoid the daemon
+crashing/restarting becoming a denial-of-service against every
+unsigned exec on the system, but an operator running a
+hardened/high-assurance deployment who'd rather block on "no verdict"
+can flip it at runtime:
+
+```bash
+avctl policy get                    # fail-open | fail-closed
+avctl policy set fail-closed        # requires root, same as the other /proc writes
+avctl policy set fail-open          # back to the default
+```
+
+This is backed by `/proc/kernel_av_daemon_policy` (0644, single
+`atomic_t` in `main.c`) — see `daemon_policy_proc_write()`'s comment
+there for the exact accepted values (`fail-open`/`fail-closed`, plus a
+mandatory trailing newline, same convention as the other `/proc`
+write handlers). Resets to fail-open on every module load/unload, same
+as every other in-memory kernel-side state here; `avctl save`/`avctl
+load` round-trip it alongside signatures/trust/protected-paths if you
+want it to persist across reloads.
+
+**Timing caveat, found while building this:** the policy is read
+inside `av_work_fn()` — i.e. at *verdict* time, asynchronously,
+whenever that specific exec's workqueue item happens to run — not
+captured back at the kprobe/exec moment itself. A process that started
+(and was allowed past the kprobe) while this was still fail-open can
+still get killed if an operator flips it to fail-closed before that
+exec's work item is processed, since the check reads the *current*
+value, not the value at launch time. With no daemon connected the scan
+fails fast rather than waiting the full `DAEMON_TIMEOUT_MS`, so this
+window is normally small, but it's not zero — and it isn't scoped to
+some other process either: if you flip this from an interactive shell
+with no daemon running, don't be surprised if that shell's own recent
+exec gets caught by it too. Arguably defensible (fail-closed's whole
+point is not trusting anything in-flight you can't get a verdict for),
+but worth knowing before you flip it live rather than discovering it
+by watching your own shell die.
 
 ## Commands
 
@@ -117,8 +153,16 @@ whole system; document this tradeoff explicitly.
   an `rmmod` racing an in-flight callback from `avd` was a genuine
   use-after-free of module `.text`, not just a theoretical one.
   **Fixed** by adding `.module = THIS_MODULE` to the family struct.
-- **Fail-open on timeout/no-daemon**, as above — a deliberate but
-  debatable choice.
+- **Fail-open on timeout/no-daemon**, as above. **Addressed:** no
+  longer a fixed choice — `avctl policy set fail-closed` makes it fail
+  closed instead, at runtime, no module reload needed. Fail-open
+  remains the default for the reason given above (avoid a crashed
+  daemon becoming a system-wide DoS); fail-closed is opt-in for
+  deployments that want it. Not calling this "fixed" outright since
+  it's a genuine tradeoff either way, not a bug — see the timing
+  caveat above the Commands table for a real, if narrow, hazard this
+  introduces (a flip to fail-closed can retroactively catch an
+  already-in-flight exec, including the flipping shell's own).
 - **Kernel netlink API surface is version-sensitive**, same caveat as
   the syscall-wrapper kprobe hooking — `genl_family` struct layout has
   changed across kernel versions (notably where `.policy` lives). This

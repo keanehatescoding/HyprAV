@@ -79,14 +79,20 @@ corpus/
                         here once testing against actual threats
 userspace/
   avctl/              - CLI for managing the signature DB (/proc/
-                        kernel_av_signatures) and the trusted-process
+                        kernel_av_signatures), the trusted-process
                         list (/proc/kernel_av_trusted, `avctl trust
-                        add/del/list`) - see the storage-metadata
-                        incident in the behavioral heuristics testing
-                        section for why the trust list exists. Both
-                        are in-memory kernel hashtables with no
-                        persistence of their own - `avctl save <file>`/
-                        `avctl load <file>` dump/replay both across an
+                        add/del/list`), the protected-path allow-list
+                        (/proc/kernel_av_protected, `avctl protect
+                        add/del/list`), and the daemon-unavailable
+                        policy (/proc/kernel_av_daemon_policy, `avctl
+                        policy get`/`avctl policy set fail-open|
+                        fail-closed` - see docs/netlink-protocol.md).
+                        See the storage-metadata incident in the
+                        behavioral heuristics testing section for why
+                        the trust list exists. All of the above are
+                        in-memory kernel state with no persistence of
+                        their own - `avctl save <file>`/`avctl load
+                        <file>` dump/replay all of it across an
                         rmmod+insmod cycle.
     avctl.c
     Makefile
@@ -171,8 +177,10 @@ carries none of that risk, so quarantine lives in `avd` instead of
 `main.c`.
 
 `v0.3.0-prep` is worth tagging on its own once verified — see
-`docs/netlink-protocol.md` for the full protocol design, including a
-documented fail-open-on-timeout decision worth discussing in your report.
+`docs/netlink-protocol.md` for the full protocol design, including the
+fail-open-on-timeout default and the `avctl policy set fail-closed`
+option to override it at runtime (see that doc's timing caveat before
+using it on a system with an interactive shell you care about).
 
 **Scope note on v0.7.0**: only ssdeep (via libfuzzy) was implemented,
 not TLSH. Both are valid fuzzy-hashing approaches with different
@@ -466,9 +474,14 @@ kernel-av: event=detected action=kill type=daemon path="/tmp/eicar.com" reason="
 ```
 
 If `avd` isn't running, the same file should still log clean via the
-fail-open path — check for `type=fail-open` in the `dmesg` line
-(`err=-ENOTCONN`-style errno if `avd` never registered, `err=-ETIMEDOUT`
-if it registered but didn't reply in time).
+fail-open path (the default) — check for `type=fail-open` in the
+`dmesg` line (`err=-ENOTCONN`-style errno if `avd` never registered,
+`err=-ETIMEDOUT` if it registered but didn't reply in time). Flip
+`avctl policy set fail-closed` first and the same scenario instead
+kills the process (`type=fail-closed` in the log line) — see
+`docs/netlink-protocol.md` for the full fail-open/fail-closed
+discussion, including a real timing caveat worth reading before you
+test this on a shell you're currently using.
 
 **What's actually been verified vs. what hasn't**: the kernel module
 (including `netlink_chan.c`) was compile/link-checked against real (if
@@ -979,14 +992,16 @@ tradeoff concrete. Trusted-process exemption is also the standard
 real-world EDR pattern for exactly this problem (publisher/hash
 allowlisting) — not a workaround invented for this project.
 
-**Persistence: `avctl save`/`avctl load`.** Both `/proc/kernel_av_signatures`
-and `/proc/kernel_av_trusted` are in-memory kernel hashtables — everything
-in them vanishes on `rmmod`, and the module only ever auto-seeds the one
-EICAR test signature at `insmod` time. `avctl save <file>` dumps both the
-signature DB and the trust list into a single file as replayable
-write-commands; `avctl load <file>` replays them (an entry that already
-exists, e.g. the auto-seeded EICAR signature on a fresh load, is reported
-as skipped rather than an error):
+**Persistence: `avctl save`/`avctl load`.** `/proc/kernel_av_signatures`,
+`/proc/kernel_av_trusted`, and `/proc/kernel_av_protected` are in-memory
+kernel hashtables — everything in them vanishes on `rmmod`, and the module
+only ever auto-seeds the one EICAR test signature at `insmod` time.
+`/proc/kernel_av_daemon_policy` isn't a hashtable but resets the same way
+(always comes back up as fail-open on load, regardless of what it was set
+to before). `avctl save <file>` dumps all four into a single file as
+replayable write-commands; `avctl load <file>` replays them (an entry that
+already exists, e.g. the auto-seeded EICAR signature on a fresh load, is
+reported as skipped rather than an error):
 
 ```bash
 ./userspace/avctl/avctl save /etc/kernel-av/state.txt

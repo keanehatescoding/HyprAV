@@ -74,7 +74,9 @@
 #include <linux/module.h>
 #include <linux/namei.h>
 #include <linux/pid.h>
+#include <linux/proc_fs.h>
 #include <linux/sched/signal.h>
+#include <linux/seq_file.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 #include <linux/workqueue.h>
@@ -601,6 +603,109 @@ out:
   return ret;
 }
 
+/* ---- operator-configurable daemon-unavailable policy ----
+ *
+ * See docs/netlink-protocol.md's fail-open/fail-closed discussion:
+ * when av_netlink_scan_request() below returns non-zero (no daemon
+ * registered, or it didn't answer within DAEMON_TIMEOUT_MS), the
+ * original design always failed open (let the exec proceed, log it
+ * as such) on the reasoning that avd crashing/restarting shouldn't
+ * itself become a denial-of-service against every unsigned exec on
+ * the system. That's still the default (0 = fail-open) - this only
+ * makes it a runtime choice instead of a fixed one, for an operator
+ * who'd rather block on "no verdict" than risk letting something
+ * through unscanned (a hardened/high-assurance deployment, e.g.).
+ * Plain atomic_t, not a mutex-guarded value: it's a single word read
+ * on every daemon-path exec and written rarely (an operator toggling
+ * it), so atomic load/store is both sufficient and cheaper than a
+ * lock for this access pattern.
+ *
+ * TIMING NOTE, confirmed the hard way during development: this flag
+ * is read inside av_work_fn() below - i.e. asynchronously, whenever
+ * that exec's workqueue item happens to run - not captured at the
+ * kprobe/exec moment itself. An exec that started (and was allowed
+ * past the kprobe) while this was still fail-open can still be
+ * killed if an operator flips it to fail-closed before that specific
+ * exec's work item is processed - the process sees the policy as of
+ * *verdict* time, not launch time. In practice this window is short
+ * (no daemon means av_netlink_scan_request() fails fast, not after
+ * the full DAEMON_TIMEOUT_MS), but it's not zero, especially under
+ * workqueue backlog. This isn't scoped to some OTHER process either -
+ * it includes whatever shell/process issued the flip itself, if that
+ * shell's own earlier exec's work item is still pending. Arguably
+ * defensible (fail-closed's whole point is "don't trust anything
+ * in-flight I can't get a verdict for"), but worth knowing before you
+ * flip this interactively: don't be surprised if your own shell gets
+ * SIGKILLed moments after you enable it with no daemon running. */
+static atomic_t av_daemon_fail_closed = ATOMIC_INIT(0);
+
+static int daemon_policy_proc_show(struct seq_file *m, void *v) {
+  seq_printf(m, "%s\n",
+             atomic_read(&av_daemon_fail_closed) ? "fail-closed" : "fail-open");
+  return 0;
+}
+
+static int daemon_policy_proc_open(struct inode *inode, struct file *file) {
+  return single_open(file, daemon_policy_proc_show, NULL);
+}
+
+/* Small, fixed-vocabulary write ("fail-open" or "fail-closed" plus a
+ * trailing newline) - same terminator-required convention as
+ * protected_proc_write() in behavior.c, for the same reason (a
+ * mandatory trailing newline is what actually distinguishes a
+ * complete write from a truncated first chunk of a larger one, not
+ * just the size cap alone). ppos is only read here, but proc_write
+ * must match struct proc_ops's fixed non-const loff_t * signature
+ * exactly - same class of false positive as protected_proc_write()'s
+ * own identical suppression. */
+/* cppcheck-suppress constParameterCallback */
+static ssize_t daemon_policy_proc_write(struct file *file, const char __user *ubuf, size_t count, loff_t *ppos) {
+  char kbuf[32];
+  size_t len;
+
+  if (*ppos != 0)
+    return -EINVAL;
+  if (count >= sizeof(kbuf))
+    return -EINVAL;
+  if (copy_from_user(kbuf, ubuf, count))
+    return -EFAULT;
+  kbuf[count] = '\0';
+
+  len = strlen(kbuf);
+  if (len == 0 || kbuf[len - 1] != '\n')
+    return -EINVAL;
+  kbuf[--len] = '\0';
+  if (len > 0 && kbuf[len - 1] == '\r')
+    kbuf[--len] = '\0';
+
+  /* Compare the fully trimmed buffer directly, not just its first
+   * whitespace-delimited token (an earlier sscanf(kbuf, "%15s", ...)
+   * version parsed only the first token, so a write like
+   * "fail-closed unexpected\n" silently enabled fail-closed instead
+   * of being rejected - this keeps the proc interface's documented
+   * fixed-vocabulary contract actually enforced). */
+  if (!strcasecmp(kbuf, "fail-open")) {
+    atomic_set(&av_daemon_fail_closed, 0);
+  } else if (!strcasecmp(kbuf, "fail-closed")) {
+    atomic_set(&av_daemon_fail_closed, 1);
+  } else {
+    return -EINVAL;
+  }
+
+  pr_info("kernel-av: daemon-unavailable policy set to %s\n", kbuf);
+  return count;
+}
+
+static const struct proc_ops daemon_policy_proc_ops = {
+    .proc_open = daemon_policy_proc_open,
+    .proc_read = seq_read,
+    .proc_write = daemon_policy_proc_write,
+    .proc_lseek = seq_lseek,
+    .proc_release = single_release,
+};
+
+static struct proc_dir_entry *daemon_policy_proc_entry;
+
 /* Shared kill-and-log helper, mirroring behavior.c's kill_with_reason -
  * see its comment for why the PID-1 guard is unconditional and
  * non-negotiable regardless of what triggered detection.
@@ -780,9 +885,21 @@ static void av_work_fn(struct work_struct *w) {
                           abs_path, pid_nr(aw->target_pid), digest.md5,
                           digest.sha1, digest.sha256, MAJOR(ident.dev),
                           MINOR(ident.dev), ident.ino);
+    } else if (atomic_read(&av_daemon_fail_closed)) {
+      /* Operator has opted into fail-closed via
+       * /proc/kernel_av_daemon_policy - -ENOTCONN/-ETIMEDOUT/other
+       * error is treated as "no verdict, don't trust it" rather than
+       * "clean". Goes through the same av_kill() as every other kill
+       * path, so it still respects the PID-1 guard and the
+       * operator-managed protected-path allow-list - fail-closed
+       * mode changes what "inconclusive" means, not those existing
+       * safety rails. */
+      snprintf(reason, sizeof(reason), "no-verdict:err=%d", nl_ret);
+      av_kill(aw->target_pid, abs_path, "fail-closed", reason, &ident);
     } else {
       /* -ENOTCONN (no daemon), -ETIMEDOUT, or another error -
-       * fail open, but log distinctly so this is visible/greppable
+       * fail open (the default - see the policy comment above this
+       * function), but log distinctly so this is visible/greppable
        * separately from a genuine daemon-confirmed clean verdict.
        * Same pr_info_ratelimited reasoning as above. */
       pr_info_ratelimited("kernel-av: event=clean type=fail-open path=\"%s\" "
@@ -1447,6 +1564,14 @@ static int __init av_init(void) {
     goto err_sigtable;
   }
 
+  daemon_policy_proc_entry = proc_create(
+      "kernel_av_daemon_policy", 0644, NULL, &daemon_policy_proc_ops);
+  if (!daemon_policy_proc_entry) {
+    pr_err("kernel-av: failed to create /proc/kernel_av_daemon_policy\n");
+    ret = -ENOMEM;
+    goto err_proc;
+  }
+
   /* Seed a default signature so testing works out of the box without
    * needing a separate `avctl add` step first. */
   av_sigtable_add(
@@ -1457,7 +1582,7 @@ static int __init av_init(void) {
   ret = av_behavior_init();
   if (ret) {
     pr_err("kernel-av: failed to init behavior tracking: %d\n", ret);
-    goto err_proc;
+    goto err_daemon_policy_proc;
   }
 
   /* max_active bounded to AV_WQ_MAX_ACTIVE rather than 0 (per-CPU
@@ -1561,6 +1686,8 @@ err_wq:
   destroy_workqueue(av_wq);
 err_behavior:
   av_behavior_exit();
+err_daemon_policy_proc:
+  remove_proc_entry("kernel_av_daemon_policy", NULL);
 err_proc:
   av_sigtable_proc_exit();
 err_sigtable:
@@ -1582,6 +1709,7 @@ static void __exit av_exit(void) {
   destroy_workqueue(av_wq);
   av_netlink_exit();
   av_behavior_exit();
+  remove_proc_entry("kernel_av_daemon_policy", NULL);
   av_sigtable_proc_exit();
   av_sigtable_exit();
   pr_info("kernel-av: unloaded\n");
