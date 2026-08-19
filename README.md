@@ -313,6 +313,46 @@ sudo cat /proc/kallsyms | grep sys_execve
 
 and adjust `HOOKED_SYSCALL_NAME` in the source accordingly.
 
+### Pre-existing kernel taint
+
+`av_init()` checks the kernel's taint state (`test_taint()`) as the
+very first thing it does, before setting up anything else, and logs a
+loud `dmesg` line (`event=kernel_tainted`) if the kernel was *already*
+tainted by something else before `av.ko` loaded. This does not refuse
+to load - same reasoning as the daemon fail-open default (see
+`docs/netlink-protocol.md`): a security module that won't even start
+on an imperfect system is worse than one that starts and says so where
+an operator can see it. The point is visibility: if something else has
+already had the chance to compromise kernel integrity (a prior OOPS, a
+forced module unload, a machine check, etc.), this module's own
+detection guarantees don't mean much, and an analyst reading `dmesg`
+should know that up front rather than trusting the results blind.
+
+Deliberately does **not** flag `TAINT_OOT_MODULE` or
+`TAINT_UNSIGNED_MODULE` - `av.ko` itself is out-of-tree and (in every
+workflow documented here) unsigned, so both of those get set by this
+module's *own* load, unconditionally, on every system. Checking for
+them would make the warning fire 100% of the time and mean nothing.
+Every other taint flag (`DIE`, `WARN`, `BAD_PAGE`, `CRAP`,
+`FORCED_MODULE`, `FORCED_RMMOD`, `MACHINE_CHECK`, `CPU_OUT_OF_SPEC`,
+`OVERRIDDEN_ACPI_TABLE`, `SOFTLOCKUP`, `LIVEPATCH`, `AUX`,
+`PROPRIETARY_MODULE`, `USER`, `RANDSTRUCT`) is one this module's own
+load cannot cause by itself, so seeing any of them means something
+else is responsible. Verified against a real kernel: a throwaway
+helper module calling `add_taint(TAINT_USER, ...)` correctly produced
+`event=kernel_tainted flags="U" reasons="USER"` — the two
+always-present OOT/unsigned flags stayed silent as designed.
+
+This is a narrower, more mechanical decision than the kernel-*variant*
+allowlisting question (restricting to specific distro kernel builds
+like `linux-hardened`/`linux-cachyos`/etc.) - that's a separate,
+bigger tradeoff not implemented here: `uname -r` string-matching is
+easy to spoof and doesn't verify build provenance, and the real
+fragility this project has already documented (kprobe symbol offsets,
+`genl_family` struct layout) is versioned by upstream kernel release,
+not by distro patches - so it wouldn't obviously reduce risk beyond
+what the existing version-pinned CI matrix already covers.
+
 ## Git hooks (lint on commit, full tests on push)
 
 One-time setup after cloning:
