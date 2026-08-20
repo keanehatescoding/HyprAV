@@ -1551,8 +1551,104 @@ static int handler_pre_renameat2(struct kprobe *p, struct pt_regs *regs) {
       (const char __user *)real_regs->r10, (int)real_regs->dx);
 }
 
+/* ---- pre-existing kernel taint check ----
+ *
+ * Checked once, as the very first thing av_init() does, before this
+ * module sets up anything else - the point is visibility into what
+ * state the kernel was ALREADY in before av.ko loaded, not a
+ * decision this module makes on its own. A kernel that's already
+ * tainted by something else (a prior OOPS, a forced/crash-driven
+ * module unload, a machine check, RANDSTRUCT disabled, etc.) means
+ * this module's own detection guarantees may not hold - something
+ * else may have already had the opportunity to compromise kernel
+ * state before av.ko ever got a chance to hook anything, and results
+ * from a module running on top of that should be trusted less, not
+ * silently trusted the same as on a clean boot.
+ *
+ * This does NOT refuse to load on a tainted kernel: same reasoning
+ * as the daemon fail-open default elsewhere in this file - a
+ * security module that won't even start on an already-imperfect
+ * system is a worse outcome than one that starts and says so loudly
+ * via dmesg, where an operator or analyst can actually see and
+ * act on it.
+ *
+ * Deliberately does NOT check TAINT_OOT_MODULE or
+ * TAINT_UNSIGNED_MODULE: av.ko itself is out-of-tree and (in every
+ * documented workflow in this repo) unsigned, so both of those flags
+ * get set by THIS module's own load, unconditionally, on every
+ * single insmod, on every system - checking for them would just mean
+ * this warning fires 100% of the time regardless of system history,
+ * carrying zero information about whether anything ELSE tainted the
+ * kernel first. Every flag below is one this module's own load
+ * cannot cause by itself, so seeing any of them set means something
+ * else is responsible. Only test_taint() is used, not get_taint():
+ * the latter isn't EXPORT_SYMBOL'd (confirmed against this project's
+ * own build - absent from Module.symvers), so it's not callable from
+ * an out-of-tree module at all; test_taint() (one flag at a time) is
+ * the only externally-usable primitive here. */
+struct av_taint_flag {
+  unsigned int flag;
+  char letter;
+  const char *name;
+};
+
+static const struct av_taint_flag av_taint_flags_of_interest[] = {
+    {TAINT_PROPRIETARY_MODULE, 'P', "PROPRIETARY_MODULE"},
+    {TAINT_FORCED_MODULE, 'F', "FORCED_MODULE"},
+    {TAINT_CPU_OUT_OF_SPEC, 'S', "CPU_OUT_OF_SPEC"},
+    {TAINT_FORCED_RMMOD, 'R', "FORCED_RMMOD"},
+    {TAINT_MACHINE_CHECK, 'M', "MACHINE_CHECK"},
+    {TAINT_BAD_PAGE, 'B', "BAD_PAGE"},
+    {TAINT_USER, 'U', "USER"},
+    {TAINT_DIE, 'D', "DIE"},
+    {TAINT_OVERRIDDEN_ACPI_TABLE, 'A', "OVERRIDDEN_ACPI_TABLE"},
+    {TAINT_WARN, 'W', "WARN"},
+    {TAINT_CRAP, 'C', "CRAP"},
+    {TAINT_FIRMWARE_WORKAROUND, 'I', "FIRMWARE_WORKAROUND"},
+    {TAINT_SOFTLOCKUP, 'L', "SOFTLOCKUP"},
+    {TAINT_LIVEPATCH, 'K', "LIVEPATCH"},
+    {TAINT_AUX, 'X', "AUX"},
+#ifdef TAINT_RANDSTRUCT
+    {TAINT_RANDSTRUCT, 'T', "RANDSTRUCT"},
+#endif
+};
+
+/* Letters follow the same convention as the kernel's own "Tainted:"
+ * dmesg/print_tainted() line, so this is directly cross-referenceable
+ * against Documentation/admin-guide/tainted-kernels.rst without
+ * needing a separate lookup table. */
+static void av_check_preexisting_taint(void) {
+  char letters[ARRAY_SIZE(av_taint_flags_of_interest) + 1];
+  char names[512];
+  size_t n_letters = 0;
+  size_t names_len = 0;
+  size_t i;
+
+  names[0] = '\0';
+  for (i = 0; i < ARRAY_SIZE(av_taint_flags_of_interest); i++) {
+    if (!test_taint(av_taint_flags_of_interest[i].flag))
+      continue;
+    letters[n_letters++] = av_taint_flags_of_interest[i].letter;
+    names_len += scnprintf(names + names_len, sizeof(names) - names_len,
+                           "%s%s", names_len ? "," : "",
+                           av_taint_flags_of_interest[i].name);
+  }
+  letters[n_letters] = '\0';
+
+  if (n_letters == 0)
+    return;
+
+  pr_alert("kernel-av: event=kernel_tainted flags=\"%s\" reasons=\"%s\" "
+           "note=\"kernel was already tainted before av.ko loaded - "
+           "detection is running on a kernel whose own integrity "
+           "isn't guaranteed, treat results with reduced confidence\"\n",
+           letters, names);
+}
+
 static int __init av_init(void) {
   int ret;
+
+  av_check_preexisting_taint();
 
   ret = av_sigtable_init();
   if (ret)
