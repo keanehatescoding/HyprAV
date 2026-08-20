@@ -180,10 +180,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Install libnl-genl, libyara, and libfuzzy
+      - name: Install libnl-genl, libyara, libfuzzy, and libtlsh
         run: |
           sudo apt-get update
-          sudo apt-get install -y libnl-genl-3-dev libyara-dev libfuzzy-dev pkg-config
+          sudo apt-get install -y libnl-genl-3-dev libyara-dev libfuzzy-dev libtlsh-dev pkg-config
       - name: Build avd
         run: make -C userspace/avd
 
@@ -242,6 +242,27 @@ jobs:
           ssdeep -m /tmp/corpus_hash.txt /tmp/ptrace_test_variant | grep -q "matches"
           # an unrelated file should NOT match
           ! ssdeep -m /tmp/corpus_hash.txt /bin/ls | grep -q "matches"
+
+      - name: Smoke-test TLSH corpus matching
+        run: |
+          set -euxo pipefail
+          sudo apt-get install -y tlsh-tools
+          # TLSH's totalDiff() is a DISTANCE (opposite direction from
+          # ssdeep's similarity score above) - lower means MORE
+          # similar, 0 = identical. Reuses /tmp/ptrace_test and
+          # /tmp/ptrace_test_variant from the ssdeep step just above -
+          # same fixture, same "few trailing bytes appended" variant,
+          # proving the same near-identical-variant case against a
+          # second, independent fuzzy-hash algorithm (see
+          # check_tlsh_corpus()'s comment in avd.c on why running both
+          # is real defense in depth, not a duplicate check).
+          diff_variant="$(tlsh -c /tmp/ptrace_test -f /tmp/ptrace_test_variant | awk '{print $1}')"
+          echo "variant diff: $diff_variant (expect well under TLSH_MATCH_MAX_DIFF=30)"
+          [ "$diff_variant" -le 30 ]
+          # an unrelated file should score a HIGH distance
+          diff_unrelated="$(tlsh -c /tmp/ptrace_test -f /bin/ls | awk '{print $1}')"
+          echo "unrelated diff: $diff_unrelated (expect well over 30)"
+          [ "$diff_unrelated" -gt 30 ]
 
       - uses: actions/upload-artifact@v7
         with:

@@ -30,19 +30,33 @@
  *         needs vfs_rename()/vfs_unlink(), genuinely risky and
  *         version-fragile kernel API territory. Userspace rename()/
  *         chmod() has none of that risk.
+ * (post-v1.0.0): TLSH as a second fuzzy-hash algorithm alongside
+ *         ssdeep - runs when ssdeep didn't match either (default:
+ *         ./corpus/tlsh_hashes.txt, override with argv[4] or
+ *         AVD_TLSH_CORPUS_FILE). Complementary, not redundant: the two
+ *         algorithms fingerprint files differently, so this is real
+ *         defense in depth, not the same check twice - see
+ *         check_tlsh_corpus()'s comment. Genuinely different
+ *         integration shape than ssdeep's, though: libtlsh's only
+ *         public API is a C++ class with no extern "C" surface at
+ *         all (confirmed against the actual upstream header), so this
+ *         goes through tlsh_shim.{h,cpp} - the one C++ translation
+ *         unit in this otherwise-C project - rather than linking
+ *         directly the way fuzzy.h does. See tlsh_shim.h and the
+ *         Makefile for the full story.
  *
- * Compile-verified against real libnl-genl-3.0, libyara, and libfuzzy
- * headers (clean build, -Wall -Wextra, no warnings). The YARA rules
- * and fuzzy-hash comparison logic were verified against real samples
- * (see README testing sections for v0.3.0-v0.7.0) using the exact
- * scan/compare patterns used here. NOT yet runtime-tested end-to-end
- * against the actual kernel module together with this - see
- * docs/netlink-protocol.md and the top-level README's netlink testing
- * section.
+ * Compile-verified against real libnl-genl-3.0, libyara, libfuzzy, and
+ * libtlsh headers (clean build, -Wall -Wextra, no warnings). The YARA
+ * rules and fuzzy-hash comparison logic (both ssdeep and TLSH) were
+ * verified against real samples (see README testing sections) using
+ * the exact scan/compare patterns used here. NOT yet runtime-tested
+ * end-to-end against the actual kernel module together with this -
+ * see docs/netlink-protocol.md and the top-level README's netlink
+ * testing section.
  *
- * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara ssdeep
+ * Dependencies (Arch/CachyOS):  sudo pacman -S libnl yara ssdeep tlsh
  * Dependencies (Debian/Ubuntu): sudo apt install libnl-genl-3-dev libyara-dev
- * libfuzzy-dev
+ * libfuzzy-dev libtlsh-dev
  *
  * See docs/netlink-protocol.md for the full protocol design.
  */
@@ -70,6 +84,7 @@
 #include <yara.h>
 
 #include "../../av/netlink_proto.h"
+#include "tlsh_shim.h"
 
 #ifndef AT_EMPTY_PATH
 #define AT_EMPTY_PATH 0x1000 /* glibc's plain <fcntl.h> doesn't define this
@@ -83,6 +98,7 @@
 
 #define DEFAULT_RULES_DIR "rules"
 #define DEFAULT_CORPUS_FILE "corpus/fuzzy_hashes.txt"
+#define DEFAULT_TLSH_CORPUS_FILE "corpus/tlsh_hashes.txt"
 #define DEFAULT_QUARANTINE_DIR "/var/lib/av-quarantine"
 #define SCAN_TIMEOUT_SECS 10
 #define MALICIOUS_SCORE_THRESHOLD 100
@@ -117,14 +133,45 @@
       * a starting point, not a final tuned                                    \
       * value, and worth revisiting once                                       \
       * you have a real sample corpus. */
+/* TLSH's totalDiff() is a DISTANCE, not a similarity score - the
+ * OPPOSITE direction from FUZZY_MATCH_THRESHOLD above (lower diff
+ * means MORE similar; 0 = identical). Calibrated against real
+ * samples the same way FUZZY_MATCH_THRESHOLD was: a small compiled
+ * test binary vs. that same binary with a few trailing bytes appended
+ * (the near-identical-variant case this whole feature exists to
+ * catch) measured diff=10; an unrelated small binary measured
+ * diff=43. 30 sits with real margin on both sides of that gap - a
+ * starting point, not a final tuned value, same caveat as
+ * FUZZY_MATCH_THRESHOLD. See the README's TLSH testing section for
+ * the exact repro. */
+#define TLSH_MATCH_MAX_DIFF 30
 
 struct fuzzy_corpus_entry {
   char hash[FUZZY_MAX_RESULT];
   char name[128];
 };
 
+/* Hash field NOT compile-time sized off av_tlsh_hash_maxlen() -
+ * avd.c never includes <tlsh.h> itself (see tlsh_shim.h), so it has
+ * no compile-time knowledge of libtlsh's actual hash string length.
+ * AV_TLSH_HASH_BUFSZ below is a fixed, generously-sized upper bound
+ * (see tlsh_shim.cpp's AV_TLSH_HASH_BUFLEN comment for the exact
+ * worst-case reasoning - this MUST stay >= av_tlsh_hash_maxlen() + 1,
+ * checked at runtime in load_tlsh_corpus() below rather than assumed
+ * to match forever); measured hash length against the distro
+ * packages actually used in development is 70 hex chars, well under
+ * this. */
+#define AV_TLSH_HASH_BUFSZ 200
+
+struct tlsh_corpus_entry {
+  char hash[AV_TLSH_HASH_BUFSZ];
+  char name[128];
+};
+
 static struct fuzzy_corpus_entry *fuzzy_corpus;
 static size_t fuzzy_corpus_count;
+static struct tlsh_corpus_entry *tlsh_corpus;
+static size_t tlsh_corpus_count;
 static const char *quarantine_dir = DEFAULT_QUARANTINE_DIR;
 
 static struct nl_sock *sock;
@@ -447,6 +494,179 @@ static int check_fuzzy_corpus(int fd, char *name_out, size_t name_out_len,
   if (best_score >= FUZZY_MATCH_THRESHOLD) {
     snprintf(name_out, name_out_len, "%s", fuzzy_corpus[best_idx].name);
     *score_out = best_score;
+    return 1;
+  }
+
+  return 0;
+}
+
+/*
+ * Loads the TLSH corpus from `path` (format: see
+ * corpus/tlsh_hashes.txt - identical shape to fuzzy_hashes.txt:
+ * <hex_hash>,<name> per line). Same not-fatal-if-missing stance as
+ * load_fuzzy_corpus() and the same reasoning.
+ */
+static int load_tlsh_corpus(const char *path) {
+  FILE *fp;
+  char line[512];
+  size_t capacity = 16;
+  size_t hash_maxlen = av_tlsh_hash_maxlen();
+
+  /* AV_TLSH_HASH_BUFSZ's comment promises this holds; check it rather
+   * than trust it silently drifting true forever if either constant
+   * ever changes without the other. */
+  if (hash_maxlen + 1 > AV_TLSH_HASH_BUFSZ) {
+    fprintf(stderr,
+            "avd: BUG: AV_TLSH_HASH_BUFSZ (%d) is smaller than "
+            "av_tlsh_hash_maxlen()+1 (%zu) - aborting rather than risk "
+            "silently truncating TLSH hashes\n",
+            AV_TLSH_HASH_BUFSZ, hash_maxlen + 1);
+    return -1;
+  }
+
+  fp = fopen(path, "r");
+  if (!fp) {
+    fprintf(stderr,
+            "avd: could not open TLSH corpus \"%s\": %s - "
+            "TLSH matching disabled\n",
+            path, strerror(errno));
+    return 0; /* not fatal - everything else still works without this */
+  }
+
+  tlsh_corpus = malloc(capacity * sizeof(*tlsh_corpus));
+  if (!tlsh_corpus) {
+    fclose(fp);
+    return -1;
+  }
+
+  while (fgets(line, sizeof(line), fp)) {
+    char *comma;
+    char *newline;
+    char *hash_part, *name_part;
+
+    if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
+      continue;
+
+    newline = strchr(line, '\n');
+    if (newline)
+      *newline = '\0';
+
+    comma = strchr(line, ',');
+    if (!comma) {
+      fprintf(stderr,
+              "avd: skipping malformed TLSH corpus line "
+              "(no comma): %s\n",
+              line);
+      continue;
+    }
+    *comma = '\0';
+    hash_part = line;
+    name_part = comma + 1;
+
+    /* sizeof(tlsh_corpus[...].hash) is a fixed 128-byte array (see
+     * struct tlsh_corpus_entry's comment); hash_maxlen is libtlsh's
+     * actual reported max length, queried once above via the shim.
+     * If some future libtlsh build ever needs more than that, this
+     * skip-with-a-warning is a clear failure mode rather than a
+     * silent truncated-hash corruption. */
+    if (strlen(hash_part) > hash_maxlen) {
+      fprintf(stderr,
+              "avd: skipping TLSH corpus line with an oversized hash "
+              "(%zu chars, max %zu): %s\n",
+              strlen(hash_part), hash_maxlen, name_part);
+      continue;
+    }
+
+    if (tlsh_corpus_count == capacity) {
+      struct tlsh_corpus_entry *grown;
+
+      capacity *= 2;
+      grown = realloc(tlsh_corpus, capacity * sizeof(*tlsh_corpus));
+      if (!grown) {
+        fclose(fp);
+        return -1;
+      }
+      tlsh_corpus = grown;
+    }
+
+    snprintf(tlsh_corpus[tlsh_corpus_count].hash,
+             sizeof(tlsh_corpus[tlsh_corpus_count].hash), "%.*s",
+             (int)sizeof(tlsh_corpus[tlsh_corpus_count].hash) - 1, hash_part);
+    snprintf(tlsh_corpus[tlsh_corpus_count].name,
+             sizeof(tlsh_corpus[tlsh_corpus_count].name), "%.*s",
+             (int)sizeof(tlsh_corpus[tlsh_corpus_count].name) - 1, name_part);
+    tlsh_corpus_count++;
+  }
+  fclose(fp);
+
+  if (tlsh_corpus_count == 0)
+    fprintf(stderr,
+            "avd: TLSH corpus \"%s\" loaded but empty - "
+            "TLSH matching will never trigger\n",
+            path);
+  else
+    printf("avd: loaded %zu TLSH hash(es) from %s\n", tlsh_corpus_count, path);
+
+  return 0;
+}
+
+/*
+ * Compares the already-open file `fd` against every entry in the TLSH
+ * corpus. On the best (LOWEST - see TLSH_MATCH_MAX_DIFF's comment on
+ * why this is the opposite direction from check_fuzzy_corpus()) diff
+ * at or under TLSH_MATCH_MAX_DIFF, copies the corpus entry's name
+ * into name_out and the diff into diff_out, returning 1. Returns 0 if
+ * nothing met the threshold, no corpus loaded, OR the file simply
+ * didn't have enough data for TLSH to produce a hash at all (-2 from
+ * av_tlsh_hash_fd() - an expected, common, non-error outcome for
+ * short files, NOT the same thing as a real hashing failure; treating
+ * it as an error here used to make handle_scan_request() log a
+ * spurious "TLSH hash ... failed" line for every small file scanned).
+ * Returns -1 on an actual hashing error (I/O failure, or a hash that
+ * somehow didn't fit the buffer - see av_tlsh_hash_fd()'s own -1/-3
+ * distinction in tlsh_shim.h, both collapsed to -1 here since callers
+ * only need "don't trust this result" either way). Same fd/dup()
+ * convention as check_fuzzy_corpus() - see av_tlsh_hash_fd()'s own
+ * comment in tlsh_shim.h.
+ */
+static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
+                             int *diff_out) {
+  char file_hash[AV_TLSH_HASH_BUFSZ];
+  int best_diff = -1;
+  size_t best_idx = 0;
+  size_t i;
+  int dup_fd;
+  int hash_ret;
+
+  if (tlsh_corpus_count == 0)
+    return 0;
+
+  dup_fd = dup(fd);
+  if (dup_fd < 0)
+    return -1;
+
+  hash_ret = av_tlsh_hash_fd(dup_fd, file_hash, sizeof(file_hash));
+  close(dup_fd);
+
+  if (hash_ret == -2)
+    return 0; /* too short/insufficiently diverse - not an error */
+  if (hash_ret != 0)
+    return -1;
+
+  for (i = 0; i < tlsh_corpus_count; i++) {
+    int diff = av_tlsh_diff(file_hash, tlsh_corpus[i].hash);
+
+    if (diff < 0)
+      continue; /* malformed corpus entry - skip, don't abort the scan */
+    if (best_diff < 0 || diff < best_diff) {
+      best_diff = diff;
+      best_idx = i;
+    }
+  }
+
+  if (best_diff >= 0 && best_diff <= TLSH_MATCH_MAX_DIFF) {
+    snprintf(name_out, name_out_len, "%s", tlsh_corpus[best_idx].name);
+    *diff_out = best_diff;
     return 1;
   }
 
@@ -870,6 +1090,36 @@ static void handle_scan_request(uint64_t reqid, uint32_t pid, const char *path,
       fprintf(stderr, "avd: fuzzy hash of \"%s\" failed\n", path);
   }
 
+  /* ssdeep didn't match either - try TLSH before declaring clean.
+   * Complementary, not redundant: the two algorithms fingerprint
+   * files differently (ssdeep's rolling-hash context-triggered
+   * piecewise hashing vs. TLSH's locality-sensitive quartile/bucket
+   * histogram), so a variant that happens to fall below one
+   * algorithm's similarity threshold isn't guaranteed to fall below
+   * the other's too - running both is real defense in depth, not
+   * just running the same check twice. */
+  {
+    char tlsh_name[128];
+    int tlsh_diff = 0;
+    int tret =
+        check_tlsh_corpus(fd, tlsh_name, sizeof(tlsh_name), &tlsh_diff);
+
+    if (tret == 1) {
+      char verdict_name[AV_RULE_NAME_MAXLEN + 1];
+
+      snprintf(verdict_name, sizeof(verdict_name), "TLSH:%.40s(%d)",
+               tlsh_name, tlsh_diff);
+      printf("avd: TLSH MATCH \"%s\" -> \"%s\" diff=%d\n", path, tlsh_name,
+             tlsh_diff);
+      quarantine_file(fd, path);
+      send_verdict(reqid, AV_VERDICT_MALICIOUS, verdict_name);
+      close(fd);
+      return;
+    }
+    if (tret < 0)
+      fprintf(stderr, "avd: TLSH hash of \"%s\" failed\n", path);
+  }
+
   send_verdict(reqid, AV_VERDICT_CLEAN, NULL);
   close(fd);
 }
@@ -1061,6 +1311,7 @@ static int register_with_kernel(void) {
 int main(int argc, char **argv) {
   const char *rules_dir = DEFAULT_RULES_DIR;
   const char *corpus_file = DEFAULT_CORPUS_FILE;
+  const char *tlsh_corpus_file = DEFAULT_TLSH_CORPUS_FILE;
 
   if (argc > 1)
     rules_dir = argv[1];
@@ -1077,6 +1328,11 @@ int main(int argc, char **argv) {
   else if (getenv("AVD_QUARANTINE_DIR"))
     quarantine_dir = getenv("AVD_QUARANTINE_DIR");
 
+  if (argc > 4)
+    tlsh_corpus_file = argv[4];
+  else if (getenv("AVD_TLSH_CORPUS_FILE"))
+    tlsh_corpus_file = getenv("AVD_TLSH_CORPUS_FILE");
+
   printf("avd: quarantine directory: %s\n", quarantine_dir);
 
   signal(SIGINT, handle_sigint);
@@ -1089,6 +1345,11 @@ int main(int argc, char **argv) {
 
   if (load_fuzzy_corpus(corpus_file) != 0) {
     fprintf(stderr, "avd: failed to initialize fuzzy corpus - aborting\n");
+    return 1;
+  }
+
+  if (load_tlsh_corpus(tlsh_corpus_file) != 0) {
+    fprintf(stderr, "avd: failed to initialize TLSH corpus - aborting\n");
     return 1;
   }
 
@@ -1177,5 +1438,6 @@ int main(int argc, char **argv) {
     yr_rules_destroy(compiled_rules);
   yr_finalize();
   free(fuzzy_corpus);
+  free(tlsh_corpus);
   return 0;
 }

@@ -1,0 +1,21 @@
+# tlsh_hashes.txt - corpus of known-bad TLSH fuzzy hashes.
+#
+# Format: <tlsh_hash>,<name>
+# Lines starting with # are comments. Blank lines are ignored.
+# Same shape as fuzzy_hashes.txt (ssdeep) - see that file's own
+# comment and the README's TLSH testing section for the full story on
+# why this is a second, separate corpus rather than one shared file:
+# a ssdeep hash and a TLSH hash for the same underlying bytes are
+# unrelated strings from two different algorithms, matched against by
+# two different comparison functions (av_tlsh_diff() here, a distance
+# where LOWER is more similar - the opposite of ssdeep's fuzzy_compare()
+# similarity score).
+#
+# TEST FIXTURE ONLY: the entry below is the TLSH hash of the exact
+# same small, harmless ptrace()-calling test binary described in
+# fuzzy_hashes.txt (see rules/heuristics.yar), NOT a real malware
+# sample. It exists so the TLSH-matching *mechanism* can be
+# demonstrated and tested end to end. Populate this file with real
+# sample hashes once you're testing detection against actual threats
+# rather than the plumbing.
+2C722243F7B0C93FCC6C537C406B477AA2F3E92043624327AB4466682E9369C5E67D96,test-ptrace-sample
