@@ -333,12 +333,15 @@ Deliberately does **not** flag `TAINT_OOT_MODULE` or
 workflow documented here) unsigned, so both of those get set by this
 module's *own* load, unconditionally, on every system. Checking for
 them would make the warning fire 100% of the time and mean nothing.
-Every other taint flag (`DIE`, `WARN`, `BAD_PAGE`, `CRAP`,
+Every other selected taint flag (`DIE`, `WARN`, `BAD_PAGE`, `CRAP`,
 `FORCED_MODULE`, `FORCED_RMMOD`, `MACHINE_CHECK`, `CPU_OUT_OF_SPEC`,
 `OVERRIDDEN_ACPI_TABLE`, `SOFTLOCKUP`, `LIVEPATCH`, `AUX`,
-`PROPRIETARY_MODULE`, `USER`, `RANDSTRUCT`) is one this module's own
-load cannot cause by itself, so seeing any of them means something
-else is responsible. Verified against a real kernel: a throwaway
+`PROPRIETARY_MODULE`, `USER`, `RANDSTRUCT`, `FIRMWARE_WORKAROUND`) is
+one this module's own load cannot cause by itself, so seeing any of
+them means something else is responsible. "Selected" deliberately,
+not exhaustive: `av_taint_flags_of_interest[]` in `av/main.c` doesn't
+track every taint flag the kernel defines (e.g. the newer `TAINT_TEST`
+or `TAINT_FWCTL` aren't checked) - only the ones above. Verified against a real kernel: a throwaway
 helper module calling `add_taint(TAINT_USER, ...)` correctly produced
 `event=kernel_tainted flags="U" reasons="USER"` — the two
 always-present OOT/unsigned flags stayed silent as designed.
