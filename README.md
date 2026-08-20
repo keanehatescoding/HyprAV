@@ -772,12 +772,12 @@ sudo userspace/avd/avd rules corpus/fuzzy_hashes.txt /var/lib/av-quarantine corp
 ```
 
 Expect in `avd`'s output:
-```
+```text
 avd: TLSH MATCH "/tmp/ptrace_test_variant" -> "test-ptrace-sample" diff=<N>
 ```
 
 And in `dmesg`:
-```
+```text
 kernel-av: event=detected action=kill type=daemon path="/tmp/ptrace_test_variant" reason="TLSH:test-ptrace-sample(<N>)" pid=... dev=... ino=... size=...
 ```
 
@@ -789,9 +789,18 @@ real margin on both sides), not against an actual malware corpus with
 known variant families.
 
 **Why a C++ shim instead of linking libtlsh directly, like ssdeep:**
-libtlsh's only public API is a C++ class (`Tlsh`, in `<tlsh/tlsh.h>`)
-with no `extern "C"` interface at all — confirmed by reading the
-actual upstream header, not assumed from the library's reputation.
+libtlsh's only public API is a C++ class (`Tlsh`) with no
+`extern "C"` interface at all — confirmed by reading the actual
+upstream header, not assumed from the library's reputation. Where
+that header actually lives differs by distro, confirmed the hard way
+via a real CI failure: Arch/CachyOS's `tlsh` package installs it under
+a subdirectory (`/usr/include/tlsh/tlsh.h`), Debian/Ubuntu's
+`libtlsh-dev` installs it flat (`/usr/include/tlsh.h`, no
+subdirectory). `tlsh_shim.cpp` includes the flat name (`<tlsh.h>`) to
+match Ubuntu directly, with `-I/usr/include/tlsh` added in the
+Makefile (a harmless no-op there on Debian/Ubuntu, where that
+directory doesn't exist) to make the same include resolve on
+Arch/CachyOS too — see the Makefile's `TLSH_CFLAGS` comment.
 `avd.c` is plain C, so it can't call that API directly the way it
 calls `fuzzy_hash_file()`/`fuzzy_compare()` from `fuzzy.h`. Two real
 alternatives were considered and not taken:
@@ -809,7 +818,7 @@ alternatives were considered and not taken:
   a modest, contained addition to that, not a departure from it.
 
 `tlsh_shim.cpp` is the one C++ file in this project — the *only*
-translation unit that includes `<tlsh/tlsh.h>` — exposing a small,
+translation unit that includes `<tlsh.h>` — exposing a small,
 plain-C-callable interface (`tlsh_shim.h`) that `avd.c` calls exactly
 like any other function. `userspace/avd/Makefile` compiles it with
 `$(CXX)` and links the final binary with `$(CXX)` too (g++ auto-links

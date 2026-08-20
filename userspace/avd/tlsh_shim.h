@@ -1,12 +1,15 @@
 /*
  * tlsh_shim.h - plain-C interface to libtlsh, whose only public API is
- * a C++ class (Tlsh, in <tlsh/tlsh.h>) with no extern "C" surface at
- * all - confirmed against the actual upstream header, not assumed.
- * avd.c is plain C, so it can't call libtlsh directly; this shim is
- * the thin C++ translation unit (tlsh_shim.cpp) that bridges the two,
- * compiled with the C++ compiler and linked into the otherwise-C avd
- * binary. See the Makefile's TLSH_LIBS check for how the build
- * detects libtlsh and falls back to gcc-only if it's absent.
+ * a C++ class (Tlsh, in <tlsh.h> - installed flat on Debian/Ubuntu,
+ * under a tlsh/ subdirectory on Arch/CachyOS, see tlsh_shim.cpp's own
+ * comment) with no extern "C" surface at all - confirmed against the
+ * actual upstream header, not assumed. avd.c is plain C, so it can't
+ * call libtlsh directly; this shim is the thin C++ translation unit
+ * (tlsh_shim.cpp) that bridges the two, compiled with the C++
+ * compiler and linked into the otherwise-C avd binary. See the
+ * Makefile's TLSH_LIBS/TLSH_CFLAGS checks for how the build detects
+ * libtlsh and its header location, and falls back to gcc-only if
+ * it's absent.
  *
  * This is a genuinely different integration shape than ssdeep's
  * (fuzzy.h is a plain C header, libfuzzy links directly into avd.c
@@ -23,13 +26,14 @@
 extern "C" {
 #endif
 
-/* Returns the length of the hex-encoded hash string a successful
- * av_tlsh_hash_fd() call writes (NOT including the NUL terminator) -
- * callers should size their buffer to at least this + 1. Fixed for a
- * given libtlsh build/bucket configuration, so this is a compile-time
- * constant in practice, but exposed as a function (not a macro) since
- * the shim - not avd.c - is the only translation unit that actually
- * includes <tlsh/tlsh.h> and knows the real value. */
+/* Returns the SAFE MAXIMUM length (in hex chars, NOT including the
+ * NUL terminator) that av_tlsh_hash_fd() will ever write - deliberately
+ * generous, not tied to any one build/bucket configuration's exact
+ * output length (see AV_TLSH_HASH_BUFLEN's comment in tlsh_shim.cpp
+ * for why: upstream TLSH's actual hash length varies by libtlsh's own
+ * compile-time bucket/checksum configuration, which this project
+ * doesn't control or know at avd.c's compile time either way).
+ * Callers should size their buffer to at least this + 1. */
 size_t av_tlsh_hash_maxlen(void);
 
 /* Hashes the already-open file `fd`, seeking to its start first (same
@@ -37,14 +41,21 @@ size_t av_tlsh_hash_maxlen(void);
  * behavior, which check_fuzzy_corpus() in avd.c already relies on -
  * callers should pass a dup()'d fd, same convention as that function,
  * so this never disturbs the original fd's position) and writes the
- * hex-encoded hash into `out` (NUL-terminated, at most outlen - 1 hex
- * chars).
+ * hex-encoded hash into `out` (NUL-terminated).
  *
  * Returns 0 on success, -1 on a read/I/O error, -2 if the file didn't
  * contain enough data for TLSH to produce a valid hash (libtlsh's own
- * MIN_DATA_LENGTH cutoff - roughly 50 bytes; short files, like short
- * ssdeep inputs, just don't fuzzy-hash meaningfully at all, this
- * isn't a bug to work around). */
+ * MIN_DATA_LENGTH cutoff - roughly 50-256 bytes depending on libtlsh
+ * version, see tlsh_shim.cpp's version-skew comment; short files,
+ * like short ssdeep inputs, just don't fuzzy-hash meaningfully at
+ * all, this isn't a bug to work around - callers should treat -2 as
+ * "no verdict from this algorithm", not as an error condition worth
+ * logging), -3 if the hash didn't fit in `outlen` bytes (should not
+ * happen if the caller sized its buffer via av_tlsh_hash_maxlen(),
+ * but rejected outright rather than silently truncated either way -
+ * a truncated hash would still parse as a well-formed-looking but
+ * WRONG hash downstream, a worse failure mode than an honest error
+ * here). */
 int av_tlsh_hash_fd(int fd, char *out, size_t outlen);
 
 /* Compares two hex-encoded TLSH hashes and returns libtlsh's own

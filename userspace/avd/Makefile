@@ -49,20 +49,32 @@ avd: avd.o tlsh_shim.o
 		echo "  Debian/Ubuntu: sudo apt install libyara-dev"; \
 		exit 1; \
 	fi
-	@if ! echo 'int main(){return 0;}' | $(CC) -x c - -o /tmp/.avd_fuzzy_check $(FUZZY_LIBS) 2>/dev/null; then \
+	@# mktemp + trap, not a fixed /tmp/.avd_fuzzy_check path: a
+	@# predictable world-writable-directory path is a classic
+	@# symlink-planting target - another local user (or a concurrent
+	@# `make` run) could pre-create a symlink there pointing anywhere,
+	@# and if this ever runs privileged (e.g. under `sudo make
+	@# install`, which depends on this same rule), the compiler
+	@# following that symlink would overwrite an arbitrary
+	@# root-owned file with a two-line test program. mktemp's
+	@# XXXXXX gives an unpredictable name; the trap cleans it up
+	@# even on a failed/interrupted probe.
+	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/.avd_fuzzy_check.XXXXXX") || exit 1; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	if ! echo 'int main(){return 0;}' | $(CC) -x c - -o "$$tmp" $(FUZZY_LIBS) 2>/dev/null; then \
 		echo "ERROR: libfuzzy (ssdeep) not found."; \
 		echo "  Arch/CachyOS: sudo pacman -S ssdeep"; \
 		echo "  Debian/Ubuntu: sudo apt install libfuzzy-dev"; \
 		exit 1; \
 	fi
-	@rm -f /tmp/.avd_fuzzy_check
-	@if ! echo 'int main(){return 0;}' | $(CXX) -x c++ - -o /tmp/.avd_tlsh_check $(TLSH_LIBS) 2>/dev/null; then \
+	@tmp=$$(mktemp "$${TMPDIR:-/tmp}/.avd_tlsh_check.XXXXXX") || exit 1; \
+	trap 'rm -f "$$tmp"' EXIT HUP INT TERM; \
+	if ! echo 'int main(){return 0;}' | $(CXX) -x c++ - -o "$$tmp" $(TLSH_LIBS) 2>/dev/null; then \
 		echo "ERROR: libtlsh not found."; \
 		echo "  Arch/CachyOS: sudo pacman -S tlsh"; \
 		echo "  Debian/Ubuntu: sudo apt install libtlsh-dev"; \
 		exit 1; \
 	fi
-	@rm -f /tmp/.avd_tlsh_check
 	$(CXX) -o avd avd.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) $(TLSH_LIBS) -lpthread
 
 # avd.c is plain C, built with $(CC) - only tlsh_shim.cpp needs a C++

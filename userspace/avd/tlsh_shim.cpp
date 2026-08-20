@@ -44,12 +44,24 @@
  * consumer defines) - since this project doesn't rebuild libtlsh from
  * source, those macros are never defined here, and Tlsh's own PIMPL
  * layout (a single opaque pointer member) doesn't depend on them for
- * ABI compatibility either way. 128 comfortably covers every observed
- * getHash() output (measured 70 hex chars against both the Arch and
- * Ubuntu packages actually used in development) with headroom for
- * other bucket configurations, without depending on an unavailable
- * macro. */
-#define AV_TLSH_HASH_BUFLEN 128
+ * ABI compatibility either way.
+ *
+ * 200 is deliberately generous, not just "big enough for what was
+ * measured": the packages actually used in development (Arch's
+ * 4.12.0, Ubuntu's 3.4.4) both produce 70 hex chars, but upstream
+ * TLSH supports BUCKETS_256 configurations that can run up to 134
+ * (1-byte checksum) or 138 (3-byte checksum) hex chars, plus a
+ * 2-char "T1" version prefix that's the default in library >=5.0.0 -
+ * up to ~140 chars in the worst documented case. This project only
+ * ever builds against the default/compact config in practice, but
+ * getHash() truncating silently into a too-small buffer would corrupt
+ * the hash into something fromTlshStr() then rejects, which
+ * check_tlsh_corpus() in avd.c would in turn treat as "never matches
+ * anything" - a silent false-negative on every scan, not a crash, the
+ * worst kind of bug for a security tool to have. av_tlsh_hash_fd()
+ * below still refuses to write into an undersized buffer rather than
+ * trusting this constant alone - defense in depth, not either/or. */
+#define AV_TLSH_HASH_BUFLEN 200
 
 size_t av_tlsh_hash_maxlen(void) {
   return AV_TLSH_HASH_BUFLEN - 1;
@@ -83,8 +95,16 @@ int av_tlsh_hash_fd(int fd, char *out, size_t outlen) {
   if (!hash || !hash[0])
     return -2;
 
-  strncpy(out, hash, outlen - 1);
-  out[outlen - 1] = '\0';
+  /* Reject rather than silently truncate if the hash somehow doesn't
+   * fit - see AV_TLSH_HASH_BUFLEN's comment above on why a corrupted-
+   * but-"successful" hash is a worse failure mode than an honest
+   * error here (a truncated hash still round-trips through
+   * fromTlshStr() far enough to look plausible, then just quietly
+   * never matches anything). */
+  if (strlen(hash) >= outlen)
+    return -3;
+
+  strcpy(out, hash);
   return 0;
 }
 

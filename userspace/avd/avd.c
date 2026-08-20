@@ -151,16 +151,20 @@ struct fuzzy_corpus_entry {
   char name[128];
 };
 
-/* Hash field sized via av_tlsh_hash_maxlen() + 1 at load time, not a
- * compile-time array bound - avd.c never includes <tlsh/tlsh.h>
- * itself (see tlsh_shim.h), so it has no compile-time knowledge of
- * libtlsh's actual hash string length. 128 is a safe fixed upper
- * bound in practice (measured 70 hex chars against the distro package
- * used in development, see tlsh_shim.cpp's own comment on this), but
- * the load path below still calls av_tlsh_hash_maxlen() and asserts
- * against it rather than assuming this array is big enough forever. */
+/* Hash field NOT compile-time sized off av_tlsh_hash_maxlen() -
+ * avd.c never includes <tlsh.h> itself (see tlsh_shim.h), so it has
+ * no compile-time knowledge of libtlsh's actual hash string length.
+ * AV_TLSH_HASH_BUFSZ below is a fixed, generously-sized upper bound
+ * (see tlsh_shim.cpp's AV_TLSH_HASH_BUFLEN comment for the exact
+ * worst-case reasoning - this MUST stay >= av_tlsh_hash_maxlen() + 1,
+ * checked at runtime in load_tlsh_corpus() below rather than assumed
+ * to match forever); measured hash length against the distro
+ * packages actually used in development is 70 hex chars, well under
+ * this. */
+#define AV_TLSH_HASH_BUFSZ 200
+
 struct tlsh_corpus_entry {
-  char hash[128];
+  char hash[AV_TLSH_HASH_BUFSZ];
   char name[128];
 };
 
@@ -508,6 +512,18 @@ static int load_tlsh_corpus(const char *path) {
   size_t capacity = 16;
   size_t hash_maxlen = av_tlsh_hash_maxlen();
 
+  /* AV_TLSH_HASH_BUFSZ's comment promises this holds; check it rather
+   * than trust it silently drifting true forever if either constant
+   * ever changes without the other. */
+  if (hash_maxlen + 1 > AV_TLSH_HASH_BUFSZ) {
+    fprintf(stderr,
+            "avd: BUG: AV_TLSH_HASH_BUFSZ (%d) is smaller than "
+            "av_tlsh_hash_maxlen()+1 (%zu) - aborting rather than risk "
+            "silently truncating TLSH hashes\n",
+            AV_TLSH_HASH_BUFSZ, hash_maxlen + 1);
+    return -1;
+  }
+
   fp = fopen(path, "r");
   if (!fp) {
     fprintf(stderr,
@@ -600,13 +616,22 @@ static int load_tlsh_corpus(const char *path) {
  * why this is the opposite direction from check_fuzzy_corpus()) diff
  * at or under TLSH_MATCH_MAX_DIFF, copies the corpus entry's name
  * into name_out and the diff into diff_out, returning 1. Returns 0 if
- * nothing met the threshold (or no corpus loaded), -1 on a hashing
- * error. Same fd/dup() convention as check_fuzzy_corpus() - see
- * av_tlsh_hash_fd()'s own comment in tlsh_shim.h.
+ * nothing met the threshold, no corpus loaded, OR the file simply
+ * didn't have enough data for TLSH to produce a hash at all (-2 from
+ * av_tlsh_hash_fd() - an expected, common, non-error outcome for
+ * short files, NOT the same thing as a real hashing failure; treating
+ * it as an error here used to make handle_scan_request() log a
+ * spurious "TLSH hash ... failed" line for every small file scanned).
+ * Returns -1 on an actual hashing error (I/O failure, or a hash that
+ * somehow didn't fit the buffer - see av_tlsh_hash_fd()'s own -1/-3
+ * distinction in tlsh_shim.h, both collapsed to -1 here since callers
+ * only need "don't trust this result" either way). Same fd/dup()
+ * convention as check_fuzzy_corpus() - see av_tlsh_hash_fd()'s own
+ * comment in tlsh_shim.h.
  */
 static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
                              int *diff_out) {
-  char file_hash[128];
+  char file_hash[AV_TLSH_HASH_BUFSZ];
   int best_diff = -1;
   size_t best_idx = 0;
   size_t i;
@@ -623,6 +648,8 @@ static int check_tlsh_corpus(int fd, char *name_out, size_t name_out_len,
   hash_ret = av_tlsh_hash_fd(dup_fd, file_hash, sizeof(file_hash));
   close(dup_fd);
 
+  if (hash_ret == -2)
+    return 0; /* too short/insufficiently diverse - not an error */
   if (hash_ret != 0)
     return -1;
 
