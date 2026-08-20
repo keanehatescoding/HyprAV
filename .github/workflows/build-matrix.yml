@@ -264,6 +264,89 @@ jobs:
           echo "unrelated diff: $diff_unrelated (expect well over 30)"
           [ "$diff_unrelated" -gt 30 ]
 
+      - name: Smoke-test the actual TLSH shim and corpus format
+        run: |
+          set -euxo pipefail
+          # The step above only exercises the standalone `tlsh` CLI -
+          # it never calls av_tlsh_hash_fd()/av_tlsh_diff() (the real
+          # shim avd.c actually links against) or parses
+          # corpus/tlsh_hashes.txt, so it could stay green even if the
+          # C/C++ shim boundary or the corpus file format were broken.
+          # This closes that gap without the much heavier lift of a
+          # full kernel+netlink+daemon round trip (avd.c's own header
+          # comment already documents that as a separate, pre-existing,
+          # not-yet-covered gap for the whole daemon, not something
+          # specific to TLSH) - it links against the real
+          # tlsh_shim.o built by the "Build avd" step above, and reads
+          # the real corpus/tlsh_hashes.txt with load_tlsh_corpus()'s
+          # exact line format (hash,name - avd.c's own loader is
+          # static/not exported, so this reimplements just enough of
+          # its parsing to exercise the same file, not a mock of it).
+          cat > /tmp/tlsh_shim_smoke.cpp << 'EOF'
+          #include "tlsh_shim.h"
+          #include <cstdio>
+          #include <cstring>
+          #include <fcntl.h>
+          #include <unistd.h>
+
+          int main(void) {
+            int fd1 = open("/tmp/ptrace_test", O_RDONLY);
+            int fd2 = open("/tmp/ptrace_test_variant", O_RDONLY);
+            if (fd1 < 0 || fd2 < 0) { perror("open"); return 1; }
+
+            char h1[256], h2[256];
+            if (av_tlsh_hash_fd(fd1, h1, sizeof(h1)) != 0) {
+              fprintf(stderr, "FAIL: av_tlsh_hash_fd(original) failed\n");
+              return 1;
+            }
+            if (av_tlsh_hash_fd(fd2, h2, sizeof(h2)) != 0) {
+              fprintf(stderr, "FAIL: av_tlsh_hash_fd(variant) failed\n");
+              return 1;
+            }
+            close(fd1);
+            close(fd2);
+
+            int diff = av_tlsh_diff(h1, h2);
+            printf("shim diff(original, variant) = %d\n", diff);
+            if (diff < 0 || diff > 30) {
+              fprintf(stderr, "FAIL: shim diff out of expected range\n");
+              return 1;
+            }
+
+            FILE *fp = fopen("corpus/tlsh_hashes.txt", "r");
+            if (!fp) { perror("fopen corpus"); return 1; }
+            char line[512];
+            int found = 0;
+            while (fgets(line, sizeof(line), fp)) {
+              char *newline = strchr(line, '\n');
+              if (newline) *newline = '\0';
+              if (line[0] == '#' || line[0] == '\0') continue;
+              char *comma = strchr(line, ',');
+              if (!comma) continue;
+              *comma = '\0';
+              int self_diff = av_tlsh_diff(line, line);
+              if (self_diff != 0) {
+                fprintf(stderr, "FAIL: corpus hash doesn't self-compare to 0 (got %d)\n", self_diff);
+                return 1;
+              }
+              found = 1;
+            }
+            fclose(fp);
+            if (!found) {
+              fprintf(stderr, "FAIL: no usable corpus entries found\n");
+              return 1;
+            }
+
+            printf("OK: shim + corpus format both verified\n");
+            return 0;
+          }
+          EOF
+          g++ -Wall -Wextra -O2 -Iuserspace/avd -I/usr/include/tlsh \
+              -c /tmp/tlsh_shim_smoke.cpp -o /tmp/tlsh_shim_smoke.o
+          g++ -o /tmp/tlsh_shim_smoke /tmp/tlsh_shim_smoke.o \
+              userspace/avd/tlsh_shim.o -ltlsh
+          /tmp/tlsh_shim_smoke
+
       - uses: actions/upload-artifact@v7
         with:
           name: avd
