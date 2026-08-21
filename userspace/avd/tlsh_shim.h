@@ -37,11 +37,15 @@ extern "C" {
 size_t av_tlsh_hash_maxlen(void);
 
 /* Hashes the already-open file `fd`, seeking to its start first (same
- * end result as fuzzy_hash_file()'s own internal seek-to-start
- * behavior, which check_fuzzy_corpus() in avd.c already relies on -
- * callers should pass a dup()'d fd, same convention as that function,
- * so this never disturbs the original fd's position) and writes the
- * hex-encoded hash into `out` (NUL-terminated).
+ * as fuzzy_hash_file()'s own internal seek-to-start behavior, which
+ * check_fuzzy_corpus() in avd.c already relies on). Unlike
+ * fuzzy_hash_file(), this does NOT restore the position afterward -
+ * it reads straight through to EOF and leaves `fd` there. Callers
+ * should pass a dup()'d fd, same convention as check_fuzzy_corpus(),
+ * and not rely on the original fd's position afterward - remember
+ * dup()'d fds share the same underlying offset, so this also leaves
+ * the fd it was dup()'d from sitting at EOF. Writes the hex-encoded
+ * hash into `out` (NUL-terminated).
  *
  * Returns 0 on success, -1 on a read/I/O error, -2 if the file didn't
  * contain enough data for TLSH to produce a valid hash (libtlsh's own
