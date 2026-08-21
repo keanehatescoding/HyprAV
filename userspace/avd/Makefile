@@ -36,6 +36,12 @@ TLSH_LIBS    := -ltlsh
 # silently ignored by both gcc and clang, not an error.
 TLSH_CFLAGS  := -I/usr/include/tlsh
 
+# `avd` must stay the default goal even though checkdeps (textually
+# the first target below) is not a real build product - make defaults
+# to whichever target is written first in the file, and CI invokes
+# this Makefile as plain `make` with no explicit target.
+.DEFAULT_GOAL := avd
+
 # checkdeps runs before avd.o/tlsh_shim.o are ever compiled (see the
 # order-only "| checkdeps" prerequisite below) - it used to live in the
 # `avd` recipe itself, but avd.o/tlsh_shim.o are prerequisites of
