@@ -188,42 +188,6 @@ layout caused earlier in this project). Userspace `rename()`/`chmod()`
 carries none of that risk, so quarantine lives in `avd` instead of
 `main.c`.
 
-`v0.3.0-prep` is worth tagging on its own once verified — see
-`docs/netlink-protocol.md` for the full protocol design, including the
-fail-open-on-timeout default and the `avctl policy set fail-closed`
-option to override it at runtime (see that doc's timing caveat before
-using it on a system with an interactive shell you care about).
-
-**Update on the v0.7.0 scope note**: TLSH has since been added
-alongside ssdeep (`check_tlsh_corpus()` in `avd.c`, `corpus/tlsh_hashes.txt`)
-— complementary, not redundant, since the two algorithms fingerprint
-files differently; a scan falls through to TLSH only if ssdeep didn't
-match either. One correction worth keeping visible: this was
-originally expected to "sit alongside the ssdeep check with
-essentially the same corpus-comparison structure" - that assumption
-turned out to be wrong. libtlsh's only public API is a C++ class with
-no `extern "C"` surface at all (confirmed against the actual upstream
-header, not assumed), so it couldn't be linked into `avd.c` directly
-the way `fuzzy.h` was. See `tlsh_shim.h`/`tlsh_shim.cpp` — the one C++
-translation unit in this otherwise-C project — and the TLSH testing
-section below for the full story, including why a small C++ shim was
-chosen over shelling out to the `tlsh` CLI per scan (in-process,
-same performance profile as ssdeep, at the cost of a real - but
-narrowly contained - build-system change).
-
-Tagging a milestone once it's working and tested:
-
-```bash
-git add av/
-git commit -m "av: signature-based execve detection"
-git tag -a v0.1.0 -m "Signature detection MVP: kprobe execve hook, in-kernel SHA-256, hardcoded signature list"
-git push origin main --tags
-```
-
-Then cut a GitHub Release from that tag (Releases → Draft a new release →
-pick the tag) with notes on what changed and how you tested it — this is
-good material to point to directly in your project report/demo.
-
 ## Prerequisites (inside the VM)
 
 ```bash
@@ -1193,32 +1157,6 @@ not evade `elf_analysis.yar` running against the same file. That's the
 central validation of treating detection as several independent
 checks rather than one big score, and the strongest single piece of
 evidence for that design choice in the whole project.
-
-## Testing weighted scoring and the override tier (v0.9.1 / v1.0.0)
-
-Confirm the false-positive fix actually holds, and that the override
-tier didn't reintroduce the problem it was meant to fix:
-
-```bash
-# single weak import only - must NOT convict (the zsh/sh/uwsm case)
-cat > /tmp/ptrace_only.c << 'EOF'
-#include <sys/ptrace.h>
-#include <stddef.h>
-int main(void) { ptrace(PTRACE_ATTACH, 1234, NULL, NULL); return 0; }
-EOF
-gcc -o /tmp/ptrace_only /tmp/ptrace_only.c
-/tmp/ptrace_only
-dmesg | tail -3
-# expect: event=clean (or no daemon match logged as MALICIOUS) -
-#         Imports_Ptrace alone (weight 15) stays well under threshold
-
-# a real UPX-packed binary - must still convict (multiple weights sum,
-# or No_Section_Headers' override fires alone either way)
-upx --best -o /tmp/upx_test /tmp/ptrace_only
-/tmp/upx_test
-dmesg | tail -3
-# expect: event=detected ... reason="daemon:No_Section_Headers,..."
-```
 
 If you have `tests/evasion/test_entropy_dilution_evasion.sh` results
 from before the override tier existed, re-running it now is the most
