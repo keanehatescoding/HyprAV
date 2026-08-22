@@ -12,6 +12,12 @@ set -uo pipefail
 
 FAIL=0
 STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
+# Probe-once cache for the userspace/avd/*.cpp|*.h case below - staging
+# tlsh_shim.h and tlsh_shim.cpp together used to run the libtlsh probe
+# (and the resulting syntax check) twice, once per matching file.
+tlsh_probe_done=0
+tlsh_available=0
+tlsh_syntax_checked=0
 
 if [ -z "$STAGED" ]; then
     exit 0
@@ -87,13 +93,30 @@ for f in $STAGED; do
             # symlink-planting concern as the Makefile's FUZZY_LIBS/
             # TLSH_LIBS probes (see that file's comment); a predictable
             # world-writable path is a classic TOCTOU target.
-            tlsh_check_tmp=$(mktemp "${TMPDIR:-/tmp}/.avd_tlsh_check.XXXXXX") || exit 1
-            trap 'rm -f "$tlsh_check_tmp"' EXIT HUP INT TERM
-            if ! g++ -x c++ - -o "$tlsh_check_tmp" <<< 'int main(){return 0;}' -ltlsh 2>/dev/null; then
+            #
+            # Probed and syntax-checked at most once per commit (see
+            # tlsh_probe_done/tlsh_syntax_checked above) - both are
+            # deterministic for a given staged tree, so re-running them
+            # for a second matching file (e.g. .h and .cpp staged
+            # together) would just be duplicate work, and previously
+            # also leaked the first iteration's temp file since the
+            # EXIT trap only cleans up whichever mktemp path was set
+            # last.
+            if [ "$tlsh_probe_done" -eq 0 ]; then
+                tlsh_probe_done=1
+                tlsh_check_tmp=$(mktemp "${TMPDIR:-/tmp}/.avd_tlsh_check.XXXXXX") || exit 1
+                trap 'rm -f "$tlsh_check_tmp"' EXIT HUP INT TERM
+                if g++ -x c++ - -o "$tlsh_check_tmp" <<< 'int main(){return 0;}' -ltlsh 2>/dev/null; then
+                    tlsh_available=1
+                fi
+                rm -f "$tlsh_check_tmp"
+            fi
+
+            if [ "$tlsh_available" -eq 0 ]; then
                 echo "  ! libtlsh not found - skipping syntax check for $f"
                 echo "    (sudo pacman -S tlsh  /  apt install libtlsh-dev)"
-            else
-                rm -f "$tlsh_check_tmp"
+            elif [ "$tlsh_syntax_checked" -eq 0 ]; then
+                tlsh_syntax_checked=1
                 echo "  - g++ -fsyntax-only: userspace/avd/tlsh_shim.cpp"
                 # -I/usr/include/tlsh: same reasoning as TLSH_CFLAGS in
                 # userspace/avd/Makefile - Arch/CachyOS's tlsh package

@@ -12,21 +12,38 @@ on:
   pull_request:
 
 jobs:
+  # Reads .github/kernel-versions.json and hands its "versions" array to
+  # the build job's matrix below via fromJSON(). Split into its own job
+  # (rather than the build job just reading the file itself) because a
+  # matrix: block is evaluated before any step runs, so there's no
+  # earlier point in the `build` job itself to check out the repo and
+  # read the file first.
+  #
+  # kernel-versions.json - not build-matrix.yml itself - is what
+  # .github/workflows/update-kernel-matrix.yml auto-updates weekly (see
+  # .github/scripts/update-kernel-matrix.sh): GitHub refuses to let the
+  # default GITHUB_TOKEN push a change to anything under
+  # .github/workflows/ even with contents:write granted, so the actual
+  # version list has to live outside that directory.
+  load-kernel-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.read.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: read
+        run: echo "versions=$(jq -c '.versions' .github/kernel-versions.json)" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: load-kernel-matrix
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        # Auto-updated weekly by .github/workflows/update-kernel-matrix.yml
-        # (see .github/scripts/update-kernel-matrix.sh) - edits between the
-        # BEGIN/END markers get overwritten by that job, so hand-edit
-        # outside the markers if you need to add e.g. a one-off version.
-        kernel_version:
-          # BEGIN kernel_version
-          - "6.12.96"  # LTS
-          - "6.18.21"  # LTS
-          - "7.1.4"  # current stable
-          # END kernel_version
+        # See load-kernel-matrix above - hand-edit
+        # .github/kernel-versions.json if you need to add e.g. a one-off
+        # version; edits there won't survive the next scheduled run.
+        kernel_version: ${{ fromJSON(needs.load-kernel-matrix.outputs.versions) }}
         # A module generally must be built with the same compiler family
         # as the target kernel, especially under LTO/CFI configs - e.g.
         # CachyOS ships a Clang-built kernel variant. Rather than branch

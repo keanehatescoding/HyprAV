@@ -360,6 +360,54 @@ static int load_rules(const char *dir) {
  * the daemon just won't have anything to fuzzy-match against, and logs
  * a warning once at startup rather than failing every scan silently.
  */
+/*
+ * Parses one raw corpus line of the shared "<hash>,<name>" format used
+ * by both the ssdeep and TLSH corpus files. Mutates `line` in place
+ * (strips the trailing newline, splits at the comma) and points
+ * hash_part_out/name_part_out into it. `kind` ("fuzzy"/"TLSH") is
+ * only used to label the malformed-line warning so callers stay
+ * distinguishable in the log. Returns 1 with the out-params set on a
+ * usable line, 0 to skip the line (comment/blank, or malformed -
+ * already warned about in the latter case).
+ */
+static int parse_corpus_line(char *line, char **hash_part_out,
+                             char **name_part_out, const char *kind) {
+  char *comma;
+  char *newline;
+
+  /* strpbrk(), not strchr(line, '\n') alone: corpus files edited on
+   * Windows can carry CRLF line endings, and stripping only '\n'
+   * would leave a trailing '\r' stuck on name_part (and, for a
+   * CRLF-only blank line, fail the blank-line check below since
+   * line[0] would be '\r', not '\n' or '\0'). */
+  newline = strpbrk(line, "\r\n");
+  if (newline)
+    *newline = '\0';
+
+  if (line[0] == '#' || line[0] == '\0')
+    return 0;
+
+  comma = strchr(line, ',');
+  if (!comma) {
+    fprintf(stderr,
+            "avd: skipping malformed %s corpus line "
+            "(no comma): %s\n",
+            kind, line);
+    return 0;
+  }
+  *comma = '\0';
+  if (line[0] == '\0' || comma[1] == '\0') {
+    fprintf(stderr,
+            "avd: skipping malformed %s corpus line "
+            "(empty hash or name)\n",
+            kind);
+    return 0;
+  }
+  *hash_part_out = line;
+  *name_part_out = comma + 1;
+  return 1;
+}
+
 static int load_fuzzy_corpus(const char *path) {
   FILE *fp;
   char line[512];
@@ -381,28 +429,10 @@ static int load_fuzzy_corpus(const char *path) {
   }
 
   while (fgets(line, sizeof(line), fp)) {
-    char *comma;
-    char *newline;
     char *hash_part, *name_part;
 
-    if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
+    if (!parse_corpus_line(line, &hash_part, &name_part, "fuzzy"))
       continue;
-
-    newline = strchr(line, '\n');
-    if (newline)
-      *newline = '\0';
-
-    comma = strchr(line, ',');
-    if (!comma) {
-      fprintf(stderr,
-              "avd: skipping malformed corpus line "
-              "(no comma): %s\n",
-              line);
-      continue;
-    }
-    *comma = '\0';
-    hash_part = line;
-    name_part = comma + 1;
 
     if (fuzzy_corpus_count == capacity) {
       struct fuzzy_corpus_entry *grown;
@@ -540,32 +570,15 @@ static int load_tlsh_corpus(const char *path) {
   }
 
   while (fgets(line, sizeof(line), fp)) {
-    char *comma;
-    char *newline;
     char *hash_part, *name_part;
 
-    if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
+    if (!parse_corpus_line(line, &hash_part, &name_part, "TLSH"))
       continue;
 
-    newline = strchr(line, '\n');
-    if (newline)
-      *newline = '\0';
-
-    comma = strchr(line, ',');
-    if (!comma) {
-      fprintf(stderr,
-              "avd: skipping malformed TLSH corpus line "
-              "(no comma): %s\n",
-              line);
-      continue;
-    }
-    *comma = '\0';
-    hash_part = line;
-    name_part = comma + 1;
-
-    /* sizeof(tlsh_corpus[...].hash) is a fixed 128-byte array (see
-     * struct tlsh_corpus_entry's comment); hash_maxlen is libtlsh's
-     * actual reported max length, queried once above via the shim.
+    /* sizeof(tlsh_corpus[...].hash) is a fixed AV_TLSH_HASH_BUFSZ
+     * (200) byte array (see struct tlsh_corpus_entry's comment);
+     * hash_maxlen is libtlsh's actual reported max length, queried
+     * once above via the shim.
      * If some future libtlsh build ever needs more than that, this
      * skip-with-a-warning is a clear failure mode rather than a
      * silent truncated-hash corruption. */

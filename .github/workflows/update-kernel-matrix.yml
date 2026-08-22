@@ -11,6 +11,18 @@ name: Update kernel matrix versions
 #
 # github-actions itself (actions/checkout, actions/cache, ...) IS a real
 # Dependabot ecosystem - that's handled separately via .github/dependabot.yml.
+#
+# Writes .github/kernel-versions.json, NOT build-matrix.yml itself, even
+# though the latter is what conceptually "owns" this data: GitHub refuses
+# to let the default GITHUB_TOKEN (or the app-installation token
+# peter-evans/create-pull-request below uses) push a change to anything
+# under .github/workflows/, even with `permissions: contents: write`
+# granted right here - that specific directory needs the separate
+# `workflows` OAuth scope, which only a PAT can carry. The first version
+# of this job edited build-matrix.yml directly and every single scheduled
+# run failed silently on exactly that push rejection. build-matrix.yml
+# now reads kernel-versions.json at run time instead (fromJSON()), so
+# this job never touches a workflow file and never needs a PAT.
 
 on:
   schedule:
@@ -46,10 +58,12 @@ jobs:
             - the 2 most recent non-EOL longterm (LTS) branches
             - the current stable release
 
-            Review the diff in `build-matrix.yml` before merging - this PR
-            does not itself run the build-matrix workflow's kernel
-            build/smoke-test jobs; those run automatically once this PR
-            exists (see `on: pull_request` in build-matrix.yml).
+            Review the diff in `.github/kernel-versions.json` before
+            merging - build-matrix.yml reads this file at run time via
+            fromJSON(), so this PR does not itself run the build-matrix
+            workflow's kernel build/smoke-test jobs; those run
+            automatically once this PR exists (see `on: pull_request` in
+            build-matrix.yml).
           branch: ci/update-kernel-matrix
           labels: ci, dependencies
           delete-branch: true
