@@ -375,12 +375,17 @@ static int parse_corpus_line(char *line, char **hash_part_out,
   char *comma;
   char *newline;
 
-  if (line[0] == '#' || line[0] == '\n' || line[0] == '\0')
-    return 0;
-
-  newline = strchr(line, '\n');
+  /* strpbrk(), not strchr(line, '\n') alone: corpus files edited on
+   * Windows can carry CRLF line endings, and stripping only '\n'
+   * would leave a trailing '\r' stuck on name_part (and, for a
+   * CRLF-only blank line, fail the blank-line check below since
+   * line[0] would be '\r', not '\n' or '\0'). */
+  newline = strpbrk(line, "\r\n");
   if (newline)
     *newline = '\0';
+
+  if (line[0] == '#' || line[0] == '\0')
+    return 0;
 
   comma = strchr(line, ',');
   if (!comma) {
@@ -391,6 +396,13 @@ static int parse_corpus_line(char *line, char **hash_part_out,
     return 0;
   }
   *comma = '\0';
+  if (line[0] == '\0' || comma[1] == '\0') {
+    fprintf(stderr,
+            "avd: skipping malformed %s corpus line "
+            "(empty hash or name)\n",
+            kind);
+    return 0;
+  }
   *hash_part_out = line;
   *name_part_out = comma + 1;
   return 1;
