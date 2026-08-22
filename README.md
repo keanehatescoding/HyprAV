@@ -157,25 +157,6 @@ kernel module talks to (via `/proc`, `debugfs`, or netlink), for the same
 reason the workqueue fix mattered: you don't want blocking, heavyweight,
 or crash-prone logic running in kernel context on every process launch.
 
-## Releases
-
-Milestones are marked with annotated git tags on `av/`, not separate
-directories.
-
-| Tag | Feature | Where it lives |
-|-----|---------|-----------------|
-| `v0.1.0` ✅ | Hash-based detection (SHA-256), kprobe execve hook, kill on match | kernel |
-| `v0.2.0` ✅ | Multi-algorithm hashing (MD5, SHA-1, SHA-256) + signature DB moved to a kernel hashtable, managed at runtime via `/proc/kernel_av_signatures` (or the `avctl` CLI) | kernel + `avctl` CLI |
-| `v0.3.0-prep` ✅ | Kernel↔daemon Generic Netlink channel (`netlink_chan.c`, `avd` skeleton) — plumbing, verified against real kernel/libnl headers | kernel + `avd` |
-| `v0.3.0` ✅ | Real YARA rule scanning — `avd` loads `rules/*.yar` and scans on a signature miss; verified against a real EICAR match at runtime | userspace daemon (libyara) |
-| `v0.4.0` ✅ | String & API heuristics via YARA's `elf` module (imported dynamic symbols: `ptrace`, `memfd_create`, `mprotect`, `dlopen`, plus a compound rule) — verified against real ptrace-importing binaries | userspace (`rules/heuristics.yar`) |
-| `v0.5.0` ✅ | ELF header & section analysis — no section headers (packer indicator), executable stack, RWX segments, entry point outside `.text` — verified against a real UPX-packed binary | userspace (`rules/elf_analysis.yar`) |
-| `v0.6.0` ✅ | Entropy analysis — whole-file and per-section Shannon entropy, threshold calibrated against real samples (normal binary, packed binary, random data) | userspace (`rules/entropy.yar`) |
-| `v0.7.0` ✅ | Fuzzy hashing (ssdeep/libfuzzy) against a corpus of known-bad hashes — catches near-identical variants that evade exact hash matching entirely; verified: a modified variant scores 100 similarity, an unrelated file scores 0 | `avd` + `corpus/fuzzy_hashes.txt` |
-| `v0.8.0` ✅ | Behavioral heuristics — rapid write-intent opens (ransomware-like), sensitive path writes/deletes, self-deleting binaries; hooks `openat`/`unlink`/`unlinkat` instead of `write()` to avoid risky cross-process fd→path resolution | kernel (workqueue-deferred, same pattern as v0.1.0) |
-| `v0.9.0` ✅ | Evasion resistance — 4 techniques tested against the real engine (dynamic symbol resolution, fuzzy-hash dilution, entropy dilution, slow-drip behavioral pacing); 3 of 4 evaded their target layer, but one (entropy dilution) was still caught by structural analysis running alongside it — the core validation of the layered-detection design | `tests/evasion/` + `docs/evasion-findings.md` |
-| `v0.9.1` ✅ | Weighted YARA scoring — real testing killed `/usr/bin/zsh`, `/bin/sh`, and `uwsm` (legitimate binaries matching a single low-confidence rule each); conviction now requires matched rules' `weight` meta to sum past `MALICIOUS_SCORE_THRESHOLD` (100), with a below-threshold match falling through to fuzzy-hash corroboration instead of returning clean outright | `avd` + `weight` meta on every rule |
-| `v1.0.0` ✅ | Override tier (a small set of verified-clean rules convict alone regardless of score — added after discovering v0.9.1's scoring change silently broke the v0.9.0 entropy-dilution defense-in-depth finding), quarantine (userspace, `avd`-driven detections only), structured `key=value` kernel logging, performance benchmark harness | kernel + userspace |
 
 **Scope note on quarantine**: only detections that go through `avd`
 (YARA, API heuristics, ELF analysis, entropy, fuzzy hash) get their
