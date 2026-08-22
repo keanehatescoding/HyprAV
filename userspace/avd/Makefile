@@ -36,7 +36,22 @@ TLSH_LIBS    := -ltlsh
 # silently ignored by both gcc and clang, not an error.
 TLSH_CFLAGS  := -I/usr/include/tlsh
 
-avd: avd.o tlsh_shim.o
+# `avd` must stay the default goal even though checkdeps (textually
+# the first target below) is not a real build product - make defaults
+# to whichever target is written first in the file, and CI invokes
+# this Makefile as plain `make` with no explicit target.
+.DEFAULT_GOAL := avd
+
+# checkdeps runs before avd.o/tlsh_shim.o are ever compiled (see the
+# order-only "| checkdeps" prerequisite below) - it used to live in the
+# `avd` recipe itself, but avd.o/tlsh_shim.o are prerequisites of
+# `avd`, so make built them (running straight into the plain compiler
+# rules further down) before that recipe's friendly "not found"
+# checks ever got a chance to run. A missing dependency then surfaced
+# as a raw compiler fatal error instead of the guided message below.
+# Putting the checks in their own target that the objects depend on
+# guarantees they run first.
+checkdeps:
 	@if [ -z "$(LIBNL_LIBS)" ]; then \
 		echo "ERROR: libnl-genl-3.0 not found via pkg-config."; \
 		echo "  Arch/CachyOS: sudo pacman -S libnl"; \
@@ -75,6 +90,8 @@ avd: avd.o tlsh_shim.o
 		echo "  Debian/Ubuntu: sudo apt install libtlsh-dev"; \
 		exit 1; \
 	fi
+
+avd: avd.o tlsh_shim.o
 	$(CXX) -o avd avd.o tlsh_shim.o $(LIBNL_LIBS) $(YARA_LIBS) $(FUZZY_LIBS) $(TLSH_LIBS) -lpthread
 
 # avd.c is plain C, built with $(CC) - only tlsh_shim.cpp needs a C++
@@ -84,10 +101,15 @@ avd: avd.o tlsh_shim.o
 # so linking mixed C/C++ objects with $(CC) would need an explicit
 # -lstdc++ instead; using $(CXX) for the link step is the more
 # conventional way to handle this rather than fighting gcc for it.
-avd.o: avd.c ../../av/netlink_proto.h tlsh_shim.h
+#
+# "| checkdeps" is an order-only prerequisite: it forces checkdeps to
+# run first without making a checkdeps timestamp change trigger a
+# needless rebuild of these objects (checkdeps has no file output to
+# have a timestamp in the first place).
+avd.o: avd.c ../../av/netlink_proto.h tlsh_shim.h | checkdeps
 	$(CC) $(CFLAGS) $(LIBNL_CFLAGS) $(YARA_CFLAGS) -c avd.c -o avd.o
 
-tlsh_shim.o: tlsh_shim.cpp tlsh_shim.h
+tlsh_shim.o: tlsh_shim.cpp tlsh_shim.h | checkdeps
 	$(CXX) $(CXXFLAGS) $(TLSH_CFLAGS) -c tlsh_shim.cpp -o tlsh_shim.o
 
 clean:
@@ -129,4 +151,4 @@ install: avd
 	@echo "  sudo systemctl daemon-reload"
 	@echo "  sudo systemctl enable --now avd.service"
 
-.PHONY: clean install
+.PHONY: clean install checkdeps

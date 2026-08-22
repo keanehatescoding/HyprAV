@@ -83,11 +83,17 @@ for f in $STAGED; do
             # as the compile target, since a .h alone isn't a
             # self-contained C++ translation unit the way a .c file is
             # elsewhere in this hook.
-            if ! g++ -x c++ - -o /tmp/.avd_tlsh_check <<< 'int main(){return 0;}' -ltlsh 2>/dev/null; then
+            # mktemp + trap, not a fixed /tmp/.avd_tlsh_check path - same
+            # symlink-planting concern as the Makefile's FUZZY_LIBS/
+            # TLSH_LIBS probes (see that file's comment); a predictable
+            # world-writable path is a classic TOCTOU target.
+            tlsh_check_tmp=$(mktemp "${TMPDIR:-/tmp}/.avd_tlsh_check.XXXXXX") || exit 1
+            trap 'rm -f "$tlsh_check_tmp"' EXIT HUP INT TERM
+            if ! g++ -x c++ - -o "$tlsh_check_tmp" <<< 'int main(){return 0;}' -ltlsh 2>/dev/null; then
                 echo "  ! libtlsh not found - skipping syntax check for $f"
                 echo "    (sudo pacman -S tlsh  /  apt install libtlsh-dev)"
             else
-                rm -f /tmp/.avd_tlsh_check
+                rm -f "$tlsh_check_tmp"
                 echo "  - g++ -fsyntax-only: userspace/avd/tlsh_shim.cpp"
                 # -I/usr/include/tlsh: same reasoning as TLSH_CFLAGS in
                 # userspace/avd/Makefile - Arch/CachyOS's tlsh package
